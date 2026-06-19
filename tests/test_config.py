@@ -17,6 +17,7 @@ def test_settings_defaults_are_safe() -> None:
         database_url="postgresql+asyncpg://x:x@localhost/test",
         weaviate_url="http://localhost:8080",
         redis_url="redis://localhost:6379/0",
+        llm_provider="openai",
     )
     assert cfg.app_env == "development"
     assert cfg.log_level == "debug"

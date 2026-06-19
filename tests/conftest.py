@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from backend.app.config import Settings
 from backend.app.db.base import Base
-from backend.app.dependencies import get_db, get_redis, get_settings, get_spotify_client, get_weaviate_client
+from backend.app.dependencies import get_brave_client, get_db, get_redis, get_settings, get_spotify_client, get_weaviate_client
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.main import app as _real_app
 
@@ -251,12 +251,15 @@ async def client(
     avoids needing real Postgres/Weaviate/Redis at startup.
     """
     fake_weaviate = MagicMock()
+    fake_brave = AsyncMock()
+    fake_brave.search = AsyncMock(return_value=[])
 
     _real_app.dependency_overrides[get_settings] = lambda: test_settings
     _real_app.dependency_overrides[get_db] = lambda: db_session
     _real_app.dependency_overrides[get_redis] = lambda: fake_redis
     _real_app.dependency_overrides[get_spotify_client] = lambda: fake_spotify
     _real_app.dependency_overrides[get_weaviate_client] = lambda: fake_weaviate
+    _real_app.dependency_overrides[get_brave_client] = lambda: fake_brave
 
     # Set app state directly so lifespan doesn't try to connect to real services
     _real_app.state.redis = fake_redis

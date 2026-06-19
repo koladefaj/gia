@@ -32,7 +32,7 @@ import weaviate
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from backend.app.api import auth, health, memory
+from backend.app.api import artist, auth, dj, health, memory
 from backend.app.config import settings
 from backend.app.db.session import engine
 from backend.app.db.weaviate_init import get_weaviate_client, init_weaviate_schema
@@ -120,3 +120,5 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(memory.router)
+app.include_router(dj.router)
+app.include_router(artist.router)

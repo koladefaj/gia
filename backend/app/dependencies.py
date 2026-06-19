@@ -34,6 +34,7 @@ from backend.app.config import Settings, settings as _default_settings
 from backend.app.db.session import AsyncSessionLocal
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.observability.logging import get_logger
+from backend.app.tools.brave import BraveSearchClient
 
 logger = get_logger(__name__)
 
@@ -130,3 +131,16 @@ def get_weaviate_client(request: Request) -> WeaviateClient:
         AttributeError: If called before ``app.state.weaviate`` is set.
     """
     return request.app.state.weaviate  # type: ignore[return-value]
+
+
+# ── Brave Search client ───────────────────────────────────────────────────────
+
+
+def get_brave_client(cfg: Settings = Depends(get_settings)) -> BraveSearchClient:
+    """Return a ``BraveSearchClient`` configured from settings.
+
+    A new instance is created per-request (stateless HTTP client with no
+    connection pool to warm up).  Override in tests via
+    ``app.dependency_overrides[get_brave_client]``.
+    """
+    return BraveSearchClient(api_key=cfg.brave_api_key)
