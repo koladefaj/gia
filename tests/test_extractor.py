@@ -81,6 +81,24 @@ class TestParseExtractedMemories:
         result = _parse_extracted_memories(raw)
         assert result[0].supersedes_id == "abc-123"
 
+    def test_json_object_not_array_returns_empty(self) -> None:
+        """A bare JSON object (not an array) is rejected, not half-parsed.
+
+        Small models sometimes drop the wrapping list — we want [] not a crash.
+        """
+        from backend.app.memory.extractor import _parse_extracted_memories
+
+        assert _parse_extracted_memories('{"type":"preference","text":"x"}') == []
+
+    def test_greedy_outermost_array_with_preamble(self) -> None:
+        """Leading prose + a fenced array (typical gemma3:4b output) still parses."""
+        from backend.app.memory.extractor import _parse_extracted_memories
+
+        raw = 'Here is what I found:\n```json\n[{"type":"preference","text":"Loves Tems","confidence":0.9}]\n```'
+        result = _parse_extracted_memories(raw)
+        assert len(result) == 1
+        assert result[0].text == "Loves Tems"
+
 
 @pytest.mark.asyncio
 async def test_extract_memories_calls_llm(test_settings) -> None:

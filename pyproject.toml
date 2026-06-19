@@ -43,6 +43,15 @@ dev = [
     "httpx>=0.28.0",
 ]
 
+# Local TTS for development/iteration (the production path is ElevenLabs over
+# HTTP and needs no package). Heavy (pulls torch), so kept as an opt-in extra:
+#   uv sync --extra local-tts
+[project.optional-dependencies]
+local-tts = [
+    "kokoro>=0.9.2",
+    "soundfile>=0.12.1",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

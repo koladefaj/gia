@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="")
     openai_api_key: str  = Field(default="")
     ollama_base_url: str = Field(default="http://localhost:11434")
-    ollama_model: str = Field(default="llama3.2")
+    ollama_model: str = Field(default="gemma3:4b")
     # Override the default persona / fast models per-provider.  Leave empty to
     # use the built-in provider defaults defined in ``providers/llm.py``.
     llm_persona_model: str = Field(default="")

@@ -61,6 +61,22 @@ def test_get_llm_ollama_prefixes_model(ollama_cfg: Settings) -> None:
     assert model.startswith("ollama/")
 
 
+def test_get_llm_ollama_uses_configured_model(test_settings: Settings) -> None:
+    """Ollama resolves to ``cfg.ollama_model`` (e.g. gemma3:4b), not a hardcode."""
+    cfg = Settings(**{**test_settings.model_dump(), "llm_provider": "ollama", "ollama_model": "gemma3:4b"})
+    with patch("backend.app.providers.llm.LLM") as mock_llm_cls:
+        get_llm(cfg)
+    assert mock_llm_cls.call_args.kwargs["model"] == "ollama/gemma3:4b"
+
+
+def test_get_fast_llm_ollama_uses_configured_model(test_settings: Settings) -> None:
+    """The fast tier shares the single configured Ollama model locally."""
+    cfg = Settings(**{**test_settings.model_dump(), "llm_provider": "ollama", "ollama_model": "gemma3:4b"})
+    with patch("backend.app.providers.llm.LLM") as mock_llm_cls:
+        get_fast_llm(cfg)
+    assert mock_llm_cls.call_args.kwargs["model"] == "ollama/gemma3:4b"
+
+
 def test_get_llm_accepts_model_override(anthropic_cfg: Settings) -> None:
     """``get_llm`` passes through an explicit ``model`` argument."""
     with patch("backend.app.providers.llm.LLM") as mock_llm_cls:

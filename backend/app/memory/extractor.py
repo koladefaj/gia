@@ -32,8 +32,15 @@ EXTRACTOR_KEY = "agents.memory"
 def _parse_extracted_memories(raw: str) -> list[ExtractedMemory]:
     """Parse the LLM's raw text response into ``ExtractedMemory`` objects.
 
-    Tolerant of markdown fences and extra surrounding text — only the first
-    JSON array in the response is used.
+    Deliberately tolerant — small local models (e.g. gemma3:4b) tend to wrap
+    JSON in ```json fences or add a sentence of preamble.  We strip code fences,
+    then take the *outermost* ``[...]`` array (greedy) so objects containing a
+    ``]`` in a string value don't truncate the parse.
+
+    Keeping this robust and provider-agnostic is why we don't reach for a
+    structured-output library here: the same parser works identically across
+    gemma3:4b, GPT-4o, and Claude, with no extra dependency or model
+    function-calling requirement.
 
     Args:
         raw: Raw string returned by the LLM.
@@ -42,7 +49,8 @@ def _parse_extracted_memories(raw: str) -> list[ExtractedMemory]:
         Parsed list of ``ExtractedMemory`` objects.  Returns ``[]`` if the
         response cannot be parsed or contains no valid entries.
     """
-    match = re.search(r"\[.*?\]", raw, re.DOTALL)
+    cleaned = re.sub(r"```(?:json)?", "", raw).strip()
+    match = re.search(r"\[.*\]", cleaned, re.DOTALL)  # greedy → outermost array
     if not match:
         logger.warning("extractor_no_json_array", raw=raw[:200])
         return []
@@ -51,6 +59,10 @@ def _parse_extracted_memories(raw: str) -> list[ExtractedMemory]:
         data = json.loads(match.group())
     except json.JSONDecodeError:
         logger.warning("extractor_json_parse_error", raw=raw[:200])
+        return []
+
+    if not isinstance(data, list):
+        logger.warning("extractor_not_a_list", raw=raw[:200])
         return []
 
     memories: list[ExtractedMemory] = []
