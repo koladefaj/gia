@@ -32,10 +32,11 @@ import weaviate
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from backend.app.api import artist, auth, dj, health, memory
+from backend.app.api import artist, auth, chat, dj, health, memory, voice
 from backend.app.config import settings
 from backend.app.db.session import engine
 from backend.app.db.weaviate_init import get_weaviate_client, init_weaviate_schema
+from backend.app.observability.langfuse import init_langfuse
 from backend.app.observability.logging import get_logger, setup_logging
 from backend.app.tools.spotify import SpotifyMCPClient
 
@@ -63,6 +64,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     setup_logging(settings.log_level)
     logger.info("gia_starting", env=settings.app_env, llm=settings.llm_provider)
+
+    if settings.langfuse_enabled:
+        init_langfuse(
+            settings.langfuse_public_key,
+            settings.langfuse_secret_key,
+            settings.langfuse_host,
+        )
 
     # Weaviate — ensure vector collections exist (idempotent), then keep a
     # persistent client on app.state for the memory engine.
@@ -122,3 +130,5 @@ app.include_router(auth.router)
 app.include_router(memory.router)
 app.include_router(dj.router)
 app.include_router(artist.router)
+app.include_router(chat.router)
+app.include_router(voice.router)
