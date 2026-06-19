@@ -113,9 +113,33 @@ class MemoryService:
         new_memories: list[ExtractedMemory] = await extract_memories(
             transcript, existing, self.cfg
         )
+        stored_ids = await self.persist_memories(user_id, new_memories)
+        logger.info(
+            "extraction_complete",
+            user_id=user_id,
+            extracted=len(new_memories),
+            stored=len(stored_ids),
+        )
+        return stored_ids
 
+    async def persist_memories(
+        self, user_id: str, memories: list[ExtractedMemory]
+    ) -> list[str]:
+        """Store *memories* via the dedup → supersede → embed → upsert pipeline.
+
+        Shared by ``run_extraction`` (conversation memories) and the cold-start
+        profiler (Spotify taste memories).  SHA-256 Redis dedup skips texts seen
+        before; the retrieval cache is invalidated once anything new lands.
+
+        Args:
+            user_id:  UUID string of the owning user.
+            memories: Validated ``ExtractedMemory`` objects to store.
+
+        Returns:
+            Weaviate UUID strings of the memories actually inserted.
+        """
         stored_ids: list[str] = []
-        for memory in new_memories:
+        for memory in memories:
             key = f"memory_hash:{text_hash(memory.text)}:{user_id}"
             if await self.redis.exists(key):  # type: ignore[union-attr]
                 logger.debug("memory_dedup_skip", user_id=user_id, text=memory.text[:40])
@@ -133,11 +157,4 @@ class MemoryService:
         # Newly-learned facts must not be hidden behind a stale retrieval cache.
         if stored_ids:
             await invalidate_user(self.redis, user_id)
-
-        logger.info(
-            "extraction_complete",
-            user_id=user_id,
-            extracted=len(new_memories),
-            stored=len(stored_ids),
-        )
         return stored_ids

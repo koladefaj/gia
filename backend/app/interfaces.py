@@ -35,6 +35,15 @@ class SpotifyClientProtocol(Protocol):
         """
         ...
 
+    async def get_top_tracks(self, time_range: str = "medium_term", limit: int = 10) -> list[dict]:
+        """Return the user's top tracks for the given time range.
+
+        Args:
+            time_range: One of ``short_term``, ``medium_term``, ``long_term``.
+            limit: Number of tracks to return (max 50).
+        """
+        ...
+
     async def get_audio_features(self, uris: list[str]) -> list[dict]:
         """Return audio feature objects for the given Spotify track URIs.
 

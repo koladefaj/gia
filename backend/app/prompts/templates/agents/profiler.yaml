@@ -1,0 +1,29 @@
+id: agents.profiler
+version: v1
+description: >
+  Cold-start profiler — distils a new user's real Spotify listening (top artists,
+  top tracks, recent plays) into durable taste-preference memories.
+metadata:
+  model_tier: fast
+  tags: [onboarding, memory, profiler]
+sections:
+  profile: |
+    You are building a first taste profile for a new user from their real Spotify listening data. Distil it into DURABLE preferences worth remembering long-term. Return a JSON array (or []).
+
+    Rules:
+    {% raw %}- Capture genre leanings, go-to artists, and overall taste: {"type":"preference","text":"Core Afrobeats listener — top artists include Burna Boy, Wizkid, Tems","confidence":0.9}{% endraw %}
+    - Prefer a few strong, specific statements over many weak ones (aim for 3-6).
+    - Ground every statement in the data below — do NOT invent artists or songs.
+    - Note listening minutes are NOT available, so never claim play counts or hours.
+    - Return only raw JSON — no markdown fences, no preamble.
+
+    Top artists (most-played, ranked):
+    {{ top_artists }}
+
+    Top tracks (most-played, ranked):
+    {{ top_tracks }}
+
+    Recently played:
+    {{ recent_tracks }}
+
+    JSON array:

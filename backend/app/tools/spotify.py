@@ -184,6 +184,11 @@ class SpotifyMCPClient:
             await self._call("getTopArtists", timeRange=time_range, limit=limit)
         )
 
+    async def get_top_tracks(self, time_range: str = "medium_term", limit: int = 10) -> list[dict]:
+        return parse_tracks(
+            await self._call("getTopTracks", timeRange=time_range, limit=limit)
+        )
+
     async def get_audio_features(self, uris: list[str]) -> list[dict]:
         """Return neutral placeholder features (no real source available).
 

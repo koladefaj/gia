@@ -151,6 +151,10 @@ class FakeSpotifyClient:
         """Return up to *limit* fake artists."""
         return self.artists[:limit]
 
+    async def get_top_tracks(self, time_range: str = "medium_term", limit: int = 10) -> list[dict]:
+        """Return up to *limit* fake tracks as the user's top tracks."""
+        return self.tracks[:limit]
+
     async def get_audio_features(self, uris: list[str]) -> list[dict]:
         """Return fake audio features for each URI in *uris*."""
         by_uri = {t["uri"]: t for t in self.tracks}
