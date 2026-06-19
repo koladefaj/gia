@@ -1,13 +1,13 @@
-"""Tests for Celery task stubs.
+"""Tests for Celery tasks.
 
-These tasks are scaffolded for Days 3 and 6.  Tests here verify that:
-  - The task is importable and registered with Celery.
-  - Calling the task function directly returns the expected stub response.
-  - The task name matches the registered name so ``celery_app.send_task``
-    can route it correctly.
+Verifies that tasks are importable, registered, and dispatch correctly.
+The memory extraction task runs real async logic so ``asyncio.run`` is
+patched to avoid network calls in unit tests.
 """
 
 from __future__ import annotations
+
+from unittest.mock import patch
 
 import pytest
 
@@ -19,12 +19,14 @@ from backend.worker.tasks.mood_inference import (
 from backend.worker.tasks.proactive_check import check_pattern_shift
 
 
-def test_extract_session_memories_returns_stub() -> None:
-    """Stub task returns a dict with status and the input IDs."""
-    result = extract_session_memories("user-1", "session-1")
-    assert result["status"] == "stub"
-    assert result["user_id"] == "user-1"
-    assert result["session_id"] == "session-1"
+def test_extract_session_memories_dispatches_async() -> None:
+    """``extract_session_memories`` calls ``asyncio.run`` with the async body."""
+    expected = {"status": "ok", "stored": 1, "memory_ids": ["mem-1"]}
+    with patch("backend.worker.tasks.memory_extraction.asyncio.run", return_value=expected) as mock_run:
+        result = extract_session_memories("user-1", "session-1")
+
+    assert result == expected
+    mock_run.assert_called_once()
 
 
 def test_run_mood_inference_returns_stub() -> None:

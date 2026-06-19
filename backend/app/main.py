@@ -28,13 +28,14 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
+import weaviate
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from backend.app.api import auth, health
+from backend.app.api import auth, health, memory
 from backend.app.config import settings
 from backend.app.db.session import engine
-from backend.app.db.weaviate_init import init_weaviate_schema
+from backend.app.db.weaviate_init import get_weaviate_client, init_weaviate_schema
 from backend.app.observability.logging import get_logger, setup_logging
 from backend.app.tools.spotify import SpotifyMCPClient
 
@@ -63,12 +64,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logging(settings.log_level)
     logger.info("gia_starting", env=settings.app_env, llm=settings.llm_provider)
 
-    # Weaviate — ensure vector collections exist (idempotent)
+    # Weaviate — ensure vector collections exist (idempotent), then keep a
+    # persistent client on app.state for the memory engine.
     try:
         await init_weaviate_schema()
         logger.info("weaviate_schema_ready")
     except Exception as exc:
         logger.warning("weaviate_unavailable_at_startup", error=str(exc))
+    app.state.weaviate = await asyncio.to_thread(get_weaviate_client)
 
     # Redis — single pool shared across all requests
     app.state.redis = aioredis.from_url(
@@ -102,6 +105,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── Shutdown ──────────────────────────────────────────────────────────────
     await app.state.spotify.close()
     await app.state.redis.aclose()
+    await asyncio.to_thread(app.state.weaviate.close)
     await engine.dispose()
     logger.info("gia_shutdown")
 
@@ -115,3 +119,4 @@ app = FastAPI(
 
 app.include_router(health.router)
 app.include_router(auth.router)
+app.include_router(memory.router)

@@ -28,6 +28,7 @@ from collections.abc import AsyncGenerator
 from fastapi import Depends, Request
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncSession
+from weaviate import WeaviateClient
 
 from backend.app.config import Settings, settings as _default_settings
 from backend.app.db.session import AsyncSessionLocal
@@ -114,3 +115,18 @@ def get_spotify_client(request: Request) -> SpotifyClientProtocol:
         AttributeError: If called before ``app.state.spotify`` is set.
     """
     return request.app.state.spotify  # type: ignore[return-value]
+
+
+# ── Weaviate client ───────────────────────────────────────────────────────────
+
+
+def get_weaviate_client(request: Request) -> WeaviateClient:
+    """Return the app-level Weaviate client stored on ``app.state``.
+
+    A single client is shared across all requests for connection efficiency.
+    The client is opened in ``lifespan`` and closed on shutdown.
+
+    Raises:
+        AttributeError: If called before ``app.state.weaviate`` is set.
+    """
+    return request.app.state.weaviate  # type: ignore[return-value]
