@@ -36,6 +36,7 @@ from backend.app.interfaces import SpotifyClientProtocol, WeatherClientProtocol
 from backend.app.observability.logging import get_logger
 from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.tools.brave import BraveSearchClient
+from backend.app.tools.spotify_web import SpotifyWebClient
 from backend.app.tools.weather import MockWeatherClient, WeatherClient
 
 logger = get_logger(__name__)
@@ -179,3 +180,15 @@ def get_weather_client(
     ``app.dependency_overrides[get_weather_client]``.
     """
     return WeatherClient() if cfg.weather_enabled else MockWeatherClient()
+
+
+# ── Spotify Web API client (playlists / profile) ──────────────────────────────
+
+
+def get_spotify_web_client(cfg: Settings = Depends(get_settings)) -> SpotifyWebClient:
+    """Return a direct Spotify Web API client for the gaps the MCP server can't do.
+
+    Used for playlist creation (current ``/v1/me/playlists`` endpoint) and the
+    user profile.  Override in tests via ``dependency_overrides``.
+    """
+    return SpotifyWebClient(cfg)

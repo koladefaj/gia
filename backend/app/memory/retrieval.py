@@ -27,14 +27,16 @@ from collections.abc import Awaitable
 from dataclasses import dataclass
 
 from redis.asyncio import Redis as AsyncRedis
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.config import Settings, settings as _default_settings
+from backend.app.config import Settings
+from backend.app.config import settings as _default_settings
 from backend.app.db.models import Profile, User
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.memory.cache import cache_key, get_cached, set_cached
 from backend.app.memory.embeddings import embed
+from backend.app.memory.name_capture import extract_name
 from backend.app.memory.reranker import rerank
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
@@ -59,7 +61,7 @@ class RetrievalConfig:
     rerank_multiplier: int
 
     @classmethod
-    def from_settings(cls, cfg: Settings) -> "RetrievalConfig":
+    def from_settings(cls, cfg: Settings) -> RetrievalConfig:
         """Build a ``RetrievalConfig`` from the application settings."""
         return cls(
             hybrid=cfg.hybrid_enabled,
@@ -169,6 +171,7 @@ async def _get_profile(user_id: str, db: AsyncSession) -> dict | None:
         "preferred_genres": profile.preferred_genres,
         "preferred_volume": profile.preferred_volume,
         "spotify_user_id": profile.spotify_user_id,
+        "display_name": profile.display_name,
     }
 
 
@@ -180,6 +183,31 @@ def _safe_list(result: object, default: list) -> list:
 def _safe(result: object, default: object) -> object:
     """Return *default* when *result* is an ``Exception``."""
     return default if isinstance(result, Exception) else result
+
+
+async def _maybe_capture_name(
+    user_id: str, query: str, profile: dict | None, db: AsyncSession
+) -> None:
+    """Persist a name the user states (e.g. "call me Kolade") to their profile.
+
+    Only fires when the profile has no name yet and the message contains an
+    explicit name statement.  Updates the passed *profile* dict in place so the
+    name is usable in the very turn it's given.
+    """
+    if not profile or profile.get("display_name"):
+        return
+    name = extract_name(query)
+    if not name:
+        return
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        return
+    await db.execute(
+        update(Profile).where(Profile.user_id == uid).values(display_name=name)
+    )
+    profile["display_name"] = name
+    logger.info("name_captured", user_id=user_id, name=name)
 
 
 async def build_user_context(
@@ -261,6 +289,8 @@ async def build_user_context(
     preferences = _safe_list(preferences, [])
     mood_patterns = _safe_list(mood_patterns, [])
     episodes = _safe_list(episodes, [])
+
+    await _maybe_capture_name(user_id, query, profile, db)  # type: ignore[arg-type]
 
     return UserContext(
         user_id=user_id,

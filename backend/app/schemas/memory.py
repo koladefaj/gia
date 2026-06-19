@@ -98,6 +98,15 @@ class UserContext(BaseModel):
         """
         lines: list[str] = ["## What Gia knows about this user\n"]
 
+        name = (self.profile or {}).get("display_name")
+        if name:
+            lines.append(f"**Name:** {name} — address them by name naturally, not every line.")
+        else:
+            lines.append(
+                "**Name:** unknown — if it fits naturally, ask once what to call them, "
+                "then use it. Don't interrogate."
+            )
+
         if self.profile:
             tz = self.profile.get("timezone", "UTC")
             genres = ", ".join(self.profile.get("preferred_genres") or []) or "none set"

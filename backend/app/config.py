@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     # client stays inert and Spotify-dependent features degrade gracefully.
     spotify_mcp_server_path: str = Field(default="")
     spotify_mcp_command: str = Field(default="node")
+    # Path to the MCP server's spotify-config.json (holds the OAuth tokens the
+    # direct Web API client reuses for endpoints the MCP server lacks, e.g.
+    # playlist creation via the new /v1/me/playlists). Empty = derive from
+    # spotify_mcp_server_path's repo root.
+    spotify_config_path: str = Field(default="")
 
     # --- TTS ---
     tts_provider: str = Field(default="kokoro")
