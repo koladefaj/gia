@@ -15,7 +15,6 @@ import random
 import uuid
 from datetime import UTC, datetime, timedelta
 
-import numpy as np
 import weaviate
 import weaviate.classes as wvc
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -24,13 +23,19 @@ from backend.app.config import settings
 from backend.app.db.base import Base
 from backend.app.db.models import ConversationSession, ListeningEvent, Profile, User
 from backend.app.db.weaviate_init import init_weaviate_schema_sync
+from backend.app.memory.embeddings import embed
 from backend.app.observability.logging import get_logger, setup_logging
 
 setup_logging("debug")
 log = get_logger(__name__)
 
-USER_ID = "kolade-demo"
-PROFILE_ID = "kolade-demo-profile"
+# Stable, deterministic UUIDs so the demo user is the same across reseeds and the
+# id is a real UUID (the User/Profile columns are native ``Uuid`` — Postgres
+# rejects non-UUID strings, and the API's profile lookup parses ``uuid.UUID``).
+USER_UUID = uuid.uuid5(uuid.NAMESPACE_DNS, "gia.kolade-demo")
+PROFILE_UUID = uuid.uuid5(uuid.NAMESPACE_DNS, "gia.kolade-demo.profile")
+USER_ID = str(USER_UUID)  # string form used for the Weaviate user_id filter
+PROFILE_ID = str(PROFILE_UUID)
 
 # ── Postgres seed ─────────────────────────────────────────────────────────────
 
@@ -48,7 +53,7 @@ _TRACK_POOL = [
 ]
 
 
-def _make_listening_events(user_id: str) -> list[ListeningEvent]:
+def _make_listening_events(user_id: uuid.UUID) -> list[ListeningEvent]:
     """30 events spread across time buckets so mood inference has signal."""
     now = datetime.now(UTC)
     events = []
@@ -56,7 +61,7 @@ def _make_listening_events(user_id: str) -> list[ListeningEvent]:
     def _event(track: tuple, played_at: datetime) -> ListeningEvent:
         uri, name, artist, energy, valence, tempo, dance, key, mode = track
         return ListeningEvent(
-            id=str(uuid.uuid4()),
+            id=uuid.uuid4(),
             user_id=user_id,
             track_uri=uri,
             track_name=name,
@@ -87,7 +92,7 @@ def _make_listening_events(user_id: str) -> list[ListeningEvent]:
         events.append(_event(random.choice(high_energy_tracks), ts))
 
     # Miscellaneous weekday afternoons → 10 events
-    for i in range(10):
+    for _ in range(10):
         days_ago = random.randint(1, 30)
         hour = random.randint(13, 18)
         ts = (now - timedelta(days=days_ago)).replace(hour=hour, minute=random.randint(0, 59))
@@ -107,16 +112,16 @@ async def seed_postgres() -> None:
 
         # Idempotent — skip if already seeded
         from sqlalchemy import select
-        existing = await session.execute(select(User).where(User.id == USER_ID))
+        existing = await session.execute(select(User).where(User.id == USER_UUID))
         if existing.scalar_one_or_none():
             log.info("seed_postgres_skipped", reason="user already exists")
             await engine.dispose()
             return
 
-        user = User(id=USER_ID, email="kolade@demo.local")
+        user = User(id=USER_UUID, email="kolade@demo.local")
         profile = Profile(
-            id=PROFILE_ID,
-            user_id=USER_ID,
+            id=PROFILE_UUID,
+            user_id=USER_UUID,
             spotify_user_id="kolade_spotify",
             timezone="Europe/London",
             preferred_genres=["afrobeats", "afropop", "r&b"],
@@ -125,13 +130,13 @@ async def seed_postgres() -> None:
         session.add(user)
         session.add(profile)
 
-        events = _make_listening_events(USER_ID)
+        events = _make_listening_events(USER_UUID)
         session.add_all(events)
 
         # One past session so memory extractor has something to reference
         past_session = ConversationSession(
-            id=str(uuid.uuid4()),
-            user_id=USER_ID,
+            id=uuid.uuid4(),
+            user_id=USER_UUID,
             started_at=datetime.now(UTC) - timedelta(days=4),
             ended_at=datetime.now(UTC) - timedelta(days=4, minutes=-35),
             summary="User asked for Afrobeats wind-down. Confirmed Tems, saved Free Mind. Created playlist 'Afro Vibes'.",
@@ -145,13 +150,6 @@ async def seed_postgres() -> None:
 
 
 # ── Weaviate seed ─────────────────────────────────────────────────────────────
-
-def _rand_vector(dim: int = 768) -> list[float]:
-    """Placeholder vector — replaced by real BGE embeddings on Day 3."""
-    v = np.random.randn(dim).astype(np.float32)
-    v /= np.linalg.norm(v)
-    return v.tolist()
-
 
 _MEMORIES = [
     {
@@ -197,7 +195,13 @@ _MEMORIES = [
 ]
 
 
-def seed_weaviate() -> None:
+def seed_weaviate(vectors: list[list[float]]) -> None:
+    """Insert the seed memories with real BGE embeddings.
+
+    Args:
+        vectors: One 768-dim BGE embedding per entry in ``_MEMORIES`` (same
+                 order). Computed in ``main`` because ``embed`` is async.
+    """
     init_weaviate_schema_sync()
 
     client = weaviate.connect_to_custom(
@@ -223,7 +227,7 @@ def seed_weaviate() -> None:
 
         now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         with collection.batch.dynamic() as batch:
-            for mem in _MEMORIES:
+            for mem, vector in zip(_MEMORIES, vectors, strict=True):
                 batch.add_object(
                     properties={
                         "user_id": USER_ID,
@@ -233,7 +237,7 @@ def seed_weaviate() -> None:
                         "created_at": now_iso,
                         "supersedes_id": "",
                     },
-                    vector=_rand_vector(),
+                    vector=vector,
                 )
 
         log.info("seed_weaviate_done", user_id=USER_ID, memories=len(_MEMORIES))
@@ -244,10 +248,15 @@ def seed_weaviate() -> None:
 async def main() -> None:
     log.info("seed_starting")
     await seed_postgres()
-    await asyncio.to_thread(seed_weaviate)
+    # Real BGE embeddings (not random) so semantic recall actually works.
+    log.info("seed_embedding_memories", count=len(_MEMORIES))
+    vectors = [await embed(mem["text"]) for mem in _MEMORIES]
+    await asyncio.to_thread(seed_weaviate, vectors)
     log.info("seed_complete", user_id=USER_ID)
-    print(f"\n✓ Seed complete. Demo user: {USER_ID}")
-    print("  Run: docker compose up → GET /health → GET /auth/spotify/status")
+    print(f"\n[OK] Seed complete. Demo user id (use as user_id in /chat): {USER_ID}")
+    print("  Try:  curl -N -X POST http://localhost:8000/chat \\")
+    print('          -H "Content-Type: application/json" \\')
+    print(f'          -d \'{{"message":"find me something for tonight","user_id":"{USER_ID}"}}\'')
 
 
 if __name__ == "__main__":
