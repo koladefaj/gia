@@ -16,44 +16,39 @@ is called directly from the API layer.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from crewai import Agent
 
 from backend.app.config import Settings
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.observability.logging import get_logger
-from backend.app.persona.prompt import GIA_PERSONA
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_llm
 from backend.app.schemas.dj import CrossfadeQueue, DJResponse, TrackItem
 from backend.app.tools.crossfade import build_key_matched_sequence, track_from_dict
 
 logger = get_logger(__name__)
 
+AGENT_KEY = "agents.dj"
 
-def build_dj_agent(cfg: Settings) -> Agent:
-    """Construct the CrewAI DJ agent.
+
+def build_dj_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
+    """Construct the CrewAI DJ agent from the externalised prompt registry.
 
     Args:
-        cfg: Application settings (LLM provider / model).
+        cfg:      Application settings (LLM provider / model).
+        registry: Prompt registry to read the agent identity from; defaults to
+                  the process-wide singleton.
 
     Returns:
         A configured ``crewai.Agent`` ready to be composed into a crew.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="DJ",
-        goal=(
-            "Discover tracks that match the user's mood and taste, build a "
-            "Camelot-compatible crossfade queue, and recommend with a brief, "
-            "grounded reason."
-        ),
-        backstory=(
-            "You are Gia's DJ brain. You know the user's taste intimately — "
-            "their preferred genres, energy levels, and which artists they "
-            "keep coming back to. You sequence tracks the way a real DJ would: "
-            "smooth energy transitions, harmonically compatible keys, and "
-            "always grounded in what you know about this specific person."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_llm(cfg),
         verbose=False,
         allow_delegation=False,
@@ -71,6 +66,7 @@ class DJService:
 
     spotify: SpotifyClientProtocol
     cfg: Settings
+    registry: PromptRegistry = field(default_factory=get_registry)
 
     async def recommend(
         self,
@@ -124,21 +120,18 @@ class DJService:
         # ── 4. Generate natural language recommendation ───────────────────────
         camelot = seed.camelot_key or "?"
         queued_names = ", ".join(f"{t.name} by {t.artist}" for t in queue_tracks[:3]) or "none"
-        context_block = f"\n{user_context_text}\n" if user_context_text else ""
 
-        prompt = (
-            GIA_PERSONA
-            + context_block
-            + f"""
-The user asked: "{query}"
-
-You found: {seed.name} by {seed.artist}
-  energy={seed.energy:.2f}, valence={seed.valence:.2f}, Camelot={camelot}
-
-Crossfade queue after it: {queued_names}
-
-Respond as Gia — recommend the seed track with a brief reason, mention the energy or mood fit, and note the queue is ready. Keep it warm and concise (2-4 sentences max).
-"""
+        prompt = self.registry.get(AGENT_KEY).render(
+            "task",
+            persona=self.registry.get("persona.gia").render(),
+            user_context=user_context_text,
+            query=query,
+            seed_name=seed.name,
+            seed_artist=seed.artist,
+            energy=seed.energy,
+            valence=seed.valence,
+            camelot=camelot,
+            queued_names=queued_names,
         )
 
         llm = get_llm(self.cfg)

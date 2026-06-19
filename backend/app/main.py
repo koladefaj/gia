@@ -38,6 +38,7 @@ from backend.app.db.session import engine
 from backend.app.db.weaviate_init import get_weaviate_client, init_weaviate_schema
 from backend.app.observability.langfuse import init_langfuse
 from backend.app.observability.logging import get_logger, setup_logging
+from backend.app.prompts import PromptRegistry
 from backend.app.tools.spotify import SpotifyMCPClient
 
 logger = get_logger(__name__)
@@ -64,6 +65,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     setup_logging(settings.log_level)
     logger.info("gia_starting", env=settings.app_env, llm=settings.llm_provider)
+
+    # Prompt registry — load and validate all YAML templates once at startup so
+    # a malformed prompt fails here, not mid-conversation.
+    app.state.prompts = PromptRegistry()
 
     if settings.langfuse_enabled:
         init_langfuse(

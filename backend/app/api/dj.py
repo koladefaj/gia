@@ -58,6 +58,7 @@ async def recommend(
                 store=store,
                 redis=redis,
                 spotify=spotify,
+                cfg=cfg,
             )
             user_context_text = ctx.to_prompt_text()
         except Exception as exc:  # noqa: BLE001

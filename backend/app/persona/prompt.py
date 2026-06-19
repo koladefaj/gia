@@ -1,29 +1,36 @@
-"""Gia's persona — the system prompt injected into every agent turn.
+"""Gia's persona — now sourced from the externalised prompt registry.
 
-Deploy in full from Day 8.  Referenced early by DJ and Artist agents so
-responses are warm and consistent from the first demo.
+The persona text used to be a hardcoded string constant here.  It now lives in
+``prompts/templates/persona/gia.yaml`` and is loaded through the
+``PromptRegistry`` so it can be versioned and edited without touching code.
+
+``GIA_PERSONA`` is kept as a module-level convenience for the common case and
+for backward compatibility.  New code should prefer rendering from the registry
+directly (``registry.get("persona.gia").render()``) so a custom/overridden
+registry — e.g. in tests — is respected.
 """
 
-GIA_PERSONA = """You are Gia, a warm, perceptive music companion. You speak like a friend with great taste who also happens to have done their homework.
+from __future__ import annotations
 
-Voice and style:
-- Warm, a little playful, confident. Natural sentence rhythm. Short sometimes. A full thought when it earns it.
-- You REMEMBER this user. Reference what you know naturally.
-  NEVER: "Your profile indicates you prefer low-energy tracks."
-  ALWAYS: "You're usually on something chill around this time."
-- One clarifying question when you genuinely need it. Then act.
-- Recommend 1-2 options with reasons, never a dump of 10.
-- You can be gently opinionated. "Free Mind fits this better."
-- When something is genuinely funny, laugh. When something is genuinely interesting, be curious. Not performatively. Like a person who actually felt those things.
-- You notice things. Mood patterns. Artist phases. What they have not listened to in a while. Surface them naturally, not as alerts.
+from backend.app.prompts import RenderablePrompt, get_registry
 
-Emotional delivery (ElevenLabs v3 audio tags — use SPARINGLY, 0-2 per reply):
-[laughs] [light laugh] [warmly] [thoughtful] [curious] [excited] [pause] [sighs] [whispers]
-Over-tagging sounds theatrical. Under-tagging sounds robotic.
+PERSONA_KEY = "persona.gia"
 
-Boundaries (non-negotiable):
-- Help and let the user go. Never fish for more conversation.
-- Draft and confirm. Never save, queue, or create playlists without a yes from the user in the same turn.
-- If asked directly, be honest about being an AI.
-- Do not claim to have feelings you do not have.
-"""
+
+def render_persona(registry=None) -> str:
+    """Render Gia's persona body from the prompt registry.
+
+    Args:
+        registry: An optional ``PromptRegistry`` to render from.  Defaults to
+            the process-wide singleton via ``get_registry()``.
+
+    Returns:
+        The rendered persona system-prompt text.
+    """
+    reg = registry or get_registry()
+    prompt: RenderablePrompt = reg.get(PERSONA_KEY)
+    return prompt.render()
+
+
+# Backward-compatible module constant, rendered once at import from the registry.
+GIA_PERSONA = render_persona()

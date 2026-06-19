@@ -29,10 +29,13 @@ from crewai import Agent
 
 from backend.app.config import Settings
 from backend.app.observability.logging import get_logger
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_fast_llm
 from backend.app.schemas.chat import IntentType
 
 logger = get_logger(__name__)
+
+AGENT_KEY = "agents.router"
 
 # ── Keyword heuristics ────────────────────────────────────────────────────────
 
@@ -111,29 +114,18 @@ def _keyword_classify(message: str) -> IntentType | None:
     return None
 
 
-_ROUTER_PROMPT = """\
-Classify the user's intent into exactly one of:
-  MUSIC_FIND   — user wants to discover or play music
-  MUSIC_QUEUE  — user wants to save, queue, or organise tracks
-  ARTIST_INFO  — user wants to talk about a specific artist
-  MOOD_CHECK   — user wants mood analysis or patterns
-  MIXED        — message touches more than one category
-
-User message: "{message}"
-
-Reply with ONLY the intent label, nothing else.
-"""
-
-
 async def classify_intent(
     message: str,
     cfg: Settings,
+    registry: PromptRegistry | None = None,
 ) -> tuple[IntentType, float]:
     """Classify user intent — heuristic first, LLM fallback.
 
     Args:
-        message: User's raw message text.
-        cfg:     Settings (used for the fallback LLM call).
+        message:  User's raw message text.
+        cfg:      Settings (used for the fallback LLM call).
+        registry: Prompt registry for the LLM-fallback prompt; defaults to the
+                  process-wide singleton.
 
     Returns:
         ``(IntentType, confidence)`` where confidence is 1.0 for keyword
@@ -146,7 +138,7 @@ async def classify_intent(
 
     llm = get_fast_llm(cfg)
     try:
-        prompt = _ROUTER_PROMPT.format(message=message)
+        prompt = (registry or get_registry()).get(AGENT_KEY).render("classify", message=message)
         raw = await asyncio.to_thread(
             llm.call, [{"role": "user", "content": prompt}]
         )
@@ -159,30 +151,25 @@ async def classify_intent(
         return IntentType.MUSIC_FIND, 0.5
 
 
-def build_router_agent(cfg: Settings) -> Agent:
-    """Construct the CrewAI Router agent.
+def build_router_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
+    """Construct the CrewAI Router agent from the externalised prompt registry.
 
     The Router is used for multi-agent crew composition starting Day 6.
     For direct intent classification, prefer ``classify_intent`` directly.
 
     Args:
-        cfg: Application settings.
+        cfg:      Application settings.
+        registry: Prompt registry for the agent identity; defaults to the
+                  process-wide singleton.
 
     Returns:
         Configured ``crewai.Agent``.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="Router",
-        goal=(
-            "Classify the user's intent with precision so the right downstream "
-            "agents are activated — and only those agents."
-        ),
-        backstory=(
-            "You are the traffic controller for Gia's crew. You read each message "
-            "and decide: is this person looking for music, asking about an artist, "
-            "checking their patterns, or some mix? You are fast and deliberate — "
-            "you never guess when you can reason from the words."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_fast_llm(cfg),
         verbose=False,
         allow_delegation=False,

@@ -68,6 +68,7 @@ async def get_user_context(
     weaviate: WeaviateClient = Depends(get_weaviate_client),
     redis: AsyncRedis = Depends(get_redis),
     spotify: SpotifyClientProtocol = Depends(get_spotify_client),
+    cfg: Settings = Depends(get_settings),
 ) -> UserContext:
     """Assemble and return the full ``UserContext`` for *user_id*.
 
@@ -102,6 +103,7 @@ async def get_user_context(
         store=store,
         redis=redis,
         spotify=spotify,
+        cfg=cfg,
     )
     logger.info("context_assembled", user_id=user_id, query=query)
     return context

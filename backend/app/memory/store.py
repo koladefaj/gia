@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from weaviate import WeaviateClient
-from weaviate.classes.query import Filter, MetadataQuery
+from weaviate.classes.query import Filter, HybridFusion, MetadataQuery
 
 from backend.app.observability.logging import get_logger
 from backend.app.schemas.memory import ExtractedMemory, MemoryEntry
@@ -101,6 +101,56 @@ class WeaviateMemoryStore:
             results = col.query.near_vector(
                 near_vector=query_vector,
                 limit=k,
+                filters=(
+                    Filter.by_property("user_id").equal(user_id)
+                    & Filter.by_property("type").equal(memory_type)
+                ),
+                return_metadata=MetadataQuery(score=True),
+            )
+            return [_obj_to_entry(o) for o in results.objects]
+
+        return await asyncio.to_thread(_run)
+
+    async def hybrid_search(
+        self,
+        user_id: str,
+        query_text: str,
+        query_vector: list[float],
+        memory_type: str,
+        k: int = 5,
+        alpha: float = 0.5,
+    ) -> list[MemoryEntry]:
+        """Return top-*k* memories using hybrid (BM25 + dense) retrieval.
+
+        Pure vector search misses exact tokens — artist names, song titles, IDs
+        — because those carry little semantic signal but matter a lot here
+        ("play that *Tems* song"). Weaviate's ``hybrid`` runs BM25 over the
+        ``text`` property (its inverted index is on by default, so no schema
+        change is required) alongside the dense vector and fuses the two with
+        relative-score ranking.
+
+        Args:
+            user_id:      UUID string identifying the user.
+            query_text:   Raw user utterance — drives the BM25 / keyword leg.
+            query_vector: 768-dim embedding of the same query — drives the
+                          dense leg.
+            memory_type:  One of ``"preference"``, ``"mood_pattern"``, ``"episode"``.
+            k:            Maximum number of results to return.
+            alpha:        Dense vs keyword weight. ``1.0`` = pure vector,
+                          ``0.0`` = pure BM25, ``0.5`` = balanced.
+
+        Returns:
+            List of ``MemoryEntry`` ordered by fused relevance (best first).
+        """
+
+        def _run() -> list[MemoryEntry]:
+            col = self.client.collections.get("UserMemory")
+            results = col.query.hybrid(
+                query=query_text,
+                vector=query_vector,
+                alpha=alpha,
+                limit=k,
+                fusion_type=HybridFusion.RELATIVE_SCORE,
                 filters=(
                     Filter.by_property("user_id").equal(user_id)
                     & Filter.by_property("type").equal(memory_type)

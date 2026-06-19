@@ -40,7 +40,11 @@ class MemoryEntry(BaseModel):
         confidence:    Confidence score at extraction time.
         created_at:    UTC timestamp of when the memory was stored.
         supersedes_id: UUID of the memory this entry replaced, if applicable.
-        score:         Semantic similarity score from the near_vector query (0–1).
+        score:         Relevance score from retrieval (near_vector / hybrid /
+                       rerank), higher = more relevant.
+        source:        Where this memory came from (e.g. ``"extractor"``,
+                       ``"seed"``, ``"mood_inference"``). Surfaced for grounding
+                       so the agent can attribute, not invent, what it knows.
     """
 
     id: str
@@ -50,6 +54,12 @@ class MemoryEntry(BaseModel):
     created_at: datetime
     supersedes_id: str | None = None
     score: float = 0.0
+    source: str | None = None
+
+    @property
+    def ref(self) -> str:
+        """Short stable reference id (first 8 chars of the UUID) for grounding."""
+        return self.id.replace("-", "")[:8]
 
 
 class UserContext(BaseModel):
@@ -110,17 +120,17 @@ class UserContext(BaseModel):
         if self.preferences:
             lines.append("\n**Preferences:**")
             for p in self.preferences:
-                lines.append(f"- {p.text} [{p.confidence:.0%} confidence]")
+                lines.append(f"- {p.text} [{p.confidence:.0%} confidence, ref {p.ref}]")
 
         if self.mood_patterns:
             lines.append("\n**Mood Patterns:**")
             for m in self.mood_patterns:
-                lines.append(f"- {m.text}")
+                lines.append(f"- {m.text} [ref {m.ref}]")
 
         if self.episodes:
             lines.append("\n**Recent Sessions:**")
             for e in self.episodes:
-                lines.append(f"- {e.text}")
+                lines.append(f"- {e.text} [ref {e.ref}]")
 
         if self.session_summary:
             lines.append(f"\n**Current Session:** {self.session_summary}")

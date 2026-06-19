@@ -18,7 +18,6 @@ from backend.app.memory.embeddings import embed
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.mood.classifier import classify_mood, deviates_significantly, time_bucket
 from backend.app.observability.logging import get_logger
-from backend.app.persona.prompt import GIA_PERSONA
 from backend.app.schemas.memory import MemoryEntry
 
 logger = get_logger(__name__)

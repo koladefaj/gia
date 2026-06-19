@@ -33,37 +33,32 @@ from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.memory.embeddings import embed
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
-from backend.app.persona.prompt import GIA_PERSONA
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_llm
 from backend.app.schemas.artist import ArtistInfoResponse, BraveResult
 from backend.app.tools.brave import BraveSearchClient
 
 logger = get_logger(__name__)
 
+AGENT_KEY = "agents.artist"
 
-def build_artist_agent(cfg: Settings) -> Agent:
-    """Construct the CrewAI Artist agent.
+
+def build_artist_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
+    """Construct the CrewAI Artist agent from the externalised prompt registry.
 
     Args:
-        cfg: Application settings.
+        cfg:      Application settings.
+        registry: Prompt registry for the agent identity; defaults to the
+                  process-wide singleton.
 
     Returns:
         A configured ``crewai.Agent`` for artist-focused conversation.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="Artist Specialist",
-        goal=(
-            "Give the user a warm, personalised take on an artist — combining "
-            "what Gia knows about the user's history with that artist, recent "
-            "news from the web, and the artist's top tracks."
-        ),
-        backstory=(
-            "You are Gia's culture lens. When a user asks about an artist you "
-            "don't look up a bio — you think about what you know of this user's "
-            "relationship with that artist, what the artist has been up to "
-            "lately, and you respond like a friend who actually follows music. "
-            "If something is funny or surprising, you react to it naturally."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_llm(cfg),
         verbose=False,
         allow_delegation=False,
@@ -85,6 +80,7 @@ class ArtistService:
     brave: BraveSearchClient
     cfg: Settings
     store: WeaviateMemoryStore | None = field(default=None)
+    registry: PromptRegistry = field(default_factory=get_registry)
 
     async def get_info(
         self,
@@ -151,23 +147,13 @@ class ArtistService:
             for r in brave_results[:3]
         ) or "No recent news found."
 
-        prompt = (
-            GIA_PERSONA
-            + f"""
-User's history with {artist_name}:
-{user_artist_memory}
-
-{artist_name}'s recent activity (from web):
-{brave_text}
-
-{artist_name}'s top tracks:
-{tracks_text}
-
-Respond as Gia would: as a knowledgeable friend, not a Wikipedia article.
-Reference the user's personal history with this artist.
-If the recent news is interesting or funny, react to it genuinely.
-Keep the response to 3-5 sentences.
-"""
+        prompt = self.registry.get(AGENT_KEY).render(
+            "task",
+            persona=self.registry.get("persona.gia").render(),
+            artist_name=artist_name,
+            user_artist_memory=user_artist_memory,
+            brave_text=brave_text,
+            tracks_text=tracks_text,
         )
 
         llm = get_llm(self.cfg)

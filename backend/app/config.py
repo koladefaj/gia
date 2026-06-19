@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     # --- Brave Search ---
     brave_api_key: str = Field(default="")
 
+    # --- Weather (Open-Meteo — no API key required) ---
+    # When enabled, the planner can fetch current weather to make music
+    # recommendations context-aware ("31°C — something for a shorter run?").
+    weather_enabled: bool = Field(default=True)
+    # Default coordinates used when the user has no location on file
+    # (Lagos, Nigeria — matches the seeded demo user).
+    weather_default_lat: float = Field(default=6.5244)
+    weather_default_lon: float = Field(default=3.3792)
+    weather_default_label: str = Field(default="Lagos")
+
     # --- Langfuse ---
     langfuse_public_key: str = Field(default="")
     langfuse_secret_key: str = Field(default="")
@@ -84,6 +94,46 @@ class Settings(BaseSettings):
     # --- Celery ---
     celery_broker_url: str = Field(default="redis://localhost:6379/1")
     celery_result_backend: str = Field(default="redis://localhost:6379/2")
+
+    # =============================================================================
+    # Retrieval (RAG hardening)
+    # =============================================================================
+
+    # Hybrid search: combine BM25 keyword + dense vector. Disable to fall back to
+    # pure dense (the pre-hardening behaviour).
+    hybrid_enabled: bool = Field(default=True)
+    # alpha weights dense vs keyword in Weaviate hybrid: 1.0 = pure vector,
+    # 0.0 = pure BM25, 0.5 = balanced.
+    retrieval_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Top-k fetched per memory type during context assembly.
+    retrieval_k_preferences: int = Field(default=8, ge=1, le=50)
+    retrieval_k_mood: int = Field(default=3, ge=1, le=50)
+    retrieval_k_episodes: int = Field(default=3, ge=1, le=50)
+    # Redis retrieval cache TTL in seconds (0 disables caching).
+    retrieval_cache_ttl: int = Field(default=60, ge=0)
+    # Multi-agent synthesis — when ON, a final LLM pass merges several agents'
+    # outputs into one coherent reply instead of concatenating them. OFF by
+    # default: single-agent turns (the common case) need no merge, and it adds
+    # an LLM call to the voice path.
+    synthesis_enabled: bool = Field(default=False)
+
+    # Cross-encoder reranking — OFF by default to protect the voice latency
+    # budget. Flip on for Celery/eval or to demo the recall gain.
+    rerank_enabled: bool = Field(default=False)
+    rerank_model: str = Field(default="BAAI/bge-reranker-base")
+    # When reranking, fetch this many candidates before trimming to the final k.
+    rerank_candidate_multiplier: int = Field(default=3, ge=1, le=10)
+
+    # =============================================================================
+    # Tool resilience
+    # =============================================================================
+
+    # Per-call timeout (seconds) applied to external tool calls.
+    tool_timeout_s: float = Field(default=8.0, gt=0.0)
+    # Consecutive failures before a tool's circuit breaker opens.
+    tool_circuit_threshold: int = Field(default=5, ge=1)
+    # Seconds the breaker stays open before allowing a probe call.
+    tool_circuit_cooldown_s: float = Field(default=30.0, gt=0.0)
 
     # --- Field validators ---
     @field_validator("llm_provider")

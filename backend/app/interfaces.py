@@ -82,3 +82,25 @@ class LLMClientProtocol(Protocol):
     def call(self, messages: list[dict], **kwargs: object) -> str:
         """Send *messages* to the model and return the text response."""
         ...
+
+
+@runtime_checkable
+class WeatherClientProtocol(Protocol):
+    """Interface for current-weather lookups used by the planner.
+
+    Weather is a cheap, keyless real-world signal that makes music
+    recommendations context-aware (energy for a hot run, a longer queue for a
+    rainy drive).  Concrete implementations:
+      - ``WeatherClient``     — calls the Open-Meteo public API
+      - ``MockWeatherClient`` — deterministic fixture data for testing / offline
+    """
+
+    async def get_current(self, latitude: float, longitude: float) -> dict | None:
+        """Return current weather at the given coordinates, or ``None`` on failure.
+
+        Returns:
+            A dict with ``temperature_c`` (float), ``condition`` (human string,
+            e.g. ``"clear"``), and ``wind_kph`` (float), or ``None`` if the
+            lookup could not be completed.
+        """
+        ...

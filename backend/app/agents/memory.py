@@ -15,42 +15,40 @@ from dataclasses import dataclass, field
 from crewai import Agent
 
 from backend.app.config import Settings
+from backend.app.memory.cache import invalidate_user
 from backend.app.memory.decay import apply_supersede
 from backend.app.memory.embeddings import embed, text_hash
 from backend.app.memory.extractor import extract_memories
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_fast_llm
 from backend.app.schemas.memory import ExtractedMemory, MemoryEntry
 
 logger = get_logger(__name__)
 
+AGENT_KEY = "agents.memory"
 
-def build_memory_agent(cfg: Settings) -> Agent:
+
+def build_memory_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
     """Construct the CrewAI ``Agent`` instance for memory curation.
 
     The agent's role is injected into other agents' system prompts so they
     know who surfaced the user context they received.
 
     Args:
-        cfg: Application settings (provides LLM provider / model).
+        cfg:      Application settings (provides LLM provider / model).
+        registry: Prompt registry for the agent identity; defaults to the
+                  process-wide singleton.
 
     Returns:
         A configured ``crewai.Agent`` ready to be added to a ``Crew``.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="Memory Curator",
-        goal=(
-            "Extract durable user preferences from conversations and keep "
-            "Gia's memory store accurate and conflict-free."
-        ),
-        backstory=(
-            "You are Gia's long-term memory system. You read conversation "
-            "transcripts and identify only what is genuinely worth remembering "
-            "— durable tastes, patterns, and facts. One-off logistics are "
-            "discarded. When a user's preference changes, you retire the old "
-            "memory and replace it with the updated one."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_fast_llm(cfg),
         verbose=False,
         allow_delegation=False,
@@ -131,6 +129,10 @@ class MemoryService:
             mem_id = await self.store.upsert_memory(user_id, memory, vector)
             await self.redis.setex(key, 86400 * 30, "1")  # type: ignore[union-attr]
             stored_ids.append(mem_id)
+
+        # Newly-learned facts must not be hidden behind a stale retrieval cache.
+        if stored_ids:
+            await invalidate_user(self.redis, user_id)
 
         logger.info(
             "extraction_complete",

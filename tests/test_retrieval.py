@@ -26,14 +26,17 @@ def _entry(text: str, uid: str = "00000000-0000-0000-0000-000000000011") -> Memo
 @pytest.fixture()
 def fake_store() -> MagicMock:
     store = MagicMock()
+    # Default retrieval path is hybrid; keep dense available for flag-off tests.
     store.search = AsyncMock(return_value=[])
+    store.hybrid_search = AsyncMock(return_value=[])
     return store
 
 
 @pytest.fixture()
 def fake_redis() -> MagicMock:
     r = MagicMock()
-    r.get = AsyncMock(return_value=None)
+    r.get = AsyncMock(return_value=None)  # retrieval cache miss
+    r.setex = AsyncMock()
     return r
 
 
@@ -84,7 +87,7 @@ async def test_build_user_context_includes_preferences(
     fake_store, fake_redis, fake_spotify, fake_db
 ) -> None:
     """Preferences returned by Weaviate appear in the context."""
-    fake_store.search = AsyncMock(side_effect=[
+    fake_store.hybrid_search = AsyncMock(side_effect=[
         [_entry("Loves Tems")],  # preferences
         [],                       # mood_patterns
         [],                       # episodes

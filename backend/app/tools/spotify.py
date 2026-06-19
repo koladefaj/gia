@@ -35,10 +35,10 @@ from contextlib import contextmanager
 from typing import Any, Generator
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from backend.app.config import Settings
 from backend.app.observability.logging import get_logger
+from backend.app.tools.resilience import CircuitBreaker, resilient_call
 
 log = get_logger(__name__)
 
@@ -104,6 +104,11 @@ class SpotifyMCPClient:
     def __init__(self, cfg: Settings) -> None:
         self._cfg = cfg
         self._http: httpx.AsyncClient | None = None
+        self._breaker = CircuitBreaker(
+            "spotify",
+            threshold=cfg.tool_circuit_threshold,
+            cooldown=cfg.tool_circuit_cooldown_s,
+        )
 
     async def prewarm(self) -> None:
         """Open the underlying HTTP connection pool during lifespan startup.
@@ -128,12 +133,13 @@ class SpotifyMCPClient:
             )
         return self._http
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4))
     async def _call(self, tool: str, **arguments: Any) -> Any:
-        """Forward *tool* with *arguments* to the MCP server.
+        """Forward *tool* with *arguments* to the MCP server, guarded for resilience.
 
-        Retries up to three times on transient HTTP errors.  Raises
-        ``httpx.HTTPStatusError`` if all retries are exhausted.
+        Wrapped in :func:`resilient_call`: each attempt has a timeout, transient
+        failures are retried with back-off, and a per-client circuit breaker
+        fails fast (rather than piling onto a dead dependency) once the MCP
+        server is clearly down.
 
         Args:
             tool:      MCP tool name (e.g. ``get_currently_playing``).
@@ -144,12 +150,25 @@ class SpotifyMCPClient:
             The parsed JSON response from the MCP server.
 
         Raises:
+            CircuitOpenError:      If the breaker is open.
             httpx.HTTPStatusError: On non-2xx response after all retries.
         """
-        http = await self._get_http()
-        response = await http.post("/tools/call", json={"name": tool, "arguments": arguments})
-        response.raise_for_status()
-        return response.json()
+
+        async def _do() -> Any:
+            http = await self._get_http()
+            response = await http.post(
+                "/tools/call", json={"name": tool, "arguments": arguments}
+            )
+            response.raise_for_status()
+            return response.json()
+
+        return await resilient_call(
+            _do,
+            name=f"spotify.{tool}",
+            timeout_s=self._cfg.tool_timeout_s,
+            retries=2,
+            breaker=self._breaker,
+        )
 
     async def get_currently_playing(self) -> dict | None:
         """Return the track currently playing or ``None`` if nothing is active.

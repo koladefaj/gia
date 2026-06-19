@@ -27,11 +27,13 @@ from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.mood.classifier import classify_mood, deviates_significantly, time_bucket
 from backend.app.mood.proactive import _parse_pattern, get_pattern_for_now
 from backend.app.observability.logging import get_logger
-from backend.app.persona.prompt import GIA_PERSONA
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_fast_llm
 from backend.app.schemas.memory import MemoryEntry
 
 logger = get_logger(__name__)
+
+AGENT_KEY = "agents.mood"
 
 
 @dataclass
@@ -53,27 +55,22 @@ class MoodResult:
     proactive_draft: str | None = None
 
 
-def build_mood_agent(cfg: Settings) -> Agent:
-    """Construct the CrewAI Mood agent.
+def build_mood_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
+    """Construct the CrewAI Mood agent from the externalised prompt registry.
 
     Args:
-        cfg: Application settings.
+        cfg:      Application settings.
+        registry: Prompt registry for the agent identity; defaults to the
+                  process-wide singleton.
 
     Returns:
         Configured ``crewai.Agent``.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="Mood Analyst",
-        goal=(
-            "Detect what mood the user is in from their listening patterns and "
-            "surface genuine, unprompted observations when something shifts."
-        ),
-        backstory=(
-            "You are Gia's awareness layer. You read audio features like a "
-            "therapist reads body language — quietly, without making it weird. "
-            "When you notice the user drifting out of their usual pattern, you "
-            "mention it once, warmly, and let them decide what to make of it."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_fast_llm(cfg),
         verbose=False,
         allow_delegation=False,
@@ -93,6 +90,7 @@ class MoodService:
     spotify: SpotifyClientProtocol
     store: WeaviateMemoryStore
     cfg: Settings
+    registry: PromptRegistry = field(default_factory=get_registry)
 
     async def analyze(self, user_id: str) -> MoodResult:
         """Run mood analysis for *user_id*.
@@ -202,18 +200,14 @@ class MoodService:
         bucket_human = bucket.replace("_", " ")
         direction = "higher" if current_energy > pattern_energy else "lower"
 
-        prompt = (
-            GIA_PERSONA
-            + f"""
-The user is typically in a "{pattern_label}" mood during {bucket_human}.
-Right now they're listening to "{track_name}" which reads as "{current_label}" — energy is {direction} than usual.
-
-Write a single warm, natural observation that Gia might surface in conversation.
-- Maximum 2 sentences.
-- Use one audio tag sparingly ([thoughtful], [curious], [warmly]).
-- Do NOT say "Your audio features show..." — speak like a friend, not an analyst.
-- End with a gentle open question or leave it open for the user to respond.
-"""
+        prompt = self.registry.get(AGENT_KEY).render(
+            "observation",
+            persona=self.registry.get("persona.gia").render(),
+            pattern_label=pattern_label,
+            bucket_human=bucket_human,
+            track_name=track_name,
+            current_label=current_label,
+            direction=direction,
         )
 
         llm = get_fast_llm(self.cfg)
