@@ -26,8 +26,14 @@ The "I'm going for a run" turn is the demo line: it should show
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
 
-from backend.app.agents.artist import ArtistService
+# Make ``backend`` importable when run as `python scripts/demo_chat.py` from the
+# repo root (the script's own dir is on sys.path, not the project root).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from backend.app.agents.artist import ArtistService  # noqa: E402
 from backend.app.agents.dj import DJService
 from backend.app.agents.planner import build_plan
 from backend.app.config import settings
