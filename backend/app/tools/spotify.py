@@ -76,62 +76,146 @@ def _span(cfg: Settings, name: str) -> Generator[Any, None, None]:
 # ── MCP stdio bridge ──────────────────────────────────────────────────────────
 
 
-class _McpBridge:
-    """Owns a single persistent MCP ``ClientSession`` over stdio.
+def _content_text(result: Any) -> str:
+    """Concatenate the text content blocks of an MCP tool result.
 
-    The session is opened in :meth:`start` (FastAPI ``lifespan`` startup) and
-    closed in :meth:`stop` (shutdown).  ``call`` serialises tool invocations.
+    No ``type`` filter: across mcp SDK versions the attribute/value varies and
+    filtering on it can silently drop every block (→ empty result).
+    """
+    return "\n".join(
+        text for c in result.content if (text := getattr(c, "text", "")) is not None and text
+    )
+
+
+class _McpBridge:
+    """Owns the MCP ``ClientSession`` via a single long-lived *owner task*.
+
+    Why an owner task rather than a session created in ``lifespan`` and used from
+    request handlers: the stdio session's anyio task group is bound to the task
+    that opened it, so tearing it down (to reconnect) from a different task
+    raises "cancel scope in a different task".  Funnelling every connect / call /
+    teardown through one owner task keeps the lifecycle in a single scope, which
+    makes **auto-reconnect** safe.
+
+    Auto-reconnect matters because ``marcelmarais/spotify-mcp-server`` historically
+    logged to stdout on token refresh (corrupting the JSON-RPC channel); even with
+    that patched, a dropped session or transient error should self-heal rather
+    than wedge Spotify for the rest of the process.
+
+    Calls are submitted to a queue and resolved via futures, so request handlers
+    never touch the session directly.
+
+    The ``session_factory`` seam (default ``None`` → real stdio server) lets
+    tests drive the reconnect logic without spawning a process.
     """
 
-    def __init__(self, command: str, server_path: str) -> None:
+    def __init__(
+        self,
+        command: str,
+        server_path: str,
+        *,
+        session_factory: Any = None,
+    ) -> None:
         self._command = command
         self._server_path = server_path
-        self._stack: AsyncExitStack | None = None
-        self._session: Any = None
-        self._lock = asyncio.Lock()
+        self._session_factory = session_factory
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._owner: asyncio.Task | None = None
 
     @property
     def started(self) -> bool:
-        return self._session is not None
+        return self._owner is not None
 
     async def start(self) -> None:
-        """Spawn the MCP server and initialise the session."""
-        from mcp import ClientSession, StdioServerParameters  # noqa: PLC0415
-        from mcp.client.stdio import stdio_client  # noqa: PLC0415
-
-        params = StdioServerParameters(command=self._command, args=[self._server_path])
-        self._stack = AsyncExitStack()
-        read, write = await self._stack.enter_async_context(stdio_client(params))
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self._session.initialize()
-        log.info("spotify_mcp_session_started", server=self._server_path)
+        """Launch the owner task (the session connects lazily on first call)."""
+        if self._owner is None:
+            self._owner = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
-        """Tear down the session and child process."""
-        if self._stack is not None:
+        """Signal the owner task to tear down the session and exit."""
+        if self._owner is not None:
+            await self._queue.put(None)  # shutdown sentinel
             try:
-                await self._stack.aclose()
-            except Exception as exc:  # noqa: BLE001
-                log.warning("spotify_mcp_session_close_error", error=str(exc))
-        self._stack = None
-        self._session = None
+                await asyncio.wait_for(asyncio.shield(self._owner), timeout=10)
+            except (TimeoutError, asyncio.CancelledError):
+                self._owner.cancel()
+            self._owner = None
 
     async def call(self, tool: str, arguments: dict) -> str:
-        """Invoke *tool* and return its concatenated text content.
+        """Submit *tool* to the owner task and await its text result.
 
         Raises:
-            RuntimeError: If the session has not been started.
+            RuntimeError: If the bridge was never started.
+            Exception:    Whatever the call ultimately failed with after retries.
         """
-        if self._session is None:
+        if self._owner is None:
             raise RuntimeError("Spotify MCP session is not started")
-        async with self._lock:
-            result = await self._session.call_tool(tool, arguments)
-        # Concatenate any text-bearing content blocks. We don't filter on a
-        # ``type`` field: across mcp SDK versions the attribute/value varies, and
-        # filtering on it can silently drop every block (→ empty result).
-        return "\n".join(
-            text for c in result.content if (text := getattr(c, "text", "")) is not None and text
-        )
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        await self._queue.put((tool, arguments, fut))
+        return await fut
+
+    async def _run(self) -> None:
+        """Owner task: own the session, process the call queue, reconnect on error."""
+        stack: AsyncExitStack | None = None
+        session: Any = None
+
+        async def connect() -> Any:
+            nonlocal stack, session
+            if self._session_factory is not None:
+                session = await self._session_factory()
+                stack = None
+            else:
+                from mcp import ClientSession, StdioServerParameters  # noqa: PLC0415
+                from mcp.client.stdio import stdio_client  # noqa: PLC0415
+
+                params = StdioServerParameters(command=self._command, args=[self._server_path])
+                stack = AsyncExitStack()
+                read, write = await stack.enter_async_context(stdio_client(params))
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+            log.info("spotify_mcp_session_started", server=self._server_path)
+            return session
+
+        async def teardown() -> None:
+            nonlocal stack, session
+            if stack is not None:
+                try:
+                    await stack.aclose()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("spotify_mcp_session_close_error", error=str(exc))
+            stack, session = None, None
+
+        try:
+            while True:
+                item = await self._queue.get()
+                if item is None:  # shutdown
+                    break
+                tool, arguments, fut = item
+                if fut.done():  # caller already gave up
+                    continue
+
+                last_exc: Exception | None = None
+                for attempt in range(2):  # one reconnect-and-retry
+                    try:
+                        if session is None:
+                            await connect()
+                        result = await session.call_tool(tool, arguments)
+                        if not fut.done():
+                            fut.set_result(_content_text(result))
+                        last_exc = None
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        log.warning(
+                            "spotify_mcp_call_failed_reconnecting",
+                            tool=tool, attempt=attempt + 1, error=str(exc),
+                        )
+                        await teardown()  # safe — same (owner) task scope
+                        await asyncio.sleep(0.3)
+                if last_exc is not None and not fut.done():
+                    fut.set_exception(last_exc)
+        finally:
+            await teardown()
 
 
 # Neutral audio features used when real ones are unavailable (Spotify deprecated

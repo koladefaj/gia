@@ -1,28 +1,33 @@
 # Patches
 
-## `spotify-mcp-server-getTopArtists.patch`
+## `spotify-mcp-server.patch`
 
-Fixes a crash in `marcelmarais/spotify-mcp-server`'s `getTopArtists` tool:
-`Cannot read properties of undefined (reading 'length')`.
+Two fixes for `marcelmarais/spotify-mcp-server` needed for Gia:
 
-Spotify's **February 2026 API changes** stopped returning `genres` (and
-`popularity`) on top-artist items, but the server assumed `artist.genres` always
-exists. The patch guards `genres`/`popularity` against `undefined`.
+1. **`getTopArtists` crash** (`src/read.ts`) — `Cannot read properties of
+   undefined (reading 'length')`. Spotify's **February 2026 API changes** stopped
+   returning `genres`/`popularity` on top-artist items, but the server assumed
+   `artist.genres` always exists. The patch guards against `undefined`. Required
+   for the onboarding profiler (`POST /memory/{user_id}/bootstrap`).
 
-The onboarding profiler (`POST /memory/{user_id}/bootstrap`) needs top artists,
-so this fix is required for that feature to use real data.
+2. **stdout corruption on token refresh** (`src/utils.ts`) — the server logged
+   "Access token refreshing…" to **stdout**, but for a stdio MCP server stdout
+   *is* the JSON-RPC channel, so that log corrupted the protocol stream and broke
+   the client mid-session (~hourly, on token refresh). The patch routes those
+   logs to **stderr**. (The app's bridge also auto-reconnects as defense in depth.)
 
 ### Apply
 
 ```bash
 git clone https://github.com/marcelmarais/spotify-mcp-server.git
 cd spotify-mcp-server
-git apply /path/to/vexis/patches/spotify-mcp-server-getTopArtists.patch
+git apply /path/to/vexis/patches/spotify-mcp-server.patch
 npm install && npm run build
 ```
 
 Then point the app at it via `SPOTIFY_MCP_SERVER_PATH=.../build/index.js`.
 
 > Note: Spotify's Feb-2026 changes also **403 on playlist creation / track
-> management** (`createPlaylist`, `addTracksToPlaylist`) — see upstream issues
-> #35 and #62. Those are server-side Spotify restrictions, not fixable here.
+> management** (`createPlaylist`, `addTracksToPlaylist`) — upstream issues #35
+> and #62. Those are server-side Spotify restrictions (Development-Mode apps),
+> not fixable here.

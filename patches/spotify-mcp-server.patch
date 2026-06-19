@@ -33,3 +33,28 @@ index 327dcab..a455c28 100644
        })
        .join('\n');
  
+diff --git a/src/utils.ts b/src/utils.ts
+index 4decdfc..506d594 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -129,7 +129,10 @@ export async function createSpotifyApi(): Promise<SpotifyApi> {
+       !config.expiresAt || config.expiresAt <= now + 5 * 60 * 1000;
+ 
+     if (shouldRefresh) {
+-      console.log(
++      // Use stderr, not stdout: for a stdio MCP server stdout IS the JSON-RPC
++      // channel, and logging to it corrupts the protocol stream (breaks the
++      // client mid-session on token refresh).
++      console.error(
+         'Access token expired or missing expiration time, refreshing...',
+       );
+       try {
+@@ -137,7 +140,7 @@ export async function createSpotifyApi(): Promise<SpotifyApi> {
+         config.accessToken = tokens.access_token;
+         config.expiresAt = now + tokens.expires_in * 1000; // Convert seconds to milliseconds
+         saveSpotifyConfig(config);
+-        console.log('Access token refreshed successfully');
++        console.error('Access token refreshed successfully');
+ 
+         // Clear cached API instance to force recreation with new token
+         cachedSpotifyApi = null;
