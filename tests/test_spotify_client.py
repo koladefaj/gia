@@ -1,8 +1,7 @@
 """Tests for ``SpotifyMCPClient`` and ``FakeSpotifyClient``.
 
-Unit tests validate the real client's HTTP call logic using a mocked
-``httpx.AsyncClient``.  Integration concerns (MCP server actually running)
-are out of scope here; those live in ``tests/integration/``.
+Unit tests validate the real client's tool-mapping and text-parsing logic with
+the MCP bridge replaced by a mock — no live MCP server is spawned.
 
 The ``FakeSpotifyClient`` is also tested to ensure it stays aligned with the
 ``SpotifyClientProtocol`` interface — so tests that use the fake remain
@@ -11,8 +10,7 @@ meaningful as the interface evolves.
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -20,7 +18,6 @@ from backend.app.config import Settings
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.tools.spotify import SpotifyMCPClient
 from tests.conftest import FakeSpotifyClient
-
 
 # ── FakeSpotifyClient contract tests ─────────────────────────────────────────
 
@@ -104,111 +101,74 @@ async def test_fake_get_audio_features_unknown_uri_returns_fallback() -> None:
     assert "uri" in features[0]
 
 
-# ── SpotifyMCPClient (real) unit tests ────────────────────────────────────────
+# ── SpotifyMCPClient (real, MCP stdio) unit tests ─────────────────────────────
 
 
 @pytest.fixture()
-def spotify_cfg(test_settings: Settings) -> Settings:
-    """Settings with a test MCP URL."""
-    return test_settings
-
-
-@pytest.fixture()
-def mcp_client(spotify_cfg: Settings) -> SpotifyMCPClient:
-    """Return a ``SpotifyMCPClient`` with a mocked HTTP layer."""
-    return SpotifyMCPClient(cfg=spotify_cfg)
-
-
-def _mock_http_response(data: object) -> AsyncMock:
-    """Build a mock ``httpx.Response`` that returns *data* as JSON."""
-    mock_resp = MagicMock()
-    mock_resp.json.return_value = data
-    mock_resp.raise_for_status = MagicMock()
-    return mock_resp
+def mcp_client(test_settings: Settings) -> SpotifyMCPClient:
+    """Return a ``SpotifyMCPClient`` whose MCP bridge is replaced by an AsyncMock."""
+    client = SpotifyMCPClient(cfg=test_settings)
+    client._bridge = MagicMock()
+    client._bridge.call = AsyncMock(return_value="")
+    client._bridge.stop = AsyncMock()
+    return client
 
 
 @pytest.mark.asyncio
-async def test_mcp_client_calls_correct_tool_name(mcp_client: SpotifyMCPClient) -> None:
-    """``_call`` sends the correct ``name`` field to the MCP server."""
-    captured: list[dict] = []
-
-    async def fake_post(url: str, *, json: dict, **_: object) -> MagicMock:  # noqa: A002
-        captured.append(json)
-        resp = MagicMock()
-        resp.json.return_value = [{"uri": "spotify:track:001", "name": "Free Mind"}]
-        resp.raise_for_status = MagicMock()
-        return resp
-
-    mock_http = AsyncMock()
-    mock_http.post = fake_post
-    mock_http.is_closed = False
-    mcp_client._http = mock_http
-
-    await mcp_client.get_recently_played(limit=5)
-    assert captured[0]["name"] == "get_recently_played"
-    assert captured[0]["arguments"]["limit"] == 5
+async def test_search_tracks_maps_tool_and_parses(mcp_client: SpotifyMCPClient) -> None:
+    """``search_tracks`` calls ``searchSpotify`` and parses the text into dicts."""
+    mcp_client._bridge.call = AsyncMock(return_value=(
+        '# Search results for "tems" (type: track)\n\n'
+        '1. "Free Mind" by Tems (4:08) - ID: 2mzM4Y0Rnx2BDZqRnhQ5Q6\n'
+    ))
+    out = await mcp_client.search_tracks("tems", limit=5)
+    name, args = mcp_client._bridge.call.call_args
+    assert name[0] == "searchSpotify"
+    assert name[1] == {"query": "tems", "type": "track", "limit": 5}
+    assert out == [{
+        "uri": "spotify:track:2mzM4Y0Rnx2BDZqRnhQ5Q6",
+        "id": "2mzM4Y0Rnx2BDZqRnhQ5Q6", "name": "Free Mind", "artist": "Tems",
+    }]
 
 
 @pytest.mark.asyncio
-async def test_mcp_client_get_audio_features_passes_uris(mcp_client: SpotifyMCPClient) -> None:
-    """``get_audio_features`` forwards the URI list in ``arguments``."""
-    captured: list[dict] = []
-
-    async def fake_post(url: str, *, json: dict, **_: object) -> MagicMock:  # noqa: A002
-        captured.append(json)
-        resp = MagicMock()
-        resp.json.return_value = [{"uri": "spotify:track:001", "energy": 0.38}]
-        resp.raise_for_status = MagicMock()
-        return resp
-
-    mock_http = AsyncMock()
-    mock_http.post = fake_post
-    mock_http.is_closed = False
-    mcp_client._http = mock_http
-
-    uris = ["spotify:track:001"]
-    await mcp_client.get_audio_features(uris)
-    assert captured[0]["arguments"]["uris"] == uris
+async def test_get_recently_played_maps_tool(mcp_client: SpotifyMCPClient) -> None:
+    await mcp_client.get_recently_played(limit=3)
+    name, _ = mcp_client._bridge.call.call_args
+    assert name[0] == "getRecentlyPlayed"
+    assert name[1] == {"limit": 3}
 
 
 @pytest.mark.asyncio
-async def test_mcp_client_close_closes_http(mcp_client: SpotifyMCPClient) -> None:
-    """``close()`` closes the underlying HTTP client."""
-    mock_http = AsyncMock()
-    mock_http.is_closed = False
-    mcp_client._http = mock_http
+async def test_get_audio_features_returns_neutral_without_calling(mcp_client: SpotifyMCPClient) -> None:
+    """No audio-features tool exists; return neutral placeholders, no MCP call."""
+    uris = ["spotify:track:001", "spotify:track:002"]
+    features = await mcp_client.get_audio_features(uris)
+    assert [f["uri"] for f in features] == uris
+    assert all("energy" in f and "key" in f for f in features)
+    mcp_client._bridge.call.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_start_playback_maps_to_play_music_with_device(mcp_client: SpotifyMCPClient) -> None:
+    res = await mcp_client.start_playback("spotify:track:001", device_id="dev-abc")
+    name, _ = mcp_client._bridge.call.call_args
+    assert name[0] == "playMusic"
+    assert name[1] == {"uri": "spotify:track:001", "deviceId": "dev-abc"}
+    assert res["status"] == "playing"
+
+
+@pytest.mark.asyncio
+async def test_close_stops_bridge(mcp_client: SpotifyMCPClient) -> None:
     await mcp_client.close()
-    mock_http.aclose.assert_called_once()
+    mcp_client._bridge.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_mcp_client_close_is_idempotent(mcp_client: SpotifyMCPClient) -> None:
-    """``close()`` is safe to call when the HTTP client is already closed."""
-    mock_http = AsyncMock()
-    mock_http.is_closed = True
-    mcp_client._http = mock_http
-
-    await mcp_client.close()  # should not raise
-    mock_http.aclose.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_mcp_client_start_playback_passes_device_id(mcp_client: SpotifyMCPClient) -> None:
-    """``start_playback`` forwards an optional ``device_id`` to the MCP call."""
-    captured: list[dict] = []
-
-    async def fake_post(url: str, *, json: dict, **_: object) -> MagicMock:  # noqa: A002
-        captured.append(json)
-        resp = MagicMock()
-        resp.json.return_value = {"status": "playing"}
-        resp.raise_for_status = MagicMock()
-        return resp
-
-    mock_http = AsyncMock()
-    mock_http.post = fake_post
-    mock_http.is_closed = False
-    mcp_client._http = mock_http
-
-    await mcp_client.start_playback("spotify:track:001", device_id="device-abc")
-    assert captured[0]["arguments"]["device_id"] == "device-abc"
+async def test_prewarm_noop_when_path_unset(test_settings: Settings) -> None:
+    """With no server path configured, prewarm does not start the bridge."""
+    cfg = test_settings.model_copy(update={"spotify_mcp_server_path": ""})
+    client = SpotifyMCPClient(cfg=cfg)
+    client._bridge.start = AsyncMock()
+    await client.prewarm()
+    client._bridge.start.assert_not_awaited()

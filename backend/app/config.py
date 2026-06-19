@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     spotify_client_secret: str = Field(default="")
     spotify_redirect_uri: str = Field(default="http://localhost:8000/auth/spotify/callback")
     spotify_mcp_url: str = Field(default="http://localhost:3001")
+    # Path to the built marcelmarais/spotify-mcp-server entrypoint (build/index.js).
+    # When set, SpotifyMCPClient spawns it over stdio (MCP protocol). Empty = the
+    # client stays inert and Spotify-dependent features degrade gracefully.
+    spotify_mcp_server_path: str = Field(default="")
+    spotify_mcp_command: str = Field(default="node")
 
     # --- TTS ---
     tts_provider: str = Field(default="kokoro")
