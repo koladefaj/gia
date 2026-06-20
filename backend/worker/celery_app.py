@@ -10,6 +10,7 @@ celery_app = Celery(
         "backend.worker.tasks.memory_extraction",
         "backend.worker.tasks.mood_inference",
         "backend.worker.tasks.proactive_check",
+        "backend.worker.tasks.session_flush",
     ],
 )
 
@@ -26,6 +27,12 @@ celery_app.conf.update(
         "mood-inference-periodic": {
             "task": "backend.worker.tasks.mood_inference.run_mood_inference_all",
             "schedule": 1800.0,
+        },
+        # Flush tail-end memories from sessions that went idle before the
+        # 45-minute per-session extraction throttle fired.
+        "session-flush-periodic": {
+            "task": "backend.worker.tasks.session_flush.flush_idle_sessions",
+            "schedule": 2700.0,
         },
     },
 )

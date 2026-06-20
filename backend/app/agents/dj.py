@@ -9,8 +9,7 @@
 5. Optionally starts Spotify playback immediately.
 
 The CrewAI ``Agent`` (from ``build_dj_agent``) is returned for composition
-into multi-agent crews starting Day 6.  For Days 4-5 the service method
-is called directly from the API layer.
+into multi-agent crews.
 """
 
 from __future__ import annotations
@@ -132,6 +131,7 @@ class DJService:
             valence=seed.valence,
             camelot=camelot,
             queued_names=queued_names,
+            start_playback=start_playback,
         )
 
         llm = get_llm(self.cfg)

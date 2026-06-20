@@ -1,65 +1,74 @@
-"""BGE-base-en-v1.5 embedding service.
+"""Embedding service — OpenAI ``text-embedding-3-small`` (1536-dim).
 
-The model is loaded lazily on first call and cached in-process.  All
-encoding runs in a thread pool (``asyncio.to_thread``) so the event loop
-is never blocked by CPU-bound work.
+Memory text is embedded via the OpenAI API rather than a local model, so the
+containers stay torch-free and production ships nothing heavy.  The call is
+already async (OpenAI SDK), so there's no thread-pool hop.
 
 SHA-256 deduplication is handled at the *storage* level, not here.
-``text_hash`` returns the key used by callers to check Redis before writing
-to Weaviate.
+``text_hash`` returns the key callers use to check Redis before writing.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-from functools import lru_cache
+import json
 
+from backend.app.config import settings
 from backend.app.observability.logging import get_logger
+from backend.app.providers.openai_client import get_async_openai
 
 logger = get_logger(__name__)
 
-_MODEL_NAME = "BAAI/bge-base-en-v1.5"
-VECTOR_DIM = 768
+# text-embedding-3-small native dimensionality. If this changes, the Weaviate
+# collections must be recreated and the user re-seeded (vectors of different
+# dimension can't be compared).
+VECTOR_DIM = 1536
+
+_EMBED_CACHE_TTL = 86400  # 24 hours — vectors are stable for the same text
 
 
-@lru_cache(maxsize=1)
-def _get_model():  # type: ignore[return]
-    """Load the BGE model once and cache it for the lifetime of the process.
+async def embed(text: str, redis=None) -> list[float]:
+    """Return an embedding vector for *text* via the OpenAI embeddings API.
 
-    The import is intentionally deferred so unit tests that mock
-    ``asyncio.to_thread`` don't trigger a full model download.
-
-    Returns:
-        A ``SentenceTransformer`` instance ready for encoding.
-    """
-    from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-
-    logger.info("bge_model_loading", model=_MODEL_NAME)
-    model = SentenceTransformer(_MODEL_NAME)
-    logger.info("bge_model_ready", dim=VECTOR_DIM)
-    return model
-
-
-async def embed(text: str) -> list[float]:
-    """Return a 768-dim normalised BGE embedding for *text*.
+    When *redis* is supplied the result is cached under
+    ``embed_cache:{sha256(text)}`` for :data:`_EMBED_CACHE_TTL` seconds so
+    identical queries within a day skip the API call entirely.  Cache errors
+    are silently swallowed — a miss is always safe.
 
     Args:
-        text: The string to embed.  Long texts are handled by the model's
-              internal pooling, but prefer keeping inputs under 512 tokens
-              for best quality.
+        text:  The string to embed.
+        redis: Optional async Redis client for the embedding cache.
 
     Returns:
-        A Python ``list[float]`` of length 768, L2-normalised, suitable for
-        Weaviate ``near_vector`` cosine-distance queries.
+        A ``list[float]`` of length :data:`VECTOR_DIM`, suitable for Weaviate
+        ``near_vector`` / hybrid cosine queries.
+
+    Raises:
+        Exception: Propagates OpenAI/network errors — callers already degrade
+            the turn on failure.
     """
+    cache_key = f"embed_cache:{text_hash(text)}" if redis is not None else None
 
-    def _encode() -> list[float]:
-        model = _get_model()
-        vector = model.encode(text, normalize_embeddings=True)
-        return vector.tolist()
+    if cache_key is not None:
+        try:
+            cached = await redis.get(cache_key)
+            if cached is not None:
+                logger.debug("embed_cache_hit", chars=len(text))
+                return json.loads(cached)
+        except Exception:  # noqa: BLE001
+            pass  # cache failure → fall through to API call
 
-    return await asyncio.to_thread(_encode)
+    client = get_async_openai(settings)
+    resp = await client.embeddings.create(model=settings.embedding_model, input=text)
+    vector = list(resp.data[0].embedding)
+
+    if cache_key is not None:
+        try:
+            await redis.set(cache_key, json.dumps(vector), ex=_EMBED_CACHE_TTL)
+        except Exception:  # noqa: BLE001
+            pass  # caching failure is non-fatal
+
+    return vector
 
 
 def text_hash(text: str) -> str:

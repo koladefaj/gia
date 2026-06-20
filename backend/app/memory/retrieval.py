@@ -242,7 +242,7 @@ async def build_user_context(
     """
     cfg = cfg or _default_settings
     rcfg = RetrievalConfig.from_settings(cfg)
-    query_vector = await embed(query)
+    query_vector = await embed(query, redis=redis)
 
     def _retrieve(memory_type: str, k: int) -> Awaitable[list[MemoryEntry]]:
         return retrieve_memories(
@@ -259,6 +259,7 @@ async def build_user_context(
     (
         profile,
         preferences,
+        life_facts,
         mood_patterns,
         episodes,
         session_raw,
@@ -267,6 +268,7 @@ async def build_user_context(
     ) = await asyncio.gather(
         _get_profile(user_id, db),
         _retrieve("preference", cfg.retrieval_k_preferences),
+        _retrieve("life_fact", cfg.retrieval_k_life_facts),
         _retrieve("mood_pattern", cfg.retrieval_k_mood),
         _retrieve("episode", cfg.retrieval_k_episodes),
         redis.get(f"session:{user_id}"),
@@ -287,6 +289,7 @@ async def build_user_context(
         recently_played = []
 
     preferences = _safe_list(preferences, [])
+    life_facts = _safe_list(life_facts, [])
     mood_patterns = _safe_list(mood_patterns, [])
     episodes = _safe_list(episodes, [])
 
@@ -296,6 +299,7 @@ async def build_user_context(
         user_id=user_id,
         profile=profile,
         preferences=preferences,  # type: ignore[arg-type]
+        life_facts=life_facts,  # type: ignore[arg-type]
         mood_patterns=mood_patterns,  # type: ignore[arg-type]
         episodes=episodes,  # type: ignore[arg-type]
         session_summary=session_raw,  # type: ignore[arg-type]

@@ -107,7 +107,7 @@ class MemoryService:
         if existing is None:
             from backend.app.memory.embeddings import embed as _embed  # noqa: PLC0415
 
-            query_vector = await _embed(transcript[:500])
+            query_vector = await _embed(transcript[:500], redis=self.redis)
             existing = await self.store.search(user_id, query_vector, "preference", k=5)
 
         new_memories: list[ExtractedMemory] = await extract_memories(
@@ -145,7 +145,7 @@ class MemoryService:
                 logger.debug("memory_dedup_skip", user_id=user_id, text=memory.text[:40])
                 continue
 
-            vector = await embed(memory.text)
+            vector = await embed(memory.text, redis=self.redis)
 
             if memory.supersedes_id:
                 await apply_supersede(self.store, memory.supersedes_id)
