@@ -51,6 +51,10 @@ sections:
     - "I'm listening to X", "I'm on X right now", "currently listening to X" — these
       are statements of current activity, NOT play requests. Always classify as
       GENERAL_CHAT with needs_music=false and start_playback=false.
+    - Opinion/suggestion questions ("what do you suggest", "what would you recommend",
+      "drake or asake?", "which is better", "what should I listen to") are GENERAL_CHAT
+      with needs_music=false and start_playback=false. Gia answers conversationally
+      first; the user decides whether to play after hearing the suggestion.
     - search_query: when needs_music or needs_search, write the clean thing to
       search for, with pronouns RESOLVED from the recent conversation. E.g. after
       the user mentioned "Fortworth by Drake and PARTYNEXTDOOR", a later "just play
@@ -72,6 +76,10 @@ sections:
     {"intent":"NEWS_QUERY","tone":"surprised","confidence":0.9,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":"Drake Ice Man","start_playback":false}
     User: "just thought I'd say hi, how have you been"
     {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.97,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
+    User: "drake or asake what do you suggest?"
+    {"intent":"GENERAL_CHAT","tone":"thoughtful","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
+    User: "what should I listen to right now"
+    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.9,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
     User: "I'm listening to him right now"
     {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
     User: "I'm on PARTYNEXTDOOR right now"
