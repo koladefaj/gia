@@ -30,10 +30,10 @@ import os
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Annotated
 from urllib.parse import urlencode
 
 import httpx
-from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from redis.asyncio import Redis as AsyncRedis
@@ -207,7 +207,7 @@ async def spotify_callback(
     try:
         user_uuid = uuid.UUID(user_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"user_id {user_id!r} is not a valid UUID.")
+        raise HTTPException(status_code=400, detail=f"user_id {user_id!r} is not a valid UUID.") from None
 
     async with httpx.AsyncClient() as http:
         resp = await http.post(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -15,7 +15,7 @@ from backend.app.memory.cache import (
 )
 from backend.app.schemas.memory import MemoryEntry
 
-_NOW = datetime(2026, 6, 19, tzinfo=timezone.utc)
+_NOW = datetime(2026, 6, 19, tzinfo=UTC)
 
 
 class FakeRedis:

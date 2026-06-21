@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import logging
 
-import structlog
-
 from backend.app.observability.logging import get_logger, setup_logging
 
 

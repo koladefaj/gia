@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
-
 from backend.worker.tasks.memory_extraction import extract_session_memories
 from backend.worker.tasks.mood_inference import (
     run_mood_inference,

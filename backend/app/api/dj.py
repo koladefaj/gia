@@ -1,10 +1,11 @@
 """DJ API — track recommendation and crossfade queue endpoints."""
 
 from __future__ import annotations
-from redis import Redis
-from typing_extensions import Annotated
+
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
+from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 

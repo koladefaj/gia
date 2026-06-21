@@ -21,8 +21,6 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.config import Settings
-from backend.app.db.models import Profile, User
-from tests.conftest import FakeSpotifyClient
 
 # Valid UUID used as the test user identity throughout auth tests
 _TEST_USER_ID = "00000000-0000-0000-0000-000000000001"

@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import uuid as uuid_lib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from weaviate import WeaviateClient
 from weaviate.classes.query import Filter, HybridFusion, MetadataQuery
@@ -45,7 +45,7 @@ def _obj_to_entry(obj) -> MemoryEntry:  # type: ignore[return]
     if isinstance(created_at, str):
         created_at = datetime.fromisoformat(created_at)
     if created_at is None:
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(UTC)
 
     score = 0.0
     if obj.metadata is not None:
@@ -186,7 +186,7 @@ class WeaviateMemoryStore:
                     "type": memory.type,
                     "text": memory.text,
                     "confidence": memory.confidence,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": datetime.now(UTC).isoformat(),
                     "supersedes_id": memory.supersedes_id or "",
                 },
                 vector=vector,

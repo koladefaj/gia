@@ -6,7 +6,8 @@ Validates the ``get_db`` dependency generator: that it yields an
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import contextlib
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,10 +30,8 @@ async def test_get_db_yields_session() -> None:
         session = await gen.__anext__()
         assert session is mock_session
         # Clean up the generator
-        try:
+        with contextlib.suppress(StopAsyncIteration):
             await gen.aclose()
-        except StopAsyncIteration:
-            pass
 
 
 @pytest.mark.asyncio

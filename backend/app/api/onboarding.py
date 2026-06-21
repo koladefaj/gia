@@ -53,7 +53,7 @@ async def bootstrap_profile(
     try:
         _uuid.UUID(user_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.")
+        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.") from None
 
     store = WeaviateMemoryStore(client=weaviate)
     stored = await bootstrap_taste_profile(

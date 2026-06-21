@@ -7,12 +7,12 @@ directly (they accept ``Settings`` as an argument).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from backend.app.config import Settings
-from backend.app.providers.llm import _build_llm, get_fast_llm, get_llm
+from backend.app.providers.llm import get_fast_llm, get_llm
 
 
 @pytest.fixture()

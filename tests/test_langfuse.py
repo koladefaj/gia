@@ -58,7 +58,7 @@ def test_crew_trace_collects_spans() -> None:
 def test_crew_trace_span_exception_still_closes() -> None:
     """A span is closed even if the body raises an exception."""
     trace = CrewTrace(session_id="s1", user_id=None)
-    with pytest.raises(ValueError), trace.span("router") as span:
+    with pytest.raises(ValueError), trace.span("router"):
         raise ValueError("test error")
 
     assert len(trace.spans) == 1
@@ -87,11 +87,8 @@ def test_init_langfuse_noop_without_langfuse_installed() -> None:
     from backend.app.observability.langfuse import init_langfuse
 
     with patch.dict("sys.modules", {"langfuse": None}):
-        # Should not raise even if langfuse is "not installed"
-        try:
-            init_langfuse("pk-test", "sk-test", "https://cloud.langfuse.com")
-        except ImportError:
-            pass  # acceptable
+        # init_langfuse swallows a missing-package ImportError itself.
+        init_langfuse("pk-test", "sk-test", "https://cloud.langfuse.com")
 
 
 @pytest.mark.asyncio

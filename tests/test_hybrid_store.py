@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,7 +18,7 @@ def _obj(uid: str, text: str, score: float) -> MagicMock:
         "type": "preference",
         "text": text,
         "confidence": 0.9,
-        "created_at": datetime(2026, 6, 19, tzinfo=timezone.utc),
+        "created_at": datetime(2026, 6, 19, tzinfo=UTC),
         "supersedes_id": "",
         "user_id": "00000000-0000-0000-0000-000000000001",
     }

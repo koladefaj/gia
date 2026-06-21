@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from backend.app.memory.fusion import RRF_K, fuse_memories, reciprocal_rank_fusion
 from backend.app.schemas.memory import MemoryEntry
 
-_NOW = datetime(2026, 6, 19, tzinfo=timezone.utc)
+_NOW = datetime(2026, 6, 19, tzinfo=UTC)
 
 
 def _m(uid: str, text: str) -> MemoryEntry:

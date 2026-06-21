@@ -22,6 +22,7 @@ async def test_transcribe_returns_empty_when_whisper_not_installed() -> None:
 async def test_transcribe_returns_text_from_whisper() -> None:
     """``transcribe`` joins segment texts from the model."""
     from unittest.mock import MagicMock
+
     from backend.app.providers.stt import transcribe
 
     seg1 = MagicMock()
@@ -42,6 +43,7 @@ async def test_transcribe_returns_text_from_whisper() -> None:
 async def test_transcribe_handles_model_error() -> None:
     """Transcription errors return ``""`` without raising."""
     from unittest.mock import MagicMock
+
     from backend.app.providers.stt import transcribe
 
     mock_model = MagicMock()
@@ -57,6 +59,7 @@ async def test_transcribe_handles_model_error() -> None:
 async def test_transcribe_empty_segments() -> None:
     """Empty segment list returns ``""``."""
     from unittest.mock import MagicMock
+
     from backend.app.providers.stt import transcribe
 
     mock_model = MagicMock()

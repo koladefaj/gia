@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,7 +10,7 @@ import pytest
 from backend.app.schemas.memory import ExtractedMemory, MemoryEntry
 
 _USER_ID = "00000000-0000-0000-0000-000000000001"
-_NOW = datetime(2026, 6, 19, tzinfo=timezone.utc)
+_NOW = datetime(2026, 6, 19, tzinfo=UTC)
 
 
 def _entry(text: str) -> MemoryEntry:

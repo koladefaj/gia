@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,7 +10,7 @@ import pytest
 from backend.app.memory import reranker
 from backend.app.schemas.memory import MemoryEntry
 
-_NOW = datetime(2026, 6, 19, tzinfo=timezone.utc)
+_NOW = datetime(2026, 6, 19, tzinfo=UTC)
 
 
 def _m(uid: str, text: str) -> MemoryEntry:

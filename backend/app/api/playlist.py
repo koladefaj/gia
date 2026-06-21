@@ -46,5 +46,5 @@ async def create_playlist(
         result = await web.create_playlist(body.name, body.description, body.track_uris)
     except Exception as exc:  # noqa: BLE001
         logger.warning("create_playlist_error", error=str(exc))
-        raise HTTPException(status_code=502, detail=f"Spotify playlist creation failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"Spotify playlist creation failed: {exc}") from exc
     return result

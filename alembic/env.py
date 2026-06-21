@@ -22,7 +22,6 @@ To roll back the last migration::
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -30,6 +29,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 # The noqa comment suppresses "imported but unused" warnings — the import
 # is the side-effect we need.
 import backend.app.db.models  # noqa: F401
+from alembic import context
 from backend.app.config import settings
 from backend.app.db.base import Base
 

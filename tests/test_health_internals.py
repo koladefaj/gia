@@ -13,7 +13,6 @@ import pytest
 
 from backend.app.api.health import _check_postgres, _check_redis, _check_weaviate
 
-
 # ── _check_postgres ───────────────────────────────────────────────────────────
 
 

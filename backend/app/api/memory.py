@@ -10,6 +10,7 @@ Spotify client, all injected via FastAPI's ``Depends`` mechanism.
 """
 
 from __future__ import annotations
+
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -94,7 +95,7 @@ async def get_user_context(
 
         _uuid.UUID(user_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.")
+        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.") from None
 
     store = WeaviateMemoryStore(client=weaviate)
     context = await build_user_context(
@@ -139,7 +140,7 @@ async def extract_memories_endpoint(
 
         _uuid.UUID(user_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.")
+        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.") from None
 
     store = WeaviateMemoryStore(client=weaviate)
     service = MemoryService(store=store, redis=redis, cfg=cfg)

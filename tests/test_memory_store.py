@@ -9,7 +9,7 @@ dispatch.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,7 +32,7 @@ def _make_weaviate_obj(
         "type": memory_type,
         "text": text,
         "confidence": confidence,
-        "created_at": datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc),
+        "created_at": datetime(2026, 6, 19, 12, 0, tzinfo=UTC),
         "supersedes_id": supersedes_id,
         "user_id": "00000000-0000-0000-0000-000000000001",
     }
@@ -68,7 +68,7 @@ async def test_search_returns_empty_when_no_results(fake_weaviate: MagicMock) ->
 @pytest.mark.asyncio
 async def test_search_maps_objects_to_memory_entries(fake_weaviate: MagicMock) -> None:
     """``search`` converts raw Weaviate objects to ``MemoryEntry`` instances."""
-    from backend.app.memory.store import WeaviateMemoryStore, _obj_to_entry
+    from backend.app.memory.store import _obj_to_entry
 
     obj = _make_weaviate_obj(
         "aaaaaaaa-0000-0000-0000-000000000001",

@@ -65,7 +65,11 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
-ignore = ["E501"]
+ignore = [
+    "E501",   # line length — handled by the formatter
+    "B008",   # function call in arg default — FastAPI Depends() is idiomatic
+    "UP042",  # str + Enum is deliberate (works everywhere, no StrEnum churn)
+]
 fixable = ["ALL"]
 unfixable = []
 

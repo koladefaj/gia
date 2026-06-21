@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Generator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,10 +95,8 @@ class AgentSpan:
         """
         self.output = output
         if self._lf_obs is not None:
-            try:
+            with suppress(Exception):
                 self._lf_obs.update(output=output[:1000])
-            except Exception:  # noqa: BLE001
-                pass
 
     def _close(self) -> None:
         """Finalise wall-clock latency (the observation is closed by ``span``)."""
@@ -163,10 +161,8 @@ class CrewTrace:
     def set_output(self, output: str) -> None:
         """Set the trace-level output (mirrored onto the root observation)."""
         if self._root is not None:
-            try:
+            with suppress(Exception):
                 self._root.update(output=output[:2000])
-            except Exception:  # noqa: BLE001
-                pass
 
     def score(
         self,
@@ -200,10 +196,8 @@ class CrewTrace:
     def flush(self) -> None:
         """Flush buffered events to Langfuse (best-effort, non-blocking)."""
         if _client is not None:
-            try:
+            with suppress(Exception):
                 _client.flush()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 @asynccontextmanager

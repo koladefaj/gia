@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -153,7 +154,7 @@ async def test_artist_service_includes_user_memory(
     fake_spotify_artist, fake_brave_results, test_settings
 ) -> None:
     """User history from Weaviate is fetched when user_id is provided."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from backend.app.agents.artist import ArtistService
     from backend.app.schemas.memory import MemoryEntry
@@ -167,7 +168,7 @@ async def test_artist_service_includes_user_memory(
         type="preference",
         text="User loves Odumodublvck's aggressive flow",
         confidence=0.9,
-        created_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        created_at=datetime(2026, 6, 1, tzinfo=UTC),
     )
 
     fake_store = MagicMock()

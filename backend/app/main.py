@@ -29,14 +29,22 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import redis.asyncio as aioredis
-import weaviate
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
-from backend.app.api import artist, auth, chat, dj, health, memory, onboarding, playlist, voice
+from backend.app.api import (
+    artist,
+    auth,
+    chat,
+    dj,
+    health,
+    memory,
+    onboarding,
+    playlist,
+    voice,
+)
 from backend.app.config import settings
 from backend.app.db.session import engine
 from backend.app.db.weaviate_init import get_weaviate_client, init_weaviate_schema
@@ -110,7 +118,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.spotify.prewarm(),
         return_exceptions=True,
     )
-    for name, result in zip(("postgres", "redis", "spotify"), results):
+    for name, result in zip(("postgres", "redis", "spotify"), results, strict=True):
         if isinstance(result, Exception):
             logger.warning("prewarm_failed", service=name, error=str(result))
         else:

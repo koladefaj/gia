@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
 from typing import Annotated
+
+from fastapi import APIRouter, Depends
 from weaviate import WeaviateClient
 
 from backend.app.agents.artist import ArtistService

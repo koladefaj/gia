@@ -30,7 +30,8 @@ from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
-from backend.app.config import Settings, settings as _default_settings
+from backend.app.config import Settings
+from backend.app.config import settings as _default_settings
 from backend.app.db.session import AsyncSessionLocal
 from backend.app.interfaces import SpotifyClientProtocol, WeatherClientProtocol
 from backend.app.observability.logging import get_logger
