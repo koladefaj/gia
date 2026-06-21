@@ -23,12 +23,15 @@ Crew execution order:
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import json
 import re
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -40,10 +43,11 @@ from weaviate import WeaviateClient
 from backend.app.agents.acknowledgment import get_selector, should_acknowledge
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
-from backend.app.agents.general import opening_line, respond_general
+from backend.app.agents.general import opening_line, respond_general, stream_general
 from backend.app.agents.hybrid_router import classify_turn
 from backend.app.agents.mood import MoodService
 from backend.app.agents.planner import _wants_weather
+from backend.app.agents.router import _keyword_classify
 from backend.app.agents.synthesis import synthesize_reply
 from backend.app.config import Settings
 from backend.app.dependencies import (
@@ -59,15 +63,16 @@ from backend.app.interfaces import SpotifyClientProtocol, WeatherClientProtocol
 from backend.app.memory.retrieval import build_user_context
 from backend.app.memory.session_history import append_turn, format_history, get_history
 from backend.app.memory.store import WeaviateMemoryStore
+from backend.app.mood.ingest import ingest_recently_played
 from backend.app.mood.proactive import pop_proactive_draft
 from backend.app.observability.langfuse import crew_trace
 from backend.app.observability.logging import get_logger
 from backend.app.providers.tts import is_emotional, synthesize
 from backend.app.schemas.chat import ChatRequest, IntentType
-from backend.app.schemas.router import RouterDecision
+from backend.app.schemas.router import RouterDecision, Tone
 from backend.app.tools.brave import BraveSearchClient
 from backend.app.voice.adapter import VoiceAdapter
-from backend.app.voice.streaming import split_sentences
+from backend.app.voice.streaming import split_sentences, stream_sentences
 
 logger = get_logger(__name__)
 
@@ -118,6 +123,11 @@ async def _weather_note(weather: WeatherClientProtocol, cfg: Settings) -> str | 
 
 
 _voice_adapter = VoiceAdapter()
+
+# Recent turns of the session transcript handed to the router (≈3 exchanges).
+# The reply path keeps the full window (session_history._MAX_TURNS); the router
+# only needs enough to resolve references and derive a clean search_query.
+_ROUTER_HISTORY_TURNS = 6
 
 # Intents the conversational responder handles directly (no specialist agent).
 _CONVERSATIONAL_INTENTS = {
@@ -171,6 +181,175 @@ async def _tts_frame(text: str, provider: str, api_key: str, voice_id: str) -> s
     })
 
 
+async def _aiter(items: list[str]) -> AsyncIterator[str]:
+    """Adapt a ready list of sentences to the async-iterator interface."""
+    for item in items:
+        yield item
+
+
+@asynccontextmanager
+async def _task_scope() -> AsyncIterator[list[asyncio.Task]]:
+    """Track background tasks and cancel any still pending on exit.
+
+    The memory-context task holds the request's DB session; if the client
+    disconnects mid-stream we must cancel it before FastAPI tears the session
+    down, otherwise a stray query lands on a closed session. Tasks that already
+    finished are left alone.
+    """
+    tasks: list[asyncio.Task] = []
+    try:
+        yield tasks
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with contextlib.suppress(Exception):
+                await task
+
+
+async def _stream_reply_frames(
+    sentences: AsyncIterator[str],
+    provider: str,
+    api_key: str,
+    voice_id: str,
+    collected: list[str],
+) -> AsyncIterator[str]:
+    """Yield ``reply_chunk`` + ``audio_chunk`` frames, pipelining TTS one ahead.
+
+    Synthesis for sentence *N+1* is kicked off (as a task) the moment its text
+    arrives, while sentence *N*'s frame is still being emitted — so the network /
+    Kokoro round-trips overlap instead of running strictly back-to-back. Every
+    sentence is also appended to *collected* so the caller can persist the full
+    reply after streaming.
+    """
+    prev_sentence: str | None = None
+    prev_task: asyncio.Task | None = None
+
+    async for sentence in sentences:
+        collected.append(sentence)
+        task = asyncio.create_task(
+            synthesize(sentence, provider=provider, api_key=api_key, voice_id=voice_id)
+        )
+        if prev_task is not None:
+            yield _sse("reply_chunk", {"text": prev_sentence})
+            async for frame in _drain_tts(prev_sentence, prev_task, provider):
+                yield frame
+        prev_sentence, prev_task = sentence, task
+
+    if prev_task is not None:
+        yield _sse("reply_chunk", {"text": prev_sentence})
+        async for frame in _drain_tts(prev_sentence, prev_task, provider):
+            yield frame
+
+
+async def _drain_tts(
+    text: str, task: asyncio.Task, provider: str
+) -> AsyncIterator[str]:
+    """Await a pending synthesis *task* and yield its ``audio_chunk`` frame."""
+    try:
+        chunk = await task
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("chat_tts_error", error=str(exc))
+        return
+    if chunk:
+        yield _sse("audio_chunk", {
+            "data": base64.b64encode(chunk).decode(),
+            "model": provider,
+            "emotional": is_emotional(text),
+        })
+
+
+# Heuristic intents that signal likely background work (retrieval / playback),
+# so a neutral filler is worth speaking before the LLM router even returns.
+# MIXED is excluded: it's the most ambiguous keyword verdict ("recommend an
+# artist like X" is usually a chat question, not retrieval), so the keyword path
+# and the LLM router disagree most often there. Conversational / status intents
+# are excluded too — they're fast already or would mis-fire a reaction.
+_FAST_ACK_INTENTS = {
+    IntentType.MUSIC_FIND,
+    IntentType.MUSIC_QUEUE,
+    IntentType.ARTIST_INFO,
+    IntentType.MOOD_CHECK,
+}
+
+
+def _fast_ack_intent(message: str) -> IntentType | None:
+    """Return a keyword-classified intent worth acknowledging *before* the router.
+
+    Uses the sub-millisecond keyword classifier so Gia can react without waiting
+    on the router LLM round-trip. Returns ``None`` when the keywords are ambiguous
+    or the intent is conversational — those wait for the real router decision so a
+    misfired ack never lands in front of a clarifying question.
+    """
+    heuristic = _keyword_classify(message)
+    if heuristic in _FAST_ACK_INTENTS:
+        return heuristic
+    return None
+
+
+async def _emit_ack(
+    intent: IntentType,
+    tone: Tone,
+    session_id: str,
+    trace,
+    message: str,
+    provider: str,
+    api_key: str,
+    voice_id: str,
+) -> AsyncIterator[str]:
+    """Select, emit and speak a single intent+tone acknowledgment as SSE frames.
+
+    The *accurate* path: only reached after the router decision exists, so the
+    line's intent and tone are real and ``should_acknowledge`` has already gated
+    on actual retrieval/clarify/confirm.
+    """
+    with trace.span("acknowledgment", message) as span:
+        t0 = time.monotonic()
+        ack_line = get_selector().select(intent, tone, session_id)
+        spoken = _voice_adapter.apply(tone.value, ack_line)
+        span.set_output(spoken)
+        yield _sse("reply_chunk", {"text": spoken})
+        yield _sse("acknowledgment", {
+            "text": spoken,
+            "tone": tone.value,
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+        })
+        frame = await _tts_frame(spoken, provider, api_key, voice_id)
+        if frame:
+            yield frame
+
+
+async def _emit_filler(
+    session_id: str,
+    trace,
+    message: str,
+    provider: str,
+    api_key: str,
+    voice_id: str,
+) -> AsyncIterator[str]:
+    """Emit a neutral filler before the router's decision exists (the fast path).
+
+    Claims nothing specific and carries no tone tag, so it can front whatever the
+    router lands on — a recommendation, a clarifying question, or pure chat —
+    without contradicting the reply. This is what keeps a keyword/LLM intent
+    disagreement from producing an ack that promises work the turn never does.
+    """
+    with trace.span("acknowledgment", message) as span:
+        t0 = time.monotonic()
+        line = get_selector().select_filler(session_id)
+        span.set_output(line)
+        yield _sse("reply_chunk", {"text": line})
+        yield _sse("acknowledgment", {
+            "text": line,
+            "tone": "neutral",
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+        })
+        frame = await _tts_frame(line, provider, api_key, voice_id)
+        if frame:
+            yield frame
+
+
 async def _run_crew(
     request: ChatRequest,
     spotify: SpotifyClientProtocol,
@@ -206,53 +385,77 @@ async def _run_crew(
     tts_api_key = cfg.elevenlabs_api_key if tts_provider == "elevenlabs" else ""
     tts_voice_id = cfg.elevenlabs_voice_id if tts_provider == "elevenlabs" else ""
 
-    async with crew_trace(session_id, user_id, user_input=request.message) as trace:
+    async with crew_trace(session_id, user_id, user_input=request.message) as trace, \
+            _task_scope() as bg_tasks:
 
-        # ── 1. Build user context ─────────────────────────────────────────────
-        user_context_text = ""
-        user_context_used = False
+        # ── 1. Kick off the two slowest pre-reply steps concurrently ──────────
+        # Memory-context building and the router LLM are independent, and the
+        # acknowledgment needs neither — so we start both as background tasks and
+        # let Gia react first, instead of paying memory + router serially before
+        # the user hears anything.
+        #
+        # Recent turns of THIS conversation let the router resolve "play it now"/
+        # "that one" and let Gia pick up where she left off — fetched first because
+        # the router needs it. The reply gets the full window for continuity; the
+        # router gets a tighter recent slice (≈3 exchanges) — enough to resolve
+        # references and derive a clean search_query, without the extra tokens or
+        # the risk of over-anchoring on a stale earlier intent.
+        turns = await get_history(redis, session_id)
+        history_text = format_history(turns)
+        router_history = format_history(turns[-_ROUTER_HISTORY_TURNS:])
+
+        memory_task: asyncio.Task | None = None
+        memory_t0 = 0.0
         if user_id and store:
             yield _sse("agent_start", {"agent": "memory", "input": request.message})
-            with trace.span("memory", request.message) as span:
-                try:
-                    t0 = time.monotonic()
-                    ctx = await build_user_context(
-                        user_id, request.message,
-                        db=db, store=store, redis=redis, spotify=spotify, cfg=cfg,
-                    )
-                    user_context_text = ctx.to_prompt_text()
-                    user_context_used = bool(user_context_text)
-                    span.set_output(f"context_length={len(user_context_text)}")
-                    yield _sse("agent_done", {
-                        "agent": "memory",
-                        "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-                        "context_chars": len(user_context_text),
-                    })
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("chat_context_error", error=str(exc))
-                    yield _sse("error", {"agent": "memory", "error": str(exc)})
+            memory_t0 = time.monotonic()
+            memory_task = asyncio.create_task(
+                build_user_context(
+                    user_id, request.message,
+                    db=db, store=store, redis=redis, spotify=spotify, cfg=cfg,
+                )
+            )
+            bg_tasks.append(memory_task)
 
-        # ── 2. Pop pending proactive draft + load short-term history ──────────
         proactive: str | None = None
         if user_id:
             proactive = await pop_proactive_draft(user_id, redis)
 
-        # Recent turns of THIS conversation — lets the router resolve "play it
-        # now"/"that one" and lets Gia pick up where she left off instead of
-        # treating every message as the first.
-        history_text = format_history(await get_history(redis, session_id))
+        # "what's playing?" is a status query — answer from Spotify, don't
+        # search/recommend (which is how Gia used to invent an answer).
+        now_playing_query = _is_now_playing_query(request.message)
 
-        # ── 3. Route the turn (structured: intent + tone + engagement) ─────────
+        # ── 2. Route the turn (structured: intent + tone + engagement) ─────────
         # One small-model call classifies everything the turn needs. It never
-        # raises — a failed call degrades to a warm GENERAL_CHAT default.
+        # raises — a failed call degrades to a warm GENERAL_CHAT default. Started
+        # as a task so the fast acknowledgment below overlaps the round-trip.
         yield _sse("agent_start", {"agent": "router", "input": request.message})
         with trace.span("router", request.message) as span:
-            t0 = time.monotonic()
-            decision = await classify_turn(request.message, cfg, history=history_text)
+            router_t0 = time.monotonic()
+            # Created inside the span so the OpenAI drop-in generation nests under
+            # "router" (asyncio tasks inherit the current OTel context).
+            router_task = asyncio.create_task(
+                classify_turn(request.message, cfg, history=router_history)
+            )
+            bg_tasks.append(router_task)
+
+            # ── 2a. Fast acknowledgment — react before the router LLM returns ──
+            # A keyword-classified retrieval intent means real work is likely, so
+            # Gia speaks a *neutral* filler in ~1s while the router and memory are
+            # still in flight. The filler claims nothing specific, so a keyword/LLM
+            # intent disagreement can't make it contradict the eventual reply; the
+            # intent-flavoured ack is reserved for the accurate post-router path.
+            acked = False
+            if not now_playing_query and _fast_ack_intent(request.message) is not None:
+                async for frame in _emit_filler(
+                    session_id, trace, request.message,
+                    tts_provider, tts_api_key, tts_voice_id,
+                ):
+                    yield frame
+                acked = True
+
+            decision = await router_task
             intent, confidence = decision.intent, decision.confidence
-            # "what's playing?" is a status query — answer from Spotify, don't
-            # search/recommend (which is how Gia used to invent an answer).
-            now_playing_query = _is_now_playing_query(request.message)
             steps = [] if now_playing_query else _steps_for_decision(decision)
             signals = ["weather"] if _wants_weather(request.message, steps) else []
             span.set_output(
@@ -264,7 +467,7 @@ async def _run_crew(
                 "tone": decision.tone.value,
                 "engagement_mode": decision.engagement_mode.value,
                 "confidence": round(confidence, 2),
-                "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                "latency_ms": round((time.monotonic() - router_t0) * 1000, 1),
             })
         yield _sse("plan", {
             "intent": intent.value,
@@ -280,24 +483,35 @@ async def _run_crew(
             },
         })
 
-        # ── 3a. Immediate acknowledgment — Gia reacts before the work runs ─────
-        # No LLM: a local template chosen by intent+tone, spoken right away so the
-        # user hears a reaction in ~1s while retrieval / the reply are still cooking.
-        if should_acknowledge(decision):
-            with trace.span("acknowledgment", request.message) as span:
-                t0 = time.monotonic()
-                ack_line = get_selector().select(decision.intent, decision.tone, session_id)
-                spoken = _voice_adapter.apply(decision.tone.value, ack_line)
-                span.set_output(spoken)
-                yield _sse("reply_chunk", {"text": spoken})
-                yield _sse("acknowledgment", {
-                    "text": spoken,
-                    "tone": decision.tone.value,
-                    "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-                })
-                frame = await _tts_frame(spoken, tts_provider, tts_api_key, tts_voice_id)
-                if frame:
-                    yield frame
+        # ── 2b. Accurate acknowledgment — only if we didn't already fast-ack ───
+        # When the keyword path was unsure, the router's real intent/tone/mode
+        # decide whether (and how) to react, so a clarify/confirm turn never gets
+        # a generic "On it." in front of its question.
+        if not acked and should_acknowledge(decision):
+            async for frame in _emit_ack(
+                decision.intent, decision.tone, session_id, trace, request.message,
+                tts_provider, tts_api_key, tts_voice_id,
+            ):
+                yield frame
+
+        # ── 3. Resolve the memory context (needed by agents + the reply) ──────
+        user_context_text = ""
+        user_context_used = False
+        if memory_task is not None:
+            with trace.span("memory", request.message) as span:
+                try:
+                    ctx = await memory_task
+                    user_context_text = ctx.to_prompt_text()
+                    user_context_used = bool(user_context_text)
+                    span.set_output(f"context_length={len(user_context_text)}")
+                    yield _sse("agent_done", {
+                        "agent": "memory",
+                        "latency_ms": round((time.monotonic() - memory_t0) * 1000, 1),
+                        "context_chars": len(user_context_text),
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("chat_context_error", error=str(exc))
+                    yield _sse("error", {"agent": "memory", "error": str(exc)})
 
         # ── 3b. Gather requested real-world signals ───────────────────────────
         if "weather" in signals:
@@ -348,10 +562,21 @@ async def _run_crew(
                         user_context_text=user_context_text,
                         start_playback=decision.start_playback,
                         n=4,
+                        requested_titles=decision.track_titles,
                     )
-                    # "queue X" → add seed + all crossfade queue tracks to Spotify.
-                    if intent == IntentType.MUSIC_QUEUE and not decision.start_playback:
-                        tracks_to_queue = [dj_result.primary_track, *dj_result.queue.tracks]
+                    # Push tracks onto Spotify's queue when the user wants them
+                    # queued — an explicit MUSIC_QUEUE, or a per-title request that
+                    # named several specific tracks ("play X and queue Y next"). If
+                    # the seed is already playing we queue only the rest; otherwise
+                    # the seed leads. (Vibe MUSIC_FIND keeps its client-side
+                    # crossfade queue and isn't pushed to Spotify.)
+                    named_multi = len(decision.track_titles) >= 2
+                    if intent == IntentType.MUSIC_QUEUE or named_multi:
+                        tracks_to_queue = (
+                            list(dj_result.queue.tracks)
+                            if decision.start_playback
+                            else [dj_result.primary_track, *dj_result.queue.tracks]
+                        )
                         for _track in tracks_to_queue:
                             try:
                                 await spotify.add_to_queue(_track.uri)
@@ -437,34 +662,65 @@ async def _run_crew(
         # Conversational intents (chit-chat, news, memory questions) — and any
         # turn where no specialist produced output — get a persona-grounded reply
         # in Gia's own voice instead of a canned string.
+        substantive_parts = [p for p in reply_parts if p.strip()]
+        streamed_inline = False
+        full_reply = ""
         if not now_playing_query and (
-            intent in _CONVERSATIONAL_INTENTS or not [p for p in reply_parts if p.strip()]
+            intent in _CONVERSATIONAL_INTENTS or not substantive_parts
         ):
+            # When the conversational reply is the *sole* content (no proactive
+            # note to keep verbatim, no specialist part to merge) we stream the
+            # model's tokens straight into per-sentence TTS — so audio for the
+            # first sentence starts while the rest is still being generated,
+            # instead of waiting for the whole reply. Otherwise fall back to a
+            # blocking reply that the unified section-5 streaming handles.
+            can_stream_inline = (
+                cfg.llm_provider in ("openai", "anthropic")
+                and not proactive
+                and not substantive_parts
+            )
             yield _sse("agent_start", {"agent": "gia", "input": request.message})
             with trace.span("general", request.message) as span:
                 t0 = time.monotonic()
-                reply = await respond_general(
-                    request.message, user_context_text, cfg=cfg, history=history_text
-                )
-                span.set_output(reply)
-                reply_parts.append(reply)
+                if can_stream_inline:
+                    collected: list[str] = []
+                    sentences = stream_sentences(stream_general(
+                        request.message, user_context_text, cfg=cfg, history=history_text,
+                    ))
+                    async for frame in _stream_reply_frames(
+                        sentences, tts_provider, tts_api_key, tts_voice_id, collected,
+                    ):
+                        yield frame
+                    full_reply = " ".join(collected)
+                    streamed_inline = True
+                    span.set_output(full_reply)
+                else:
+                    reply = await respond_general(
+                        request.message, user_context_text, cfg=cfg, history=history_text
+                    )
+                    reply_parts.append(reply)
+                    span.set_output(reply)
                 yield _sse("agent_done", {
                     "agent": "gia",
                     "latency_ms": round((time.monotonic() - t0) * 1000, 1),
                 })
 
         # ── 5. Synthesise + stream reply + TTS ────────────────────────────────
-        # When several agents contributed (and synthesis is enabled), merge
-        # them into one coherent reply; otherwise join. A pending proactive note
-        # is kept verbatim at the front so its phrasing is never reworded.
-        if cfg.synthesis_enabled and len([p for p in reply_parts if p.strip()]) > 1:
-            with trace.span("synthesis", request.message) as span:
-                synth_input = reply_parts[1:] if proactive else reply_parts
-                merged = await synthesize_reply(synth_input, request.message, cfg)
-                full_reply = f"{proactive} {merged}".strip() if proactive else merged
-                span.set_output(full_reply)
-        else:
-            full_reply = " ".join(reply_parts)
+        # The inline-streamed conversational reply is already on the wire; only
+        # the parts path (specialists / proactive / blocking fallback) needs
+        # merging + streaming here. When several agents contributed (and synthesis
+        # is enabled), merge them into one coherent reply; otherwise join. A
+        # pending proactive note is kept verbatim at the front so its phrasing is
+        # never reworded.
+        if not streamed_inline:
+            if cfg.synthesis_enabled and len([p for p in reply_parts if p.strip()]) > 1:
+                with trace.span("synthesis", request.message) as span:
+                    synth_input = reply_parts[1:] if proactive else reply_parts
+                    merged = await synthesize_reply(synth_input, request.message, cfg)
+                    full_reply = f"{proactive} {merged}".strip() if proactive else merged
+                    span.set_output(full_reply)
+            else:
+                full_reply = " ".join(reply_parts)
 
         # Trace-level output for the turn (visible at the top of the Langfuse trace).
         trace.set_output(full_reply)
@@ -495,14 +751,34 @@ async def _run_crew(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("chat_extract_enqueue_error", error=str(exc))
 
-        for sentence in split_sentences(full_reply):
-            yield _sse("reply_chunk", {"text": sentence})
+        # Parts path: stream the assembled reply sentence-by-sentence with TTS
+        # pipelined one sentence ahead. (The inline-streamed conversational reply
+        # was already emitted above.)
+        if not streamed_inline:
+            async for frame in _stream_reply_frames(
+                _aiter(split_sentences(full_reply)),
+                tts_provider, tts_api_key, tts_voice_id, [],
+            ):
+                yield frame
+
+        # Record recent plays for mood patterning — throttled, and only after the
+        # reply has streamed so it never adds perceived latency (the db session is
+        # free at this point). On a fresh ingest, kick the worker to re-infer this
+        # user's per-time-bucket mood patterns.
+        if user_id:
             try:
-                frame = await _tts_frame(sentence, tts_provider, tts_api_key, tts_voice_id)
-                if frame:
-                    yield frame
+                if await redis.set(f"ingest_throttle:{user_id}", "1", ex=1800, nx=True):
+                    added = await ingest_recently_played(user_id, spotify, db)
+                    if added:
+                        from backend.worker.celery_app import (
+                            celery_app,  # noqa: PLC0415
+                        )
+                        celery_app.send_task(
+                            "backend.worker.tasks.mood_inference.run_mood_inference",
+                            args=[user_id],
+                        )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("chat_tts_error", error=str(exc))
+                logger.warning("chat_ingest_error", error=str(exc))
 
         # ── 6. Done ───────────────────────────────────────────────────────────
         yield _sse("done", {

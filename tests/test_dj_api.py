@@ -11,24 +11,14 @@ from backend.app.schemas.dj import CrossfadeQueue, DJResponse, TrackItem
 
 
 def _fake_dj_response() -> DJResponse:
-    track = TrackItem(
-        uri="spotify:track:001",
-        name="Free Mind",
-        artist="Tems",
-        energy=0.38,
-        valence=0.71,
-        key=5,
-        mode=0,
-        camelot_key="4A",
-    )
+    track = TrackItem(uri="spotify:track:001", name="Free Mind", artist="Tems")
     return DJResponse(
-        recommendation="[thoughtful] Here's Free Mind by Tems — smooth energy step down, key matches too.",
+        recommendation="[thoughtful] Here's Free Mind by Tems — should sit right.",
         primary_track=track,
         queue=CrossfadeQueue(
             seed_uri="spotify:track:001",
             tracks=[
-                TrackItem(uri="spotify:track:002", name="Essence", artist="Wizkid",
-                          energy=0.42, valence=0.80, key=2, mode=1),
+                TrackItem(uri="spotify:track:002", name="Essence", artist="Wizkid"),
             ],
             crossfade_ms=3000,
         ),

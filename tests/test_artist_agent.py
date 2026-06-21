@@ -6,6 +6,48 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.agents.artist import extract_artist_name
+
+
+class TestExtractArtistName:
+    """The gate that stops small talk being looked up as an artist."""
+
+    @pytest.mark.parametrize("message,expected", [
+        ("tell me about Odumodublvck", "Odumodublvck"),
+        ("tell me about Tems lately", "Tems"),
+        ("who is Burna Boy?", "Burna Boy"),
+        ("who's Asake", "Asake"),
+        ("what about Wizkid", "Wizkid"),
+        ("what has Drake been up to", "Drake"),
+        ("anything new from Rema", "Rema"),
+        ("Tems", "Tems"),
+        ("Burna Boy", "Burna Boy"),
+    ])
+    def test_extracts_name(self, message: str, expected: str) -> None:
+        assert extract_artist_name(message) == expected
+
+    @pytest.mark.parametrize("message", [
+        "whats the weather like",
+        "how are you doing",
+        "hey gia",
+        "find me something chill",
+        "what's my mood",
+        "thanks so much",
+        "",
+        "i'm a little tired",
+        # Conversational affirmations — replies to "want me to play him?", never
+        # an artist to look up (this is what produced the "crossword" hallucination).
+        "yeah sure",
+        "yeah",
+        "nah",
+        "yep",
+        "cool nice",
+        "alright sure",
+        "maybe",
+    ])
+    def test_rejects_non_artist(self, message: str) -> None:
+        assert extract_artist_name(message) == ""
+
 
 @pytest.fixture()
 def fake_spotify_artist() -> MagicMock:

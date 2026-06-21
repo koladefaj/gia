@@ -4,7 +4,7 @@ The Router is the first agent to run on every turn.  It decides which
 downstream agents are needed (DJ, Artist, Mood, or a combination) so the
 crew does not run unnecessary work.
 
-Design principles (from Section 3):
+Design principles:
   - "Mostly deterministic — fast and traceable beats smart and slow."
   - Keyword heuristics handle 80 % of intents in < 1 ms.
   - An LLM call is made only when the keywords conflict or are absent.
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 
 from crewai import Agent
 
@@ -65,6 +64,22 @@ _MUSIC_KEYWORDS = [
     "music", "vibe", "chill", "hype", "listen", "listening",
 ]
 
+_GREETING_KEYWORDS = [
+    "hey", "hello", "hi", "sup", "yo", "morning", "evening",
+    "what's up", "how are you", "how's it going", "good morning",
+    "good evening", "good afternoon", "what can you do",
+    "who are you", "help",
+]
+
+# Non-music small talk (weather, how-are-you, your-name) — routed to GENERAL so
+# Gia answers conversationally instead of the LLM guessing MIXED and treating
+# the whole sentence as an artist to look up.
+_SMALLTALK_KEYWORDS = [
+    "weather", "raining", "sunny",
+    "how are things", "whats up", "your name", "what do you do",
+    "thanks", "thank you", "tired", "bored", "stressed",
+]
+
 
 def _word_match(text: str, keywords: list[str]) -> bool:
     """Return ``True`` when any keyword matches as a complete word in *text*."""
@@ -89,13 +104,20 @@ def _keyword_classify(message: str) -> IntentType | None:
     is_queue = _word_match(lower, _QUEUE_KEYWORDS)
     is_mood = _word_match(lower, _MOOD_KEYWORDS)
     is_music = _word_match(lower, _MUSIC_KEYWORDS)
+    has_signal = is_artist or is_queue or is_mood or is_music
+
+    # Greetings / small talk that carry no music, artist, queue, or mood signal →
+    # GENERAL (conversational). No word-count cap: "just thought I'd say hi, how
+    # have you been" is a greeting even at nine words. A greeting that DOES carry
+    # a real ask ("hey, play something") keeps its true intent below.
+    if not has_signal and _word_match(lower, _GREETING_KEYWORDS + _SMALLTALK_KEYWORDS):
+        return IntentType.GENERAL
 
     # Queue + music without artist/mood → queue intent dominates
     if is_queue and is_music and not is_artist and not is_mood:
         return IntentType.MUSIC_QUEUE
 
     # Mood + music without artist/queue → mood intent dominates
-    # e.g. "what are my listening patterns?" is a mood check, not music discovery
     if is_mood and is_music and not is_artist and not is_queue:
         return IntentType.MOOD_CHECK
 
@@ -147,8 +169,10 @@ async def classify_intent(
         logger.debug("router_llm_hit", intent=intent.value, raw=raw)
         return intent, 0.8
     except Exception as exc:  # noqa: BLE001
-        logger.warning("router_llm_fallback", error=str(exc))
-        return IntentType.MUSIC_FIND, 0.5
+        logger.warning("router_llm_unavailable", error=str(exc))
+        raise RuntimeError(
+            f"LLM service unavailable — could not classify intent: {exc}"
+        ) from exc
 
 
 def build_router_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:

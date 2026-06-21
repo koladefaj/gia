@@ -16,14 +16,26 @@ sections:
     and facts. One-off logistics are discarded. When a user's preference changes,
     you retire the old memory and replace it with the updated one.
   extract: |
-    From this exchange, extract DURABLE preferences worth remembering.
-    Discard one-off logistics. Return a JSON array or [].
+    From this exchange, extract what's DURABLE and worth remembering about this
+    person — so Gia can be a real companion, not just a music player. Two kinds:
+
+      "preference" — a lasting music taste.
+      "life_fact"  — a non-music personal fact: their work, a project they're
+                     building, something they're studying or struggling with, a
+                     plan, a relationship, a recurring feeling. The things a
+                     friend remembers and follows up on later.
+
+    Discard one-off logistics and fleeting small talk. Return a JSON array or [].
 
     Rules:
     {% raw %}- "I loved Free Mind" → {"type":"preference","text":"User enjoys Tems low-energy tracks during wind-down","confidence":0.8,"supersedes_id":null}{% endraw %}
+    {% raw %}- "ugh, still stuck on this Python script for work" → {"type":"life_fact","text":"User is working on a Python script for work and was stuck on it","confidence":0.8,"supersedes_id":null}{% endraw %}
+    {% raw %}- "I've got my final exams next week" → {"type":"life_fact","text":"User has final exams coming up","confidence":0.85,"supersedes_id":null}{% endraw %}
     - "play it at 8pm" → discard (one-off)
     - "actually I'm into high-energy stuff now" → preference that SUPERSEDES prior "prefers low-energy". Always include supersedes_id if this conflicts with an existing memory listed below.
+    - "I finished that script!" → life_fact that SUPERSEDES the earlier "stuck on it" memory (include its supersedes_id).
     - Mood patterns go to the Mood agent's extractor, not here.
+    - Write life facts in the third person, plainly ("User is ..."), no invented detail.
     - Return only raw JSON — no markdown fences, no preamble.
 
     Exchange:

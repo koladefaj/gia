@@ -37,6 +37,7 @@ _INTENT_STEPS: dict[IntentType, list[str]] = {
     IntentType.ARTIST_INFO: ["artist"],
     IntentType.MOOD_CHECK: ["mood"],
     IntentType.MIXED: ["dj", "artist"],
+    IntentType.GENERAL: [],  # handled by chat.py fallback — no specialist agent needed
 }
 
 # Contexts where the current weather meaningfully changes a music pick.
@@ -87,8 +88,13 @@ async def build_plan(
     Returns:
         A populated ``ExecutionPlan``.
     """
-    intent, confidence = await classify_intent(message, cfg, registry)
-    steps = list(_INTENT_STEPS.get(intent, ["dj"]))
+    try:
+        intent, confidence = await classify_intent(message, cfg, registry)
+    except RuntimeError:
+        # LLM is unavailable and keywords gave no match — surface as GENERAL
+        # so chat.py can return a friendly "service unavailable" message.
+        raise
+    steps = list(_INTENT_STEPS.get(intent, []))
 
     signals: list[str] = []
     if _wants_weather(message, steps):

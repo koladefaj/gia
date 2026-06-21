@@ -18,9 +18,24 @@ sections:
     Classify the user's intent into exactly one of:
       MUSIC_FIND   — user wants to discover or play music
       MUSIC_QUEUE  — user wants to save, queue, or organise tracks
-      ARTIST_INFO  — user wants to talk about a specific artist
+      ARTIST_INFO  — user wants to talk about a specific named artist
       MOOD_CHECK   — user wants mood analysis or patterns
-      MIXED        — message touches more than one category
+      MIXED        — clearly asks for BOTH music discovery AND a specific artist
+      GENERAL      — greeting, small talk, thanks, "how are you", or anything
+                     that is NOT a music request (this is the default for chit-chat)
+
+    Rules:
+    - If the message is just a greeting or casual conversation, answer GENERAL.
+    - Only answer MIXED when the message genuinely names an artist AND asks to
+      play/find music. A plain "hi, how have you been" is GENERAL, not MIXED.
+    - When unsure, prefer GENERAL over guessing a music intent.
+
+    Examples:
+      "just thought I'd say hi, how have you been" → GENERAL
+      "what's the weather like" → GENERAL
+      "play something chill" → MUSIC_FIND
+      "tell me about Tems" → ARTIST_INFO
+      "play a Burna Boy song and tell me about him" → MIXED
 
     User message: "{{ message }}"
 

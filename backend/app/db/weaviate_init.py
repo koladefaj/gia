@@ -6,8 +6,8 @@ already exist.  Called once during FastAPI lifespan startup.
 Collections
 -----------
 ``UserMemory``
-    Stores extracted facts about a user (genre preferences, listening habits,
-    biographical snippets) as 768-dimensional BGE embeddings.
+    Stores extracted facts about a user (genre preferences, life facts,
+    listening habits) as OpenAI ``text-embedding-3-small`` (1536-dim) vectors.
 
 ``MoodPattern``
     Stores aggregated time-bucket mood statistics (energy, valence, tempo) used
@@ -28,7 +28,7 @@ from backend.app.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
-VECTOR_DIM = 768  # BGE-base-en-v1.5
+VECTOR_DIM = 1536  # OpenAI text-embedding-3-small (vectors supplied by the app)
 
 
 def get_weaviate_client() -> WeaviateClient:

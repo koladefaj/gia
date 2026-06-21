@@ -6,31 +6,22 @@ from pydantic import BaseModel, Field
 
 
 class TrackItem(BaseModel):
-    """A single track with its Spotify and audio-feature metadata.
+    """A single track's Spotify metadata.
+
+    Audio-feature fields (energy/valence/key/mode/…) were dropped once Spotify
+    stopped exposing ``/audio-features`` to new apps — they were always neutral
+    constants, so the harmonic sequencing they fed was a no-op. Queue order now
+    comes from the user's stated track order or search relevance.
 
     Attributes:
-        uri:          Spotify URI (``spotify:track:...``).
-        name:         Track name.
-        artist:       Primary artist name.
-        energy:       Spotify audio feature 0–1 (loud/fast = high).
-        valence:      Spotify audio feature 0–1 (happy = high).
-        tempo:        BPM.
-        key:          Spotify key integer 0–11 (C=0, C♯=1 …).
-        mode:         0 = minor, 1 = major.
-        danceability: Spotify audio feature 0–1.
-        camelot_key:  Camelot wheel label (e.g. ``"8B"``), or ``None``.
+        uri:    Spotify URI (``spotify:track:...``).
+        name:   Track name.
+        artist: Primary artist name.
     """
 
     uri: str
     name: str
     artist: str
-    energy: float = 0.5
-    valence: float = 0.5
-    tempo: float = 120.0
-    key: int = 0
-    mode: int = 1
-    danceability: float = 0.5
-    camelot_key: str | None = None
 
 
 class CrossfadeQueue(BaseModel):

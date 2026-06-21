@@ -10,6 +10,7 @@ SHA-256 deduplication is handled at the *storage* level, not here.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 
@@ -35,6 +36,10 @@ async def embed(text: str, redis=None) -> list[float]:
     identical queries within a day skip the API call entirely.  Cache errors
     are silently swallowed — a miss is always safe.
 
+    Thin wrapper over :func:`embed_many` for the single-text callers (the
+    per-turn retrieval query); behaviour is identical (cache check + one API
+    call on a miss).
+
     Args:
         text:  The string to embed.
         redis: Optional async Redis client for the embedding cache.
@@ -47,28 +52,70 @@ async def embed(text: str, redis=None) -> list[float]:
         Exception: Propagates OpenAI/network errors — callers already degrade
             the turn on failure.
     """
-    cache_key = f"embed_cache:{text_hash(text)}" if redis is not None else None
+    return (await embed_many([text], redis=redis))[0]
 
-    if cache_key is not None:
-        try:
-            cached = await redis.get(cache_key)
-            if cached is not None:
-                logger.debug("embed_cache_hit", chars=len(text))
-                return json.loads(cached)
-        except Exception:  # noqa: BLE001
-            pass  # cache failure → fall through to API call
 
-    client = get_async_openai(settings)
-    resp = await client.embeddings.create(model=settings.embedding_model, input=text)
-    vector = list(resp.data[0].embedding)
+async def embed_many(texts: list[str], redis=None) -> list[list[float]]:
+    """Embed several texts in ONE API call (cache-aware), preserving input order.
 
-    if cache_key is not None:
-        try:
-            await redis.set(cache_key, json.dumps(vector), ex=_EMBED_CACHE_TTL)
-        except Exception:  # noqa: BLE001
-            pass  # caching failure is non-fatal
+    The worker's extraction pass produces a handful of new memories per session;
+    embedding them one HTTP round-trip at a time is wasteful. This batches every
+    cache miss into a single ``embeddings.create(input=[...])`` request and
+    returns the vectors aligned 1:1 with *texts*.
 
-    return vector
+    Args:
+        texts: Strings to embed (any already-cached ones skip the API).
+        redis: Optional async Redis client for the 24h embedding cache.
+
+    Returns:
+        A list of vectors, one per input text, in the same order.
+
+    Raises:
+        Exception: Propagates OpenAI/network errors — callers degrade on failure.
+    """
+    if not texts:
+        return []
+
+    results: list[list[float] | None] = [None] * len(texts)
+    miss_indices: list[int] = []
+    miss_texts: list[str] = []
+
+    # ── Cache lookups — only the misses go to the API ────────────────────────
+    for i, text in enumerate(texts):
+        if redis is not None:
+            try:
+                cached = await redis.get(f"embed_cache:{text_hash(text)}")
+                if cached is not None:
+                    results[i] = json.loads(cached)
+                    continue
+            except Exception:  # noqa: BLE001
+                pass  # cache failure → treat as a miss
+        miss_indices.append(i)
+        miss_texts.append(text)
+
+    if miss_texts:
+        client = get_async_openai(settings)
+        resp = await client.embeddings.create(
+            model=settings.embedding_model, input=miss_texts
+        )
+        # The API returns items in input order, but each carries its own .index —
+        # sort by it so a vector never lands against the wrong text.
+        ordered = sorted(resp.data, key=lambda d: d.index)
+        logger.debug("embed_batch", total=len(texts), api_calls=len(miss_texts))
+        for idx, item in zip(miss_indices, ordered, strict=True):
+            vector = list(item.embedding)
+            results[idx] = vector
+            if redis is not None:
+                # Caching failure is non-fatal — a miss next time is always safe.
+                with contextlib.suppress(Exception):
+                    await redis.set(
+                        f"embed_cache:{text_hash(texts[idx])}",
+                        json.dumps(vector),
+                        ex=_EMBED_CACHE_TTL,
+                    )
+
+    # Every index is either a cache hit or was filled from the batch above.
+    return [vector for vector in results if vector is not None]
 
 
 def text_hash(text: str) -> str:

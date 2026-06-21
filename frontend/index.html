@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gia — voice music companion</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d0d0d;
+      color: #e8e8e8;
+      font-family: "Inter", system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    header {
+      padding: 16px 24px;
+      border-bottom: 1px solid #1f1f1f;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    header h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
+    header .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #2ecc71;
+      box-shadow: 0 0 6px #2ecc71;
+    }
+    header .dot.idle { background: #555; box-shadow: none; }
+
+    #status-bar {
+      font-size: 11px;
+      color: #555;
+      padding: 6px 24px;
+      border-bottom: 1px solid #1a1a1a;
+      min-height: 24px;
+    }
+
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .msg {
+      max-width: 680px;
+      line-height: 1.6;
+      font-size: 15px;
+    }
+
+    .msg.user {
+      align-self: flex-end;
+      background: #1a1a2e;
+      border: 1px solid #2a2a4a;
+      border-radius: 16px 16px 4px 16px;
+      padding: 12px 16px;
+      color: #a0b4ff;
+    }
+
+    .msg.gia {
+      align-self: flex-start;
+      color: #e8e8e8;
+      position: relative;
+      padding-left: 0;
+    }
+
+    .msg.gia .label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #888;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .msg.gia .text { white-space: pre-wrap; }
+
+    .msg.gia .audio-btn {
+      margin-top: 8px;
+      background: none;
+      border: 1px solid #333;
+      border-radius: 8px;
+      color: #888;
+      font-size: 12px;
+      padding: 4px 10px;
+      cursor: pointer;
+      display: none;
+    }
+    .msg.gia .audio-btn:hover { border-color: #666; color: #ccc; }
+    .msg.gia .audio-btn.visible { display: inline-block; }
+
+    .agent-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 20px;
+      padding: 4px 10px;
+      font-size: 11px;
+      color: #666;
+      align-self: flex-start;
+    }
+
+    .agent-pill .spinner {
+      width: 8px; height: 8px;
+      border: 1.5px solid #444;
+      border-top-color: #888;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    form {
+      display: flex;
+      gap: 12px;
+      padding: 16px 24px;
+      border-top: 1px solid #1f1f1f;
+    }
+
+    input[type="text"] {
+      flex: 1;
+      background: #141414;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      color: #e8e8e8;
+      font-size: 15px;
+      padding: 12px 16px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input[type="text"]:focus { border-color: #444; }
+    input[type="text"]::placeholder { color: #444; }
+
+    button[type="submit"] {
+      background: #3a3aff;
+      border: none;
+      border-radius: 12px;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      padding: 12px 20px;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    button[type="submit"]:hover { background: #5555ff; }
+    button[type="submit"]:disabled { opacity: 0.4; cursor: default; }
+
+    #user-id-row {
+      padding: 8px 24px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    #user-id-row label { font-size: 12px; color: #555; }
+    #user-id-row input {
+      background: #111;
+      border: 1px solid #222;
+      border-radius: 6px;
+      color: #888;
+      font-size: 12px;
+      padding: 4px 8px;
+      width: 300px;
+      outline: none;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="dot idle" id="status-dot"></div>
+  <h1>Gia</h1>
+</header>
+
+<div id="user-id-row">
+  <label>User ID (optional, for memory + mood)</label>
+  <input id="user-id" type="text" placeholder="paste a UUID or leave blank" />
+</div>
+
+<div id="status-bar"></div>
+
+<div id="messages"></div>
+
+<form id="chat-form">
+  <input id="input" type="text" placeholder="Ask Gia for music, an artist, or your mood…" autocomplete="off" />
+  <button type="submit" id="send-btn">Send</button>
+</form>
+
+<script>
+  const API = "http://localhost:8000";
+  const messages = document.getElementById("messages");
+  const form = document.getElementById("chat-form");
+  const input = document.getElementById("input");
+  const sendBtn = document.getElementById("send-btn");
+  const statusBar = document.getElementById("status-bar");
+  const statusDot = document.getElementById("status-dot");
+  const userIdInput = document.getElementById("user-id");
+
+  // Stable identity so memory actually persists:
+  //  - user_id  → kept in localStorage, survives reloads (long-term memory + name)
+  //  - sessionId → one per page load (one conversation; threads turn history)
+  function getUserId() {
+    let id = localStorage.getItem("gia_user_id");
+    if (!id) { id = crypto.randomUUID(); localStorage.setItem("gia_user_id", id); }
+    return id;
+  }
+  const sessionId = crypto.randomUUID();
+  // Show the resolved id; a value the user pastes (e.g. the seeded demo UUID) wins.
+  userIdInput.value = userIdInput.value.trim() || getUserId();
+
+  const audioCtx = new AudioContext();
+  const audioQueue = [];
+  let audioPlaying = false;
+
+  async function playNextChunk() {
+    if (audioPlaying || audioQueue.length === 0) return;
+    audioPlaying = true;
+    const buf = audioQueue.shift();
+    try {
+      const decoded = await audioCtx.decodeAudioData(buf);
+      const src = audioCtx.createBufferSource();
+      src.buffer = decoded;
+      src.connect(audioCtx.destination);
+      src.onended = () => { audioPlaying = false; playNextChunk(); };
+      src.start();
+    } catch (e) {
+      audioPlaying = false;
+      playNextChunk();
+    }
+  }
+
+  function enqueueAudio(base64) {
+    const binary = atob(base64);
+    const buf = new ArrayBuffer(binary.length);
+    const view = new Uint8Array(buf);
+    for (let i = 0; i < binary.length; i++) view[i] = binary.charCodeAt(i);
+    audioQueue.push(buf);
+    playNextChunk();
+  }
+
+  // ElevenLabs-style [audio tags] are delivery cues, not text to show the user.
+  function stripTags(text) {
+    return text.replace(/\[[a-z][a-z ]*\]/gi, "").replace(/\s{2,}/g, " ").trim();
+  }
+
+  function setStatus(text) { statusBar.textContent = text; }
+
+  function appendUser(text) {
+    const el = document.createElement("div");
+    el.className = "msg user";
+    el.textContent = text;
+    messages.appendChild(el);
+    el.scrollIntoView({ behavior: "smooth" });
+    return el;
+  }
+
+  function appendGia() {
+    const el = document.createElement("div");
+    el.className = "msg gia";
+    el.innerHTML = `<div class="label">Gia</div><div class="text"></div>`;
+    messages.appendChild(el);
+    el.scrollIntoView({ behavior: "smooth" });
+    return el;
+  }
+
+  function appendAgentPill(agent) {
+    const el = document.createElement("div");
+    el.className = "agent-pill";
+    el.innerHTML = `<div class="spinner"></div> ${agent}`;
+    messages.appendChild(el);
+    el.scrollIntoView({ behavior: "smooth" });
+    return el;
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const message = input.value.trim();
+    if (!message) return;
+
+    // Unlock AudioContext on first user gesture
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+
+    input.value = "";
+    sendBtn.disabled = true;
+    statusDot.classList.remove("idle");
+
+    appendUser(message);
+    const giaEl = appendGia();
+    const giaText = giaEl.querySelector(".text");
+
+    const agentPills = {};
+
+    try {
+      const uid = userIdInput.value.trim() || getUserId();
+      const body = { message, user_id: uid, session_id: sessionId };
+
+      const resp = await fetch(`${API}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        const parts = buf.split("\n\n");
+        buf = parts.pop();
+
+        for (const part of parts) {
+          const lines = part.trim().split("\n");
+          let event = "", data = "";
+          for (const line of lines) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            if (line.startsWith("data:")) data = line.slice(5).trim();
+          }
+          if (!event || !data) continue;
+
+          let payload;
+          try { payload = JSON.parse(data); } catch { continue; }
+
+          switch (event) {
+            case "agent_start": {
+              const pill = appendAgentPill(payload.agent);
+              agentPills[payload.agent] = pill;
+              setStatus(`${payload.agent} thinking…`);
+              break;
+            }
+            case "agent_done": {
+              const pill = agentPills[payload.agent];
+              if (pill) pill.remove();
+              const ms = payload.latency_ms ? ` ${payload.latency_ms}ms` : "";
+              setStatus(`${payload.agent} done${ms}`);
+              break;
+            }
+            case "tool_call": {
+              setStatus(`${payload.agent} → ${payload.tool}`);
+              break;
+            }
+            case "reply_chunk": {
+              const clean = stripTags(payload.text);
+              if (clean) {
+                giaText.textContent += (giaText.textContent ? " " : "") + clean;
+                giaEl.scrollIntoView({ behavior: "smooth" });
+              }
+              break;
+            }
+            case "audio_chunk": {
+              enqueueAudio(payload.data);
+              break;
+            }
+            case "done": {
+              setStatus(`intent: ${payload.intent} | session: ${payload.session_id?.slice(0,8)}`);
+              statusDot.classList.add("idle");
+              break;
+            }
+            case "error": {
+              setStatus(`error (${payload.agent}): ${payload.error}`);
+              break;
+            }
+          }
+        }
+      }
+    } catch (err) {
+      setStatus(`connection error: ${err.message}`);
+      giaText.textContent = giaText.textContent || "Something went wrong — try again.";
+    } finally {
+      sendBtn.disabled = false;
+      input.focus();
+    }
+  });
+
+  // Gia speaks first: fetch a warm opening line on load so the conversation
+  // starts like a friend saying hi, not an empty box. Best-effort — a backend
+  // hiccup just leaves the screen clear rather than showing an error.
+  async function loadOpening() {
+    try {
+      const uid = userIdInput.value.trim();
+      const url = uid
+        ? `${API}/chat/opening?user_id=${encodeURIComponent(uid)}`
+        : `${API}/chat/opening`;
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const greeting = stripTags(data.greeting || "");
+      if (greeting) {
+        const giaEl = appendGia();
+        giaEl.querySelector(".text").textContent = greeting;
+      }
+    } catch (e) {
+      /* opener is best-effort; stay silent on failure */
+    }
+  }
+
+  window.addEventListener("load", loadOpening);
+</script>
+
+</body>
+</html>

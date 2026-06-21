@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 from functools import lru_cache
 
 from backend.app.observability.logging import get_logger
@@ -33,6 +34,20 @@ logger = get_logger(__name__)
 
 _EMOTIONAL_TAGS = {"[laughs]", "[light laugh]", "[warmly]", "[thoughtful]",
                    "[curious]", "[excited]", "[pause]", "[sighs]", "[whispers]"}
+
+# Matches any ``[audio tag]`` so it can be removed before non-ElevenLabs TTS.
+_AUDIO_TAG_RE = re.compile(r"\[[a-z][a-z ]*\]")
+
+
+def strip_audio_tags(text: str) -> str:
+    """Remove ElevenLabs-style ``[audio tags]`` and tidy the leftover spacing.
+
+    ElevenLabs v3 interprets tags like ``[warmly]`` as delivery cues, but a
+    plain TTS engine (Kokoro) would read the literal word "warmly" aloud. We
+    strip them so local audio stays clean; the production ElevenLabs path keeps
+    the tags untouched.
+    """
+    return re.sub(r"\s{2,}", " ", _AUDIO_TAG_RE.sub("", text)).strip()
 
 
 def is_emotional(sentence: str) -> bool:
@@ -84,9 +99,15 @@ def _kokoro_synthesize_sync(text: str, voice: str = "af_heart") -> bytes:
     if pipeline is None:
         return b""
 
+    # Kokoro has no notion of delivery tags — strip them so it doesn't read
+    # "[warmly]" aloud. Empty after stripping → nothing to synthesise.
+    text = strip_audio_tags(text)
+    if not text:
+        return b""
+
     try:
-        import soundfile as sf  # type: ignore[import-untyped]
         import numpy as np
+        import soundfile as sf  # type: ignore[import-untyped]
 
         generator = pipeline(text, voice=voice, speed=1.0)
         chunks = [audio for _, _, audio in generator]

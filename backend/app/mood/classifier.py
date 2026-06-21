@@ -1,61 +1,83 @@
-"""Quadrant-based mood classifier — no LLM required.
+"""Mood vocabulary + time bucketing.
 
-Maps (energy, valence) to a human-readable mood label using a simple
-four-quadrant model.  This is intentionally not an LLM: it runs in
-microseconds, is fully deterministic, and can be explained in one sentence
-during a demo without looking over-engineered.
+Spotify no longer exposes audio features to new apps, so mood is no longer
+derived from (energy, valence) quadrants. Instead an LLM labels the *music the
+user actually plays* (track + artist names) into one of a small, fixed
+vocabulary — see :mod:`backend.app.mood.labeler`. Keeping the vocabulary closed
+means a current label and a stored pattern label compare cleanly (string
+equality), which is what the deviation check needs.
 
-Quadrant map::
-
-                 high valence
-                      │
-        wind-down  ◄──┤──►  hype
-                      │
-    ──────────────────┼────────────────── high energy →
-                      │
-      melancholic  ◄──┤──►  aggressive-focus
-                      │
-
-The ``neutral`` label is returned for the centre band where neither
-extreme applies.
+``time_bucket`` is unchanged — it still keys patterns by ``(weekday, period)``.
 """
 
 from __future__ import annotations
 
-_ENERGY_HIGH = 0.7
-_ENERGY_LOW = 0.4
-_VALENCE_HIGH = 0.6
-_VALENCE_LOW = 0.4
+# Closed mood vocabulary. The labeler is constrained to these; pattern matching
+# and deviation are plain string comparisons over this set.
+MOOD_LABELS: tuple[str, ...] = (
+    "hype",
+    "chill",
+    "melancholy",
+    "focused",
+    "romantic",
+    "upbeat",
+    "reflective",
+    "neutral",
+)
+
+# Common free-text moods the model might return → canonical vocabulary label.
+_SYNONYMS: dict[str, str] = {
+    "sad": "melancholy",
+    "down": "melancholy",
+    "moody": "melancholy",
+    "happy": "upbeat",
+    "joyful": "upbeat",
+    "energetic": "hype",
+    "party": "hype",
+    "dance": "hype",
+    "calm": "chill",
+    "mellow": "chill",
+    "relaxed": "chill",
+    "laid-back": "chill",
+    "intense": "focused",
+    "concentration": "focused",
+    "study": "focused",
+    "love": "romantic",
+    "sensual": "romantic",
+    "nostalgic": "reflective",
+    "introspective": "reflective",
+    "thoughtful": "reflective",
+}
 
 
-def classify_mood(energy: float, valence: float) -> str:
-    """Map (energy, valence) to a mood label.
+def coerce_label(raw: str) -> str:
+    """Map a model's free-text mood answer onto the closed vocabulary.
+
+    Tolerant by design: the labeler is asked for one vocabulary word, but models
+    drift ("a chill, mellow vibe"). We scan for a vocabulary hit first, then a
+    synonym, and fall back to ``"neutral"`` so a noisy answer never crashes a turn.
 
     Args:
-        energy:  Spotify audio feature 0–1 (loud / fast = high).
-        valence: Spotify audio feature 0–1 (happy = high).
+        raw: The model's raw label text.
 
     Returns:
-        One of ``"hype"``, ``"aggressive-focus"``, ``"wind-down"``,
-        ``"melancholic"``, or ``"neutral"``.
+        One of :data:`MOOD_LABELS`.
     """
-    if energy > _ENERGY_HIGH and valence > _VALENCE_HIGH:
-        return "hype"
-    if energy > _ENERGY_HIGH and valence < _VALENCE_LOW:
-        return "aggressive-focus"
-    if energy < _ENERGY_LOW and valence > _VALENCE_HIGH:
-        return "wind-down"
-    if energy < _ENERGY_LOW and valence < _VALENCE_LOW:
-        return "melancholic"
+    s = raw.strip().lower()
+    for label in MOOD_LABELS:
+        if label in s:
+            return label
+    for word, label in _SYNONYMS.items():
+        if word in s:
+            return label
     return "neutral"
 
 
 def time_bucket(hour: int, weekday: int) -> str:
     """Convert hour (0-23) and weekday (0=Mon … 6=Sun) to a named bucket.
 
-    The bucket is used as the key in ``MoodPattern`` Weaviate objects.
-    Consistent naming lets the proactive engine match the right pattern
-    against the current time without fuzzy matching.
+    The bucket keys ``mood_pattern`` memories so the proactive engine can match
+    the current time against a stored pattern without fuzzy matching.
 
     Args:
         hour:    Hour of the day (0–23).
@@ -77,28 +99,3 @@ def time_bucket(hour: int, weekday: int) -> str:
         period = "night"
 
     return f"{day}_{period}"
-
-
-def deviates_significantly(
-    current_energy: float,
-    current_valence: float,
-    pattern_energy: float,
-    pattern_valence: float,
-    threshold: float = 0.2,
-) -> bool:
-    """Return ``True`` when current features deviate meaningfully from pattern.
-
-    Args:
-        current_energy:  Energy of the currently playing track.
-        current_valence: Valence of the currently playing track.
-        pattern_energy:  Expected energy for this time bucket.
-        pattern_valence: Expected valence for this time bucket.
-        threshold:       Minimum absolute difference to count as significant.
-
-    Returns:
-        ``True`` if energy or valence deviates by more than *threshold*.
-    """
-    return (
-        abs(current_energy - pattern_energy) > threshold
-        or abs(current_valence - pattern_valence) > threshold
-    )

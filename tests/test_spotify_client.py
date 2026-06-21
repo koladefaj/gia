@@ -81,26 +81,6 @@ async def test_fake_add_to_queue_records_uri() -> None:
     assert "spotify:track:003" in client.queued_tracks
 
 
-@pytest.mark.asyncio
-async def test_fake_get_audio_features_maps_uris() -> None:
-    """``get_audio_features`` returns features in the same order as the input URIs."""
-    client = FakeSpotifyClient()
-    uris = ["spotify:track:001", "spotify:track:002"]
-    features = await client.get_audio_features(uris)
-    assert len(features) == 2
-    assert features[0]["uri"] == "spotify:track:001"
-    assert features[1]["uri"] == "spotify:track:002"
-
-
-@pytest.mark.asyncio
-async def test_fake_get_audio_features_unknown_uri_returns_fallback() -> None:
-    """Unknown URIs fall back to the first track rather than raising."""
-    client = FakeSpotifyClient()
-    features = await client.get_audio_features(["spotify:track:UNKNOWN"])
-    assert len(features) == 1
-    assert "uri" in features[0]
-
-
 # ── SpotifyMCPClient (real, MCP stdio) unit tests ─────────────────────────────
 
 
@@ -137,16 +117,6 @@ async def test_get_recently_played_maps_tool(mcp_client: SpotifyMCPClient) -> No
     name, _ = mcp_client._bridge.call.call_args
     assert name[0] == "getRecentlyPlayed"
     assert name[1] == {"limit": 3}
-
-
-@pytest.mark.asyncio
-async def test_get_audio_features_returns_neutral_without_calling(mcp_client: SpotifyMCPClient) -> None:
-    """No audio-features tool exists; return neutral placeholders, no MCP call."""
-    uris = ["spotify:track:001", "spotify:track:002"]
-    features = await mcp_client.get_audio_features(uris)
-    assert [f["uri"] for f in features] == uris
-    assert all("energy" in f and "key" in f for f in features)
-    mcp_client._bridge.call.assert_not_awaited()
 
 
 @pytest.mark.asyncio

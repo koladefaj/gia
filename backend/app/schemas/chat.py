@@ -8,13 +8,22 @@ from pydantic import BaseModel, Field
 
 
 class IntentType(str, Enum):
-    """Possible intents the Router agent can classify."""
+    """Possible intents the Router can classify.
+
+    ``GENERAL`` is the legacy chit-chat label kept for backward compatibility;
+    the structured router emits ``GENERAL_CHAT`` (the doc's name) and the two are
+    treated identically downstream.
+    """
 
     MUSIC_FIND = "MUSIC_FIND"
     MUSIC_QUEUE = "MUSIC_QUEUE"
     ARTIST_INFO = "ARTIST_INFO"
     MOOD_CHECK = "MOOD_CHECK"
+    MEMORY_QUERY = "MEMORY_QUERY"
+    NEWS_QUERY = "NEWS_QUERY"
+    GENERAL_CHAT = "GENERAL_CHAT"
     MIXED = "MIXED"
+    GENERAL = "GENERAL"
 
 
 class ExecutionPlan(BaseModel):

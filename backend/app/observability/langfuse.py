@@ -1,26 +1,33 @@
-"""Langfuse AI tracing utilities.
+"""Langfuse AI tracing utilities (Langfuse SDK v3/v4, OpenTelemetry-based).
 
-Provides a lightweight context manager for tracing crew runs with per-agent
-spans.  When Langfuse is not configured (keys absent) all calls are no-ops
-so the application runs identically in dev without a Langfuse account.
+Provides a lightweight context manager for tracing a chat turn with per-agent
+spans.  When Langfuse is not configured (keys absent) every call is a no-op so
+the application runs identically in dev without a Langfuse account — the local
+``AgentSpan`` bookkeeping still works, so the ``agent_traces`` field in the
+``done`` SSE event and the unit tests are unaffected.
+
+The v4 SDK is OpenTelemetry-based: observations are created with
+``start_as_current_observation(as_type=...)`` and nest automatically via OTel
+context propagation.  Trace-level attributes (session/user/name/tags) are
+applied with ``propagate_attributes``.  Direct OpenAI calls are traced
+separately via the ``langfuse.openai`` drop-in (see ``providers/openai_client``);
+those generations nest under whichever agent span is active.
 
 Usage::
 
-    async with crew_trace(session_id, user_id) as trace:
-        with trace.span("router") as span:
-            intent, _ = await classify_intent(message, cfg)
-            span.set_output(intent.value)
-
-        with trace.span("dj") as span:
-            result = await dj_service.recommend(query)
-            span.set_output(result.recommendation)
+    async with crew_trace(session_id, user_id, user_input=message) as trace:
+        with trace.span("router", message) as span:
+            decision = await classify_turn(message, cfg)   # OpenAI drop-in
+            span.set_output(decision.intent.value)         # nests under "router"
+        ...
+        trace.set_output(full_reply)
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Generator
-from contextlib import contextmanager, asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,43 +35,43 @@ from backend.app.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
-_langfuse_client: Any = None
+# Process-wide Langfuse client.  ``None`` until ``init_langfuse`` succeeds with
+# real credentials, which is also the signal that tracing is active.
+_client: Any = None
 
 
 def init_langfuse(public_key: str, secret_key: str, host: str) -> None:
-    """Initialise the Langfuse SDK client.
+    """Initialise the global Langfuse SDK client (v4).
 
-    Called once at application startup when both keys are present.  Idempotent —
-    calling again with the same keys is harmless.
+    Called once at application startup when both keys are present.  Constructing
+    ``Langfuse(...)`` registers the process-wide client that ``get_client()`` and
+    the ``langfuse.openai`` drop-in both pick up automatically.
 
     Args:
         public_key: Langfuse public key (``LANGFUSE_PUBLIC_KEY``).
         secret_key: Langfuse secret key (``LANGFUSE_SECRET_KEY``).
-        host:       Langfuse host URL.
+        host:       Langfuse host URL (``LANGFUSE_HOST``).
     """
-    global _langfuse_client  # noqa: PLW0603
+    global _client  # noqa: PLW0603
     try:
-        from langfuse import Langfuse  # type: ignore[import-untyped]
+        from langfuse import Langfuse  # noqa: PLC0415
 
-        _langfuse_client = Langfuse(
-            public_key=public_key,
-            secret_key=secret_key,
-            host=host,
-        )
+        _client = Langfuse(public_key=public_key, secret_key=secret_key, host=host)
         logger.info("langfuse_initialised", host=host)
     except ImportError:
-        logger.warning("langfuse_not_installed", hint="pip install langfuse")
+        logger.warning("langfuse_not_installed", hint="pip install 'langfuse>=4'")
     except Exception as exc:  # noqa: BLE001
         logger.warning("langfuse_init_failed", error=str(exc))
 
 
 @dataclass
 class AgentSpan:
-    """A single agent span within a crew trace.
+    """A single agent span within a chat-turn trace.
 
-    Collects input/output and timing.  When Langfuse is active, the span is
-    sent to the Langfuse API.  When Langfuse is inactive the data is available
-    locally for test assertions and the ``agent_traces`` field in ``ChatResponse``.
+    Collects input/output and timing.  When Langfuse is active the span is
+    backed by a live observation (``_lf_obs``) that receives the same output;
+    when inactive the data is available locally for test assertions and the
+    ``agent_traces`` field in ``ChatResponse``.
 
     Attributes:
         agent:      Agent name (e.g. ``"router"``, ``"dj"``).
@@ -78,106 +85,153 @@ class AgentSpan:
     output: str = ""
     latency_ms: float = 0.0
     _start: float = field(default_factory=time.monotonic, repr=False)
-    _lf_span: Any = field(default=None, repr=False)
+    _lf_obs: Any = field(default=None, repr=False)
 
     def set_output(self, output: str) -> None:
-        """Record the agent's output.
+        """Record the agent's output (mirrored to Langfuse, truncated).
 
         Args:
-            output: String summary (truncated to 500 chars for Langfuse).
+            output: String summary (truncated to 1000 chars for Langfuse).
         """
         self.output = output
-        if self._lf_span is not None:
+        if self._lf_obs is not None:
             try:
-                self._lf_span.update(output=output[:500])
+                self._lf_obs.update(output=output[:1000])
             except Exception:  # noqa: BLE001
                 pass
 
     def _close(self) -> None:
-        """Finalise latency and close the Langfuse span."""
+        """Finalise wall-clock latency (the observation is closed by ``span``)."""
         self.latency_ms = (time.monotonic() - self._start) * 1000
-        if self._lf_span is not None:
-            try:
-                self._lf_span.end()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 @dataclass
 class CrewTrace:
-    """Container for all spans in a single crew run.
+    """Container for all spans in a single chat turn.
 
     Attributes:
         session_id: Conversation session identifier.
         user_id:    User UUID string.
-        spans:      Ordered list of spans collected during the run.
+        spans:      Ordered list of spans collected during the turn.
     """
 
     session_id: str
     user_id: str | None
     spans: list[AgentSpan] = field(default_factory=list)
-    _lf_trace: Any = field(default=None, repr=False)
+    _active: bool = field(default=False, repr=False)
+    _root: Any = field(default=None, repr=False)
 
     @contextmanager
     def span(self, agent: str, input_text: str = "") -> Generator[AgentSpan, None, None]:
-        """Open a span for *agent*, yield it, then close it.
+        """Open a child observation for *agent*, yield a span, then close it.
+
+        Any Langfuse-instrumented call made inside the block (e.g. the
+        ``langfuse.openai`` drop-in) nests under this observation automatically.
 
         Args:
-            agent:      Agent name.
-            input_text: Optional input summary to record upfront.
+            agent:      Agent name → observation name.
+            input_text: Optional input summary recorded upfront.
 
         Yields:
             The ``AgentSpan`` instance.
         """
-        lf_span = None
-        if self._lf_trace is not None:
+        s = AgentSpan(agent=agent, input=input_text)
+        if self._active and _client is not None:
             try:
-                lf_span = self._lf_trace.span(
+                with _client.start_as_current_observation(
+                    as_type="span",
                     name=agent,
-                    input=input_text[:500] if input_text else "",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+                    input=input_text[:1000] if input_text else None,
+                ) as obs:
+                    s._lf_obs = obs
+                    try:
+                        yield s
+                    finally:
+                        s._close()
+                        self.spans.append(s)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("langfuse_span_failed", agent=agent, error=str(exc))
 
-        s = AgentSpan(agent=agent, input=input_text, _lf_span=lf_span)
+        # Tracing disabled or span creation failed — local bookkeeping only.
         try:
             yield s
         finally:
             s._close()
             self.spans.append(s)
 
+    def set_output(self, output: str) -> None:
+        """Set the trace-level output (mirrored onto the root observation)."""
+        if self._root is not None:
+            try:
+                self._root.update(output=output[:2000])
+            except Exception:  # noqa: BLE001
+                pass
+
     def flush(self) -> None:
         """Flush buffered events to Langfuse (best-effort, non-blocking)."""
-        if _langfuse_client is not None:
+        if _client is not None:
             try:
-                _langfuse_client.flush()
+                _client.flush()
             except Exception:  # noqa: BLE001
                 pass
 
 
 @asynccontextmanager
-async def crew_trace(session_id: str, user_id: str | None = None):
-    """Async context manager that opens a Langfuse trace for a crew run.
+async def crew_trace(
+    session_id: str,
+    user_id: str | None = None,
+    user_input: str | None = None,
+):
+    """Async context manager that opens a Langfuse trace for one chat turn.
+
+    Opens a root ``gia-chat-turn`` observation and applies ``session_id`` /
+    ``user_id`` / trace name / tags via ``propagate_attributes`` so every nested
+    agent span and LLM generation inherits them.  On exit, buffered events are
+    flushed.
 
     Args:
-        session_id: Conversation session identifier.
-        user_id:    Optional user UUID string.
+        session_id: Conversation session identifier (groups turns into a Session).
+        user_id:    Optional user UUID string (enables per-user filtering).
+        user_input: Optional raw user message — becomes the trace-level input.
 
     Yields:
-        A ``CrewTrace`` instance.  On exit the trace is flushed to Langfuse.
+        A ``CrewTrace`` instance.
     """
-    lf_trace = None
-    if _langfuse_client is not None:
-        try:
-            lf_trace = _langfuse_client.trace(
-                name="gia_crew_run",
-                session_id=session_id,
-                user_id=user_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("langfuse_trace_open_failed", error=str(exc))
+    trace = CrewTrace(session_id=session_id, user_id=user_id)
 
-    trace = CrewTrace(session_id=session_id, user_id=user_id, _lf_trace=lf_trace)
+    if _client is None:
+        # Tracing disabled — yield a local-only trace.
+        try:
+            yield trace
+        finally:
+            trace.flush()
+        return
+
+    try:
+        from langfuse import propagate_attributes  # noqa: PLC0415
+
+        with _client.start_as_current_observation(
+            as_type="span",
+            name="gia-chat-turn",
+            input=user_input[:1000] if user_input else None,
+        ) as root, propagate_attributes(
+            session_id=session_id,
+            user_id=user_id or None,
+            trace_name="gia-chat-turn",
+            tags=["chat"],
+        ):
+            trace._active = True
+            trace._root = root
+            try:
+                yield trace
+            finally:
+                trace.flush()
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("langfuse_trace_open_failed", error=str(exc))
+
+    # Failed to open the Langfuse trace — degrade to local-only bookkeeping.
     try:
         yield trace
     finally:

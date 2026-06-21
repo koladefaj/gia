@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,7 +10,7 @@ import pytest
 from backend.app.schemas.memory import MemoryEntry, UserContext
 
 _USER_ID = "00000000-0000-0000-0000-000000000001"
-_NOW = datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 6, 19, 12, 0, tzinfo=UTC)
 
 
 def _entry(text: str, uid: str = "00000000-0000-0000-0000-000000000011") -> MemoryEntry:
@@ -210,6 +210,28 @@ class TestUserContextToPromptText:
         text = ctx.to_prompt_text()
         assert "Loves Tems" in text
         assert "Preferences" in text
+
+    def test_life_facts_rendered_with_followup_hint(self) -> None:
+        ctx = self._context(
+            life_facts=[_entry("User is building a Python script for work")]
+        )
+        text = ctx.to_prompt_text()
+        assert "Life & context" in text
+        assert "Python script" in text
+        assert "follow up" in text.lower()
+
+    def test_life_fact_shows_recency(self) -> None:
+        from datetime import timedelta
+
+        old = MemoryEntry(
+            id="00000000-0000-0000-0000-000000000099",
+            type="life_fact",
+            text="User had final exams",
+            confidence=0.8,
+            created_at=_NOW - timedelta(days=10),
+        )
+        text = self._context(life_facts=[old]).to_prompt_text()
+        assert "week" in text  # ~1 week ago suffix from _ago()
 
     def test_now_playing_rendered(self) -> None:
         ctx = self._context(now_playing={"name": "Free Mind", "artist": "Tems", "energy": 0.38})

@@ -8,7 +8,7 @@
 4. Synthesises all three into a warm, personalised response via the persona LLM.
 
 The response is designed to feel like a knowledgeable friend who has done
-their homework — not a Wikipedia article.
+their homework done, not a Wikipedia article.
 
 Section 5 prompt injection (from the spec)::
 
@@ -24,6 +24,7 @@ Section 5 prompt injection (from the spec)::
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 
 from crewai import Agent
@@ -41,6 +42,92 @@ from backend.app.tools.brave import BraveSearchClient
 logger = get_logger(__name__)
 
 AGENT_KEY = "agents.artist"
+
+
+# Phrases that introduce an artist name ("tell me about <name>"). Matched on a
+# lower-cased copy; the name is sliced from the *original* text to keep its case.
+_ARTIST_TRIGGERS = [
+    r"\btell me about\s+",
+    r"\btalk (?:to me )?about\s+",
+    r"\bwhat do you know about\s+",
+    r"\bwho(?:'s| is| are)\s+",
+    r"\bwhat(?:'s| has| did)?\s+(?=.+\b(?:been up to|up to|done|released|dropped|new)\b)",
+    r"\bwhat about\s+",
+    r"\bhow about\s+",
+    r"\banything (?:new )?(?:from|on|about)\s+",
+]
+
+# Trailing clauses to drop from a captured name ("Tems lately" → "Tems").
+_NAME_TAIL = re.compile(
+    r"\b(been up to|up to|lately|these days|right now|please|for me|recently|"
+    r"new|doing|releasing|dropping|up)\b.*$",
+    re.IGNORECASE,
+)
+
+# Words that disqualify a *bare* message from being read as an artist name, so
+# small talk ("whats the weather like") is never looked up as an artist.
+_NOT_ARTIST = {
+    "weather", "mood", "moods", "pattern", "patterns", "you", "your", "yourself",
+    "gia", "help", "what", "whats", "what's", "how", "why", "when", "where",
+    "hey", "hi", "hello", "yo", "sup", "thanks", "thank", "please", "music",
+    "song", "songs", "play", "find", "recommend", "something", "vibe", "vibes",
+    "chill", "hype", "tired", "bored", "happy", "sad", "okay", "ok", "yes", "no",
+    "the", "a", "an", "is", "are", "do", "can", "could", "would", "i", "im",
+    "i'm", "me", "we", "they", "this", "that", "today", "now",
+    # Conversational affirmations / fillers — "yeah sure", "nah", "cool" are
+    # replies, never artist names. Without these, a bare "yeah sure" answer to
+    # "want me to play him?" gets looked up as an artist and hallucinates.
+    "yeah", "yea", "yep", "yup", "nah", "nope", "maybe", "cool", "nice", "wow",
+    "lol", "haha", "hmm", "fine", "alright", "aight", "right", "whatever",
+    "dunno", "idk", "huh", "sure", "really", "totally", "exactly", "absolutely",
+    "good", "great", "awesome", "perfect", "sorry", "wait", "stop",
+}
+
+# A plausible artist name: letters/digits/spaces and a few name punctuation marks.
+_NAME_SHAPE = re.compile(r"^[A-Za-z0-9 '&.\-]+$")
+
+
+def extract_artist_name(message: str) -> str:
+    """Pull the artist name out of an artist-info message, or return ``""``.
+
+    Two strategies, in order:
+
+    1. **Trigger phrase** — "tell me about <name>", "who is <name>", "what has
+       <name> been up to" → the text after the trigger, with trailing filler
+       ("lately", "been up to") stripped.
+    2. **Bare name** — a short message (≤ 4 words) that is *only* a name, with no
+       small-talk / question words → the message itself.
+
+    Anything else (greetings, weather, generic chatter) yields ``""`` so the
+    caller skips the artist agent instead of looking up a nonsense "artist" like
+    *"whats the weather like"*.
+
+    Args:
+        message: The user's raw message.
+
+    Returns:
+        The extracted artist name, or ``""`` when none is present.
+    """
+    text = message.strip().strip("\"'").rstrip("?.!").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+
+    for trigger in _ARTIST_TRIGGERS:
+        m = re.search(trigger, lower)
+        if m:
+            name = text[m.end():].strip().strip("\"'")
+            name = _NAME_TAIL.sub("", name).strip().rstrip(",")
+            return name if name and _NAME_SHAPE.match(name) else ""
+
+    words = text.split()
+    if (
+        1 <= len(words) <= 4
+        and _NAME_SHAPE.match(text)
+        and not any(w.lower().strip(",'") in _NOT_ARTIST for w in words)
+    ):
+        return text
+    return ""
 
 
 def build_artist_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from typing import Annotated
 from weaviate import WeaviateClient
 
 from backend.app.agents.artist import ArtistService
@@ -24,13 +25,13 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/artist", tags=["artist"])
 
 
-@router.post("/info", response_model=ArtistInfoResponse)
+@router.post("/info", summary="Get personalised artist information", status_code=200, response_model=ArtistInfoResponse)
 async def artist_info(
     body: ArtistInfoRequest,
-    spotify: SpotifyClientProtocol = Depends(get_spotify_client),
-    brave: BraveSearchClient = Depends(get_brave_client),
-    weaviate: WeaviateClient = Depends(get_weaviate_client),
-    cfg: Settings = Depends(get_settings),
+    spotify: Annotated[SpotifyClientProtocol, Depends(get_spotify_client)],
+    brave: Annotated[BraveSearchClient, Depends(get_brave_client)],
+    weaviate: Annotated[WeaviateClient, Depends(get_weaviate_client)],
+    cfg: Annotated[Settings, Depends(get_settings)],
 ) -> ArtistInfoResponse:
     """Return a warm, personalised take on *body.artist_name*.
 

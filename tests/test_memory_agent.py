@@ -67,7 +67,8 @@ async def test_memory_service_stores_new_memories(
 
     with patch("backend.app.agents.memory.build_memory_agent"), \
          patch("backend.app.agents.memory.extract_memories", new=AsyncMock(return_value=[new_mem])), \
-         patch("backend.app.agents.memory.embed", new=AsyncMock(return_value=[0.0] * 768)):
+         patch("backend.app.agents.memory.embed_many",
+               new=AsyncMock(side_effect=lambda texts, redis=None: [[0.0] * 768 for _ in texts])):
         service = MemoryService(store=fake_store, redis=fake_redis, cfg=test_settings)
         ids = await service.run_extraction(_USER_ID, "I loved Free Mind by Tems")
 
@@ -89,7 +90,8 @@ async def test_memory_service_skips_duplicates(
 
     with patch("backend.app.agents.memory.build_memory_agent"), \
          patch("backend.app.agents.memory.extract_memories", new=AsyncMock(return_value=[new_mem])), \
-         patch("backend.app.agents.memory.embed", new=AsyncMock(return_value=[0.0] * 768)):
+         patch("backend.app.agents.memory.embed_many",
+               new=AsyncMock(side_effect=lambda texts, redis=None: [[0.0] * 768 for _ in texts])):
         service = MemoryService(store=fake_store, redis=fake_redis, cfg=test_settings)
         ids = await service.run_extraction(_USER_ID, "duplicate transcript")
 
@@ -116,7 +118,8 @@ async def test_memory_service_handles_supersede(
 
     with patch("backend.app.agents.memory.build_memory_agent"), \
          patch("backend.app.agents.memory.extract_memories", new=AsyncMock(return_value=[new_mem])), \
-         patch("backend.app.agents.memory.embed", new=AsyncMock(return_value=[0.0] * 768)):
+         patch("backend.app.agents.memory.embed_many",
+               new=AsyncMock(side_effect=lambda texts, redis=None: [[0.0] * 768 for _ in texts])):
         service = MemoryService(store=fake_store, redis=fake_redis, cfg=test_settings)
         await service.run_extraction(_USER_ID, "I changed my mind")
 
@@ -132,7 +135,8 @@ async def test_memory_service_no_extraction_returns_empty(
 
     with patch("backend.app.agents.memory.build_memory_agent"), \
          patch("backend.app.agents.memory.extract_memories", new=AsyncMock(return_value=[])), \
-         patch("backend.app.agents.memory.embed", new=AsyncMock(return_value=[0.0] * 768)):
+         patch("backend.app.agents.memory.embed_many",
+               new=AsyncMock(side_effect=lambda texts, redis=None: [[0.0] * 768 for _ in texts])):
         service = MemoryService(store=fake_store, redis=fake_redis, cfg=test_settings)
         ids = await service.run_extraction(_USER_ID, "play it at 8pm")
 

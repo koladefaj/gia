@@ -17,7 +17,7 @@ from crewai import Agent
 from backend.app.config import Settings
 from backend.app.memory.cache import invalidate_user
 from backend.app.memory.decay import apply_supersede
-from backend.app.memory.embeddings import embed, text_hash
+from backend.app.memory.embeddings import embed_many, text_hash
 from backend.app.memory.extractor import extract_memories
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
@@ -138,19 +138,34 @@ class MemoryService:
         Returns:
             Weaviate UUID strings of the memories actually inserted.
         """
-        stored_ids: list[str] = []
+        # ── 1. Drop dups first (SHA seen-before in Redis, or repeated within this
+        #        batch) so we only embed — and pay for — genuinely new texts. ───
+        to_store: list[ExtractedMemory] = []
+        seen_hashes: set[str] = set()
         for memory in memories:
-            key = f"memory_hash:{text_hash(memory.text)}:{user_id}"
-            if await self.redis.exists(key):  # type: ignore[union-attr]
+            digest = text_hash(memory.text)
+            if digest in seen_hashes:
+                continue
+            if await self.redis.exists(f"memory_hash:{digest}:{user_id}"):  # type: ignore[union-attr]
                 logger.debug("memory_dedup_skip", user_id=user_id, text=memory.text[:40])
                 continue
+            seen_hashes.add(digest)
+            to_store.append(memory)
 
-            vector = await embed(memory.text, redis=self.redis)
+        if not to_store:
+            return []
 
+        # ── 2. One batched embedding call for every new memory (cache-aware) ──
+        vectors = await embed_many([m.text for m in to_store], redis=self.redis)
+
+        # ── 3. Supersede + upsert + mark each as seen ────────────────────────
+        stored_ids: list[str] = []
+        for memory, vector in zip(to_store, vectors, strict=True):
             if memory.supersedes_id:
                 await apply_supersede(self.store, memory.supersedes_id)
 
             mem_id = await self.store.upsert_memory(user_id, memory, vector)
+            key = f"memory_hash:{text_hash(memory.text)}:{user_id}"
             await self.redis.setex(key, 86400 * 30, "1")  # type: ignore[union-attr]
             stored_ids.append(mem_id)
 

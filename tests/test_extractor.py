@@ -6,7 +6,7 @@ prompt construction, JSON parsing, and error handling.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,7 +20,7 @@ def _make_entry(text: str, uid: str = "00000000-0000-0000-0000-000000000001") ->
         type="preference",
         text=text,
         confidence=0.8,
-        created_at=datetime(2026, 6, 19, tzinfo=timezone.utc),
+        created_at=datetime(2026, 6, 19, tzinfo=UTC),
     )
 
 
@@ -35,6 +35,19 @@ class TestParseExtractedMemories:
         assert result[0].text == "Loves Tems"
         assert result[0].confidence == pytest.approx(0.9)
         assert result[0].supersedes_id is None
+
+    def test_parses_life_fact_type(self) -> None:
+        """The extractor accepts the non-music ``life_fact`` memory class."""
+        from backend.app.memory.extractor import _parse_extracted_memories
+
+        raw = (
+            '[{"type":"life_fact","text":"User is building a Python script for work",'
+            '"confidence":0.8,"supersedes_id":null}]'
+        )
+        result = _parse_extracted_memories(raw)
+        assert len(result) == 1
+        assert result[0].type == "life_fact"
+        assert "Python script" in result[0].text
 
     def test_json_inside_markdown_fences(self) -> None:
         """Extractor strips markdown fences and still parses the array."""

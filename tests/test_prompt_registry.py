@@ -191,11 +191,11 @@ def test_dj_task_renders_with_context() -> None:
         query="chill afrobeats",
         seed_name="Free Mind",
         seed_artist="Tems",
-        energy=0.38,
-        valence=0.71,
-        camelot="8A",
         queued_names="a, b",
+        start_playback=False,
+        requested_title=None,
+        missing_titles=None,
     )
     assert "Free Mind by Tems" in out
-    assert "0.38" in out
+    # The template never references raw audio-feature numbers.
     assert "chill afrobeats" in out

@@ -69,3 +69,53 @@ def test_init_langfuse_noop_without_langfuse_installed() -> None:
             init_langfuse("pk-test", "sk-test", "https://cloud.langfuse.com")
         except ImportError:
             pass  # acceptable
+
+
+@pytest.mark.asyncio
+async def test_crew_trace_creates_v4_observations(monkeypatch) -> None:
+    """When a client is configured, spans back onto real v4 observations.
+
+    Verifies the v4 wiring: ``start_as_current_observation`` is used for the
+    root and each agent span, outputs are mirrored via ``.update()``, and the
+    client is flushed on exit.
+    """
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+
+    import backend.app.observability.langfuse as lf
+
+    created: list[tuple[str, MagicMock]] = []
+
+    @contextmanager
+    def _obs(*, as_type, name, input=None, output=None):  # noqa: A002
+        obs = MagicMock(name=f"obs:{name}")
+        created.append((name, obs))
+        yield obs
+
+    @contextmanager
+    def _propagate(**_kwargs):
+        yield
+
+    import langfuse as langfuse_pkg
+
+    monkeypatch.setattr(langfuse_pkg, "propagate_attributes", _propagate, raising=False)
+
+    client = MagicMock()
+    client.start_as_current_observation.side_effect = _obs
+    monkeypatch.setattr(lf, "_client", client)
+
+    async with lf.crew_trace("sess-1", "user-1", user_input="hi there") as trace:
+        assert trace._active is True
+        with trace.span("router", "hi there") as span:
+            span.set_output("GENERAL_CHAT")
+        trace.set_output("Hey! Good to hear from you.")
+
+    names = [n for n, _ in created]
+    assert names == ["gia-chat-turn", "router"]
+    # Agent output mirrored onto its observation.
+    _, router_obs = created[1]
+    router_obs.update.assert_any_call(output="GENERAL_CHAT")
+    # Trace-level output mirrored onto the root observation.
+    _, root_obs = created[0]
+    root_obs.update.assert_any_call(output="Hey! Good to hear from you.")
+    client.flush.assert_called()

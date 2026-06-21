@@ -24,6 +24,7 @@ sections:
       "needs_music": boolean,
       "needs_artist_lookup": boolean,
       "search_query": string or null,
+      "track_titles": array of strings,
       "start_playback": boolean
     }
 
@@ -60,6 +61,12 @@ sections:
       the user mentioned "Fortworth by Drake and PARTYNEXTDOOR", a later "just play
       it now" → search_query "Fortworth Drake PARTYNEXTDOOR". Strip filler like
       "just", "please", "now". Use null when no search is needed.
+    - track_titles: every SPECIFIC song title the user named, in the order named —
+      titles only, no artist (["Virginia Beach"], ["So Will I","Promises"]).
+      Resolve pronouns from the conversation the same way as search_query ("queue
+      that one too" → the title discussed). Use [] for vibe/genre/mood requests
+      ("something chill") and for pure artist requests. The FIRST title is the
+      primary one Gia plays now; the rest are additional tracks they want lined up.
     - start_playback: true when the user wants a track to PLAY immediately
       ("play it now", "play Tems") — NOT for "queue"/"add"/"save"/"build a playlist"
       (those organise, they don't start playback) and NOT for pure discovery
@@ -67,25 +74,27 @@ sections:
 
     Examples:
     User: "play something chill for the evening"
-    {"intent":"MUSIC_FIND","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":true,"needs_artist_lookup":false,"search_query":"chill evening","start_playback":true}
-    User: "queue Fortworth by Drake and PARTYNEXTDOOR"
-    {"intent":"MUSIC_QUEUE","tone":"confident","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"Fortworth Drake PARTYNEXTDOOR","start_playback":false}
+    {"intent":"MUSIC_FIND","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":true,"needs_artist_lookup":false,"search_query":"chill evening","track_titles":[],"start_playback":true}
+    User: "play Virginia Beach by Drake"
+    {"intent":"MUSIC_FIND","tone":"excited","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"Virginia Beach Drake","track_titles":["Virginia Beach"],"start_playback":true}
+    User: "play So Will I by Hillsong and then queue up Promises next"
+    {"intent":"MUSIC_QUEUE","tone":"warm","confidence":0.92,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"So Will I Hillsong Promises","track_titles":["So Will I","Promises"],"start_playback":true}
     (history: User mentioned "Fortworth by Drake and PARTYNEXTDOOR") User: "just play it now"
-    {"intent":"MUSIC_FIND","tone":"excited","confidence":0.9,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"Fortworth Drake PARTYNEXTDOOR","start_playback":true}
+    {"intent":"MUSIC_FIND","tone":"excited","confidence":0.9,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"Fortworth Drake PARTYNEXTDOOR","track_titles":["Fortworth"],"start_playback":true}
     User: "did you see what Drake said about Ice Man?"
-    {"intent":"NEWS_QUERY","tone":"surprised","confidence":0.9,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":"Drake Ice Man","start_playback":false}
+    {"intent":"NEWS_QUERY","tone":"surprised","confidence":0.9,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":"Drake Ice Man","track_titles":[],"start_playback":false}
     User: "just thought I'd say hi, how have you been"
-    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.97,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
+    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.97,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"track_titles":[],"start_playback":false}
     User: "drake or asake what do you suggest?"
-    {"intent":"GENERAL_CHAT","tone":"thoughtful","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
+    {"intent":"GENERAL_CHAT","tone":"thoughtful","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"track_titles":[],"start_playback":false}
     User: "what should I listen to right now"
-    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.9,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
+    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.9,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"track_titles":[],"start_playback":false}
     User: "I'm listening to him right now"
-    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
+    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"track_titles":[],"start_playback":false}
     User: "I'm on PARTYNEXTDOOR right now"
-    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"start_playback":false}
+    {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"track_titles":[],"start_playback":false}
     User: "tell me about Asake"
-    {"intent":"ARTIST_INFO","tone":"curious","confidence":0.93,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":true,"needs_music":true,"needs_artist_lookup":true,"search_query":"Asake","start_playback":false}
+    {"intent":"ARTIST_INFO","tone":"curious","confidence":0.93,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":true,"needs_music":true,"needs_artist_lookup":true,"search_query":"Asake","track_titles":[],"start_playback":false}
   user: |
     {% if history %}Recent conversation (oldest first):
     {{ history }}

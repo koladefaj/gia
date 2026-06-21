@@ -26,10 +26,14 @@ by ``dependencies.py`` and replaced in tests via ``dependency_overrides``.
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import redis.asyncio as aioredis
 import weaviate
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from backend.app.api import artist, auth, chat, dj, health, memory, onboarding, playlist, voice
@@ -129,6 +133,17 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_FRONTEND = Path(__file__).resolve().parent.parent.parent / "frontend"
+if _FRONTEND.is_dir():
+    app.mount("/ui", StaticFiles(directory=_FRONTEND, html=True), name="frontend")
 
 app.include_router(health.router)
 app.include_router(auth.router)

@@ -39,6 +39,10 @@ async def _extract_async(user_id: str, session_id: str) -> dict:
     from backend.app.agents.memory import MemoryService  # noqa: PLC0415
     from backend.app.config import settings  # noqa: PLC0415
     from backend.app.db.weaviate_init import get_weaviate_client  # noqa: PLC0415
+    from backend.app.memory.session_history import (  # noqa: PLC0415
+        format_history,
+        get_history,
+    )
     from backend.app.memory.store import WeaviateMemoryStore  # noqa: PLC0415
     from backend.app.observability.logging import get_logger  # noqa: PLC0415
 
@@ -51,7 +55,9 @@ async def _extract_async(user_id: str, session_id: str) -> dict:
     weaviate_client = await asyncio.to_thread(get_weaviate_client)
 
     try:
-        transcript: str | None = await redis_client.get(f"session:{user_id}")
+        # The real conversation lives in the per-session history ring written by
+        # the chat endpoint (chat:hist:{session_id}).
+        transcript = format_history(await get_history(redis_client, session_id))
         if not transcript:
             logger.info("memory_task_no_transcript", user_id=user_id)
             return {"status": "no_transcript", "stored": 0, "memory_ids": []}

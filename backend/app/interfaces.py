@@ -44,13 +44,6 @@ class SpotifyClientProtocol(Protocol):
         """
         ...
 
-    async def get_audio_features(self, uris: list[str]) -> list[dict]:
-        """Return audio feature objects for the given Spotify track URIs.
-
-        Features include: energy, valence, tempo, danceability, key, mode.
-        """
-        ...
-
     async def search_tracks(self, query: str, limit: int = 10) -> list[dict]:
         """Search Spotify for tracks matching *query*."""
         ...

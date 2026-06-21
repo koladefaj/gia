@@ -12,11 +12,11 @@ into the first reply.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from backend.app.memory.embeddings import embed
 from backend.app.memory.store import WeaviateMemoryStore
-from backend.app.mood.classifier import classify_mood, deviates_significantly, time_bucket
+from backend.app.mood.classifier import coerce_label, time_bucket
 from backend.app.observability.logging import get_logger
 from backend.app.schemas.memory import MemoryEntry
 
@@ -38,7 +38,7 @@ async def get_pattern_for_now(
     Returns:
         The matching ``MemoryEntry`` (type=mood_pattern), or ``None``.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     bucket = time_bucket(now.hour, now.weekday())
     query = f"mood pattern {bucket}"
     try:
@@ -51,70 +51,56 @@ async def get_pattern_for_now(
     return None
 
 
-def _parse_pattern(text: str) -> tuple[float, float]:
-    """Extract avg_energy and avg_valence from a stored pattern text.
+def _parse_pattern(text: str) -> str:
+    """Extract the mood label from a stored pattern text.
 
     Pattern text format::
 
-        Mood pattern for sunday_evening: wind-down.
-        avg energy=0.31, avg valence=0.72, ...
+        Mood pattern for sunday_evening: chill. Often plays Tems, Wizkid. ...
 
     Args:
         text: The pattern ``MemoryEntry.text``.
 
     Returns:
-        ``(energy, valence)`` floats, defaulting to ``(0.5, 0.5)`` on parse error.
+        A vocabulary mood label (``"neutral"`` if it can't be parsed).
     """
-    energy, valence = 0.5, 0.5
-    for part in text.split(","):
-        part = part.strip()
-        if "avg energy=" in part:
-            try:
-                energy = float(part.split("=")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        if "avg valence=" in part:
-            try:
-                valence = float(part.split("=")[1].strip())
-            except (ValueError, IndexError):
-                pass
-    return energy, valence
+    if ": " not in text:
+        return "neutral"
+    after = text.split(": ", 1)[1]
+    return coerce_label(after.split(".", 1)[0])
 
 
 async def check_and_draft_proactive(
     user_id: str,
-    current_energy: float,
-    current_valence: float,
+    current_label: str,
     store: WeaviateMemoryStore,
     redis,
 ) -> str | None:
-    """Compare current track to known pattern and draft a proactive message.
+    """Compare the current mood label to the bucket's pattern and draft a nudge.
 
-    If the deviation is significant, a short message is drafted in Gia's voice
-    and cached in Redis so the next chat turn can surface it naturally.
+    When the user's current listening reads as a different mood than they usually
+    play in this time bucket, a short message is drafted in Gia's voice and cached
+    in Redis so the next chat turn can surface it naturally.
 
     Args:
-        user_id:         UUID string of the user.
-        current_energy:  Energy of the currently playing track.
-        current_valence: Valence of the currently playing track.
-        store:           Weaviate memory store.
-        redis:           Async Redis client for caching the draft.
+        user_id:       UUID string of the user.
+        current_label: Mood label for what they're playing now (from the labeler).
+        store:         Weaviate memory store.
+        redis:         Async Redis client for caching the draft.
 
     Returns:
-        The proactive draft string, or ``None`` if no deviation detected.
+        The proactive draft string, or ``None`` if no shift is detected.
     """
     pattern = await get_pattern_for_now(user_id, store)
     if pattern is None:
         return None
 
-    pattern_energy, pattern_valence = _parse_pattern(pattern.text)
-    if not deviates_significantly(current_energy, current_valence, pattern_energy, pattern_valence):
+    pattern_label = _parse_pattern(pattern.text)
+    if current_label == "neutral" or current_label == pattern_label:
         return None
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     bucket = time_bucket(now.hour, now.weekday())
-    pattern_label = classify_mood(pattern_energy, pattern_valence)
-    current_label = classify_mood(current_energy, current_valence)
 
     draft = (
         f"[thoughtful] Hey — you're usually on {pattern_label} stuff "

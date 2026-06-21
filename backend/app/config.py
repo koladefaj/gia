@@ -14,7 +14,7 @@ using an invalid value that causes a cryptic error deep in business logic.
 
 import logging
 
-from pydantic import field_validator, Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # =============================================================================
     # Infrastructure
     # =============================================================================
-    
+
     # --- App ---
     app_env: str = Field(default="development")
     log_level: str = Field(default="debug")
@@ -61,6 +61,21 @@ class Settings(BaseSettings):
     # use the built-in provider defaults defined in ``providers/llm.py``.
     llm_persona_model: str = Field(default="")
     llm_fast_model: str = Field(default="")
+
+    # --- Per-component models (intent-aware voice pipeline) ---
+    # All model names are config so they swap without code changes.  gpt-5.5 is
+    # not generally available yet; planner/conversation default to gpt-4o and log
+    # a fallback if a 5.5 name is set but unreachable (see providers/openai_stream).
+    router_model: str = Field(default="gpt-4o-mini")
+    memory_model: str = Field(default="gpt-4o-mini")
+    # Memory embeddings via the OpenAI API (no local torch/sentence-transformers).
+    # text-embedding-3-small is 1536-dim; change → recreate Weaviate + re-seed.
+    embedding_model: str = Field(default="text-embedding-3-small")
+    artist_model: str = Field(default="gpt-4o")
+    planner_model: str = Field(default="gpt-4o")
+    conversation_model: str = Field(default="gpt-4o")
+    # Below this router confidence, escalate to the Planner instead of dispatching.
+    router_confidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
 
     # --- Spotify ---
     spotify_client_id: str = Field(default="")
@@ -119,6 +134,7 @@ class Settings(BaseSettings):
     retrieval_k_preferences: int = Field(default=8, ge=1, le=50)
     retrieval_k_mood: int = Field(default=3, ge=1, le=50)
     retrieval_k_episodes: int = Field(default=3, ge=1, le=50)
+    retrieval_k_life_facts: int = Field(default=4, ge=1, le=50)
     # Redis retrieval cache TTL in seconds (0 disables caching).
     retrieval_cache_ttl: int = Field(default=60, ge=0)
     # Multi-agent synthesis — when ON, a final LLM pass merges several agents'

@@ -12,11 +12,10 @@ Two impedance mismatches are handled here so the rest of Gia sees a normal
 1. **Text, not JSON.** The MCP tools return formatted markdown; the parsers in
    ``spotify_parse`` turn that back into dicts.
 2. **No audio features / artist endpoints.** The server exposes no
-   ``audio-features`` (Spotify deprecated it) or artist-info tool, so
-   ``get_audio_features`` returns neutral placeholders (the DJ still builds a
-   queue, just without real key/energy data) and the artist helpers degrade
-   gracefully.  ``ArtistService`` already gets an artist's tracks via
-   ``search_tracks``, so nothing depends on the missing tools.
+   ``audio-features`` (Spotify deprecated it) or artist-info tool. The DJ builds
+   its queue from search relevance / the user's stated track order instead, and
+   ``ArtistService`` gets an artist's tracks via ``search_tracks`` — so nothing
+   depends on the missing tools.
 
 For unit tests, inject a ``FakeSpotifyClient`` via ``dependency_overrides`` — the
 real client is never constructed in tests.
@@ -218,15 +217,6 @@ class _McpBridge:
             await teardown()
 
 
-# Neutral audio features used when real ones are unavailable (Spotify deprecated
-# the endpoint and the MCP server exposes none). Keeps the DJ queue builder
-# functional with degraded — but non-crashing — sequencing.
-_NEUTRAL_FEATURES = {
-    "energy": 0.5, "valence": 0.5, "tempo": 120.0,
-    "danceability": 0.6, "key": 0, "mode": 1,
-}
-
-
 class SpotifyMCPClient:
     """``SpotifyClientProtocol`` implementation over the MCP stdio server.
 
@@ -272,16 +262,6 @@ class SpotifyMCPClient:
         return parse_tracks(
             await self._call("getTopTracks", timeRange=time_range, limit=limit)
         )
-
-    async def get_audio_features(self, uris: list[str]) -> list[dict]:
-        """Return neutral placeholder features (no real source available).
-
-        Spotify deprecated ``/audio-features`` and the MCP server exposes no
-        equivalent, so per-track energy/valence/key/mode cannot be fetched.  We
-        return neutral values keyed by uri so the DJ's queue builder keeps
-        working (Camelot sequencing is degraded but never crashes).
-        """
-        return [{"uri": uri, **_NEUTRAL_FEATURES} for uri in uris]
 
     # Spotify caps search ``limit`` at 10 for Development-Mode apps (a >10 value
     # returns HTTP 400 "Invalid limit"), so we clamp it here defensively.
