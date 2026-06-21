@@ -274,18 +274,30 @@ _FAST_ACK_INTENTS = {
 }
 
 
+# An explicit action verb — a music intent only earns an instant filler when the
+# user is actually commanding playback, not just mentioning music ("his music is
+# fire" must not draw an "On it." before a chat reply).
+_FAST_ACK_VERB_RE = re.compile(
+    r"\b(play|queue|put (me )?on|throw on|add|skip|save|find|recommend|shuffle|resume)\b",
+    re.IGNORECASE,
+)
+
+
 def _fast_ack_intent(message: str) -> IntentType | None:
     """Return a keyword-classified intent worth acknowledging *before* the router.
 
     Uses the sub-millisecond keyword classifier so Gia can react without waiting
     on the router LLM round-trip. Returns ``None`` when the keywords are ambiguous
-    or the intent is conversational — those wait for the real router decision so a
-    misfired ack never lands in front of a clarifying question.
+    or conversational so a misfired ack never lands in front of a clarifying reply.
+    Music intents additionally require an explicit action verb — a topical mention
+    ("Suono Sai's music is fire") is chat, not a command.
     """
     heuristic = _keyword_classify(message)
-    if heuristic in _FAST_ACK_INTENTS:
-        return heuristic
-    return None
+    if heuristic not in _FAST_ACK_INTENTS:
+        return None
+    if heuristic in (IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE) and not _FAST_ACK_VERB_RE.search(message):
+        return None
+    return heuristic
 
 
 async def _emit_ack(

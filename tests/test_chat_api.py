@@ -287,6 +287,16 @@ def test_fast_ack_skips_ambiguous_mixed_intent() -> None:
     assert _fast_ack_intent("play something chill") is not None
 
 
+def test_fast_ack_requires_action_verb_for_music() -> None:
+    """Topical music chat (no command verb) doesn't draw a premature filler."""
+    from backend.app.api.chat import _fast_ack_intent
+
+    assert _fast_ack_intent("suono sai music is fire") is None
+    assert _fast_ack_intent("his songs are so good honestly") is None
+    # An explicit play command still fires.
+    assert _fast_ack_intent("play me something") is not None
+
+
 @pytest.mark.asyncio
 async def test_greeting_does_not_fast_ack(client: AsyncClient) -> None:
     """A pure greeting carries no retrieval work, so Gia doesn't fire an ack."""

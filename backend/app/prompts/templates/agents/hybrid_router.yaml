@@ -52,6 +52,13 @@ sections:
     - "I'm listening to X", "I'm on X right now", "currently listening to X" — these
       are statements of current activity, NOT play requests. Always classify as
       GENERAL_CHAT with needs_music=false and start_playback=false.
+    - Sharing or opinions about music or an artist with NO action verb — "I just
+      discovered X", "X's music is fire", "X is so good", "have you heard X",
+      "X is underrated" — are GENERAL_CHAT (needs_music=false, start_playback=false,
+      track_titles=[]). The user is talking, not requesting. React to the
+      enthusiasm; do NOT auto-play or queue. Only treat it as a music request when
+      there is an explicit action: play, put on, put me on, queue, add, skip, save,
+      find, recommend, shuffle.
     - Opinion/suggestion questions ("what do you suggest", "what would you recommend",
       "drake or asake?", "which is better", "what should I listen to") are GENERAL_CHAT
       with needs_music=false and start_playback=false. Gia answers conversationally
@@ -61,22 +68,27 @@ sections:
       the user mentioned "Fortworth by Drake and PARTYNEXTDOOR", a later "just play
       it now" → search_query "Fortworth Drake PARTYNEXTDOOR". Strip filler like
       "just", "please", "now". Use null when no search is needed.
-    - track_titles: every SPECIFIC song title the user named, in the order named —
-      titles only, no artist (["Virginia Beach"], ["So Will I","Promises"]).
-      Resolve pronouns from the conversation the same way as search_query ("queue
-      that one too" → the title discussed). Use [] for vibe/genre/mood requests
-      ("something chill") and for pure artist requests. The FIRST title is the
-      primary one Gia plays now; the rest are additional tracks they want lined up.
-    - start_playback: true when the user wants a track to PLAY immediately
-      ("play it now", "play Tems") — NOT for "queue"/"add"/"save"/"build a playlist"
-      (those organise, they don't start playback) and NOT for pure discovery
-      questions. MUSIC_QUEUE almost always means start_playback=false.
+    - track_titles: every SPECIFIC SONG title the user named, in the order named —
+      song titles only, NEVER an artist name. "play Virginia Beach" → ["Virginia
+      Beach"]; but "put me on Monochrome" / "play some Asake" name an ARTIST, not a
+      song → track_titles=[] (the artist goes in search_query). Resolve pronouns
+      from the conversation ("queue that one too" → the title discussed). Use [] for
+      vibe/genre/mood requests and artist-only requests. The FIRST title is the one
+      Gia plays now; the rest are lined up after.
+    - start_playback: true when the user wants to PLAY now — "play it now", "play
+      Tems", "put me on X", "put on X", "throw on X". NOT for "queue"/"add"/"save"/
+      "build a playlist" (those organise) and NOT for discovery questions.
+      MUSIC_QUEUE almost always means start_playback=false.
 
     Examples:
     User: "play something chill for the evening"
     {"intent":"MUSIC_FIND","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":true,"needs_artist_lookup":false,"search_query":"chill evening","track_titles":[],"start_playback":true}
     User: "play Virginia Beach by Drake"
     {"intent":"MUSIC_FIND","tone":"excited","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"Virginia Beach Drake","track_titles":["Virginia Beach"],"start_playback":true}
+    User: "just discovered Suono Sai yesterday, his music is fire"
+    {"intent":"GENERAL_CHAT","tone":"excited","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":true,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"track_titles":[],"start_playback":false}
+    User: "put me on Monochrome"
+    {"intent":"MUSIC_FIND","tone":"excited","confidence":0.92,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"Monochrome","track_titles":[],"start_playback":true}
     User: "play So Will I by Hillsong and then queue up Promises next"
     {"intent":"MUSIC_QUEUE","tone":"warm","confidence":0.92,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":true,"needs_artist_lookup":false,"search_query":"So Will I Hillsong Promises","track_titles":["So Will I","Promises"],"start_playback":true}
     (history: User mentioned "Fortworth by Drake and PARTYNEXTDOOR") User: "just play it now"
