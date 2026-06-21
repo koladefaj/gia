@@ -45,3 +45,29 @@ sections:
     {{ existing_memories }}
 
     JSON array:
+  consolidate: |
+    Below are the raw things Gia has learned about one user over time — many
+    small, specific facts. Your job is to step back and synthesise the SIGNAL:
+    the higher-order patterns a close friend would notice, not the individual
+    data points.
+
+    Turn the raw memories into 2–4 concise INSIGHT statements. Each insight should
+    generalise across several raw facts — a taste, a tendency, a throughline — not
+    restate a single one.
+
+    Good:  "Prefers emotionally expressive Afrobeats — Tems, Wizkid, slower R&B —
+            and leans to it when winding down."
+    Good:  "Uses music to focus; reaches for lyric-light, steady tracks while working."
+    Bad:   "Likes Tems." (that's a raw fact, not an insight)
+    Bad:   "Likes Tems, Burna Boy, and Rema." (a list, not a synthesis)
+
+    Rules:
+    - Only generalise from the raw memories below — never invent a taste or fact.
+    - If there isn't enough signal to generalise, return fewer insights, or [].
+    - Write in the third person, plainly ("User ...").
+    - Return ONLY a raw JSON array of strings — no objects, no markdown, no preamble.
+
+    Raw memories:
+    {{ raw_memories }}
+
+    JSON array of insight strings:

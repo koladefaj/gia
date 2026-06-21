@@ -235,3 +235,35 @@ class WeaviateMemoryStore:
             return _obj_to_entry(obj)
 
         return await asyncio.to_thread(_run)
+
+    async def fetch_by_type(
+        self, user_id: str, memory_type: str, limit: int = 50
+    ) -> list[MemoryEntry]:
+        """Fetch a user's memories of *memory_type* without a semantic query.
+
+        Unlike :meth:`search`, this is a filter-only scan (no vector) — used by
+        consolidation, which needs to read the *whole* set of a user's raw
+        memories to synthesise higher-order insights, not the top-k for a query.
+
+        Args:
+            user_id:     UUID string identifying the user.
+            memory_type: Memory class to fetch (e.g. ``"preference"``).
+            limit:       Maximum rows to return.
+
+        Returns:
+            List of ``MemoryEntry`` (newest-first not guaranteed — order is the
+            store's; consolidation doesn't depend on order).
+        """
+
+        def _run() -> list[MemoryEntry]:
+            col = self.client.collections.get("UserMemory")
+            results = col.query.fetch_objects(
+                limit=limit,
+                filters=(
+                    Filter.by_property("user_id").equal(user_id)
+                    & Filter.by_property("type").equal(memory_type)
+                ),
+            )
+            return [_obj_to_entry(o) for o in results.objects]
+
+        return await asyncio.to_thread(_run)

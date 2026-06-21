@@ -88,7 +88,9 @@ async def test_build_user_context_includes_preferences(
 ) -> None:
     """Preferences returned by Weaviate appear in the context."""
     fake_store.hybrid_search = AsyncMock(side_effect=[
+        [],                       # insights (retrieved first)
         [_entry("Loves Tems")],  # preferences
+        [],                       # life_facts
         [],                       # mood_patterns
         [],                       # episodes
     ])

@@ -68,6 +68,16 @@ async def _extract_async(user_id: str, session_id: str) -> dict:
             user_id=user_id,
             transcript=transcript,
         )
+
+        # New facts landed → re-synthesise this user's higher-order insights
+        # (the reflection loop). Decoupled into its own task so extraction stays
+        # fast and a consolidation failure never breaks extraction.
+        if memory_ids:
+            from backend.worker.celery_app import celery_app  # noqa: PLC0415
+            celery_app.send_task(
+                "backend.worker.tasks.memory_consolidation.run_consolidation",
+                args=[user_id],
+            )
     finally:
         await redis_client.aclose()
         await asyncio.to_thread(weaviate_client.close)

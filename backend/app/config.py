@@ -135,6 +135,8 @@ class Settings(BaseSettings):
     retrieval_k_mood: int = Field(default=3, ge=1, le=50)
     retrieval_k_episodes: int = Field(default=3, ge=1, le=50)
     retrieval_k_life_facts: int = Field(default=4, ge=1, le=50)
+    # Synthesised higher-order insights (memory consolidation) — few, high-signal.
+    retrieval_k_insights: int = Field(default=3, ge=1, le=50)
     # Redis retrieval cache TTL in seconds (0 disables caching).
     retrieval_cache_ttl: int = Field(default=60, ge=0)
     # Multi-agent synthesis — when ON, a final LLM pass merges several agents'

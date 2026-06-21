@@ -258,6 +258,7 @@ async def build_user_context(
 
     (
         profile,
+        insights,
         preferences,
         life_facts,
         mood_patterns,
@@ -267,6 +268,7 @@ async def build_user_context(
         recently_played,
     ) = await asyncio.gather(
         _get_profile(user_id, db),
+        _retrieve("insight", cfg.retrieval_k_insights),
         _retrieve("preference", cfg.retrieval_k_preferences),
         _retrieve("life_fact", cfg.retrieval_k_life_facts),
         _retrieve("mood_pattern", cfg.retrieval_k_mood),
@@ -288,6 +290,7 @@ async def build_user_context(
     if isinstance(recently_played, Exception):
         recently_played = []
 
+    insights = _safe_list(insights, [])
     preferences = _safe_list(preferences, [])
     life_facts = _safe_list(life_facts, [])
     mood_patterns = _safe_list(mood_patterns, [])
@@ -298,6 +301,7 @@ async def build_user_context(
     return UserContext(
         user_id=user_id,
         profile=profile,
+        insights=insights,  # type: ignore[arg-type]
         preferences=preferences,  # type: ignore[arg-type]
         life_facts=life_facts,  # type: ignore[arg-type]
         mood_patterns=mood_patterns,  # type: ignore[arg-type]

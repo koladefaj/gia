@@ -108,6 +108,7 @@ class UserContext(BaseModel):
 
     user_id: str
     profile: dict | None = None
+    insights: list[MemoryEntry] = Field(default_factory=list)
     preferences: list[MemoryEntry] = Field(default_factory=list)
     life_facts: list[MemoryEntry] = Field(default_factory=list)
     mood_patterns: list[MemoryEntry] = Field(default_factory=list)
@@ -151,6 +152,14 @@ class UserContext(BaseModel):
                 for t in self.recently_played[:3]
             ]
             lines.append(f"**Recent:** {', '.join(snippets)}")
+
+        if self.insights:
+            lines.append(
+                "\n**Who they are** (synthesised from everything you've learned — "
+                "the big picture, more reliable than any single fact below):"
+            )
+            for i in self.insights:
+                lines.append(f"- {i.text} [ref {i.ref}]")
 
         if self.preferences:
             lines.append("\n**Preferences:**")
