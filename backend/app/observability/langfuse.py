@@ -168,6 +168,35 @@ class CrewTrace:
             except Exception:  # noqa: BLE001
                 pass
 
+    def score(
+        self,
+        name: str,
+        value: float | str,
+        *,
+        data_type: str | None = None,
+        comment: str | None = None,
+    ) -> None:
+        """Attach a self-evaluation score to this turn's trace (best-effort).
+
+        Lightweight, deterministic feedback signals — was retrieved context used,
+        the router's confidence, end-to-end latency — logged per turn so quality
+        and cost are measurable over time, not guessed. No-op when tracing is off.
+
+        Args:
+            name:      Score name (e.g. ``"context_used"``).
+            value:     Numeric/boolean/categorical value.
+            data_type: Optional Langfuse data type (``NUMERIC`` / ``BOOLEAN`` / …).
+            comment:   Optional human-readable note.
+        """
+        if not (self._active and _client is not None):
+            return
+        try:
+            _client.score_current_trace(
+                name=name, value=value, data_type=data_type, comment=comment
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("langfuse_score_failed", name=name)
+
     def flush(self) -> None:
         """Flush buffered events to Langfuse (best-effort, non-blocking)."""
         if _client is not None:

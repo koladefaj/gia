@@ -387,6 +387,7 @@ async def _run_crew(
     Yields:
         SSE-formatted strings.
     """
+    turn_t0 = time.monotonic()
     session_id = request.session_id or str(uuid.uuid4())
     user_id = request.user_id
     store = WeaviateMemoryStore(client=weaviate) if user_id else None
@@ -791,6 +792,18 @@ async def _run_crew(
                         )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("chat_ingest_error", error=str(exc))
+
+        # ── Self-evaluation: log per-turn quality/cost signals to Langfuse ────
+        # Deterministic and free — the feedback loop that lets routing and
+        # retrieval be tuned from data later instead of by guesswork.
+        trace.score("context_used", 1 if user_context_used else 0, data_type="BOOLEAN")
+        trace.score("retrieval_used", 1 if steps else 0, data_type="BOOLEAN")
+        trace.score("router_confidence", round(confidence, 2), data_type="NUMERIC")
+        trace.score(
+            "turn_latency_ms",
+            round((time.monotonic() - turn_t0) * 1000, 1),
+            data_type="NUMERIC",
+        )
 
         # ── 6. Done ───────────────────────────────────────────────────────────
         yield _sse("done", {

@@ -2,9 +2,32 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
-from backend.app.observability.langfuse import AgentSpan, CrewTrace
+from backend.app.observability.langfuse import CrewTrace
+
+
+def test_score_is_noop_when_tracing_inactive() -> None:
+    """``score`` must never raise when Langfuse is off (the dev default)."""
+    trace = CrewTrace(session_id="s1", user_id=None)
+    trace.score("context_used", 1, data_type="BOOLEAN")  # no client, no crash
+
+
+def test_score_calls_client_when_active() -> None:
+    """When tracing is active, scores are forwarded to the Langfuse client."""
+    from backend.app.observability import langfuse as lf
+
+    trace = CrewTrace(session_id="s1", user_id=None)
+    trace._active = True
+    fake_client = MagicMock()
+    with patch.object(lf, "_client", fake_client):
+        trace.score("router_confidence", 0.9, data_type="NUMERIC")
+
+    fake_client.score_current_trace.assert_called_once()
+    assert fake_client.score_current_trace.call_args.kwargs["name"] == "router_confidence"
+    assert fake_client.score_current_trace.call_args.kwargs["value"] == 0.9
 
 
 def test_agent_span_records_latency() -> None:
@@ -35,9 +58,8 @@ def test_crew_trace_collects_spans() -> None:
 def test_crew_trace_span_exception_still_closes() -> None:
     """A span is closed even if the body raises an exception."""
     trace = CrewTrace(session_id="s1", user_id=None)
-    with pytest.raises(ValueError):
-        with trace.span("router") as span:
-            raise ValueError("test error")
+    with pytest.raises(ValueError), trace.span("router") as span:
+        raise ValueError("test error")
 
     assert len(trace.spans) == 1
     assert trace.spans[0].latency_ms >= 0.0
@@ -61,6 +83,7 @@ async def test_crew_trace_context_manager() -> None:
 def test_init_langfuse_noop_without_langfuse_installed() -> None:
     """``init_langfuse`` does not raise when the langfuse package is absent."""
     from unittest.mock import patch
+
     from backend.app.observability.langfuse import init_langfuse
 
     with patch.dict("sys.modules", {"langfuse": None}):
