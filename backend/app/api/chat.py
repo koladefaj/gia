@@ -40,10 +40,9 @@ from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
-from backend.app.agents.acknowledgment import get_selector, should_acknowledge
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
-from backend.app.agents.general import opening_line, respond_general, stream_general
+from backend.app.agents.general import opening_line, stream_general
 from backend.app.agents.hybrid_router import classify_turn
 from backend.app.agents.mood import MoodService
 from backend.app.agents.planner import _wants_weather
@@ -67,12 +66,11 @@ from backend.app.mood.ingest import ingest_recently_played
 from backend.app.mood.proactive import pop_proactive_draft
 from backend.app.observability.langfuse import crew_trace
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import is_emotional, synthesize
+from backend.app.providers.tts import is_emotional, synthesize_stream
 from backend.app.schemas.chat import ChatRequest, IntentType
-from backend.app.schemas.router import RouterDecision, Tone
+from backend.app.schemas.router import RouterDecision
 from backend.app.tools.brave import BraveSearchClient
-from backend.app.voice.adapter import VoiceAdapter
-from backend.app.voice.streaming import split_sentences, stream_sentences
+from backend.app.voice.streaming import split_sentences
 
 logger = get_logger(__name__)
 
@@ -122,8 +120,6 @@ async def _weather_note(weather: WeatherClientProtocol, cfg: Settings) -> str | 
     )
 
 
-_voice_adapter = VoiceAdapter()
-
 # Recent turns of the session transcript handed to the router (≈3 exchanges).
 # The reply path keeps the full window (session_history._MAX_TURNS); the router
 # only needs enough to resolve references and derive a clean search_query.
@@ -169,18 +165,6 @@ def _is_now_playing_query(message: str) -> bool:
     return bool(_NOW_PLAYING_RE.search(message))
 
 
-async def _tts_frame(text: str, provider: str, api_key: str, voice_id: str) -> str | None:
-    """Synthesise *text* and return an ``audio_chunk`` SSE frame (or ``None``)."""
-    chunk = await synthesize(text, provider=provider, api_key=api_key, voice_id=voice_id)
-    if not chunk:
-        return None
-    return _sse("audio_chunk", {
-        "data": base64.b64encode(chunk).decode(),
-        "model": provider,
-        "emotional": is_emotional(text),
-    })
-
-
 async def _aiter(items: list[str]) -> AsyncIterator[str]:
     """Adapt a ready list of sentences to the async-iterator interface."""
     for item in items:
@@ -215,18 +199,22 @@ async def _stream_reply_frames(
     voice_id: str,
     collected: list[str],
 ) -> AsyncIterator[str]:
-    """Stream the reply text sentence-by-sentence, then synthesise the WHOLE
-    reply in a single TTS pass.
+    """Stream the reply text sentence-by-sentence, then STREAM the WHOLE reply's
+    audio progressively as ElevenLabs renders it.
 
-    Per-sentence synthesis made the voice lurch: each ElevenLabs call saw only
-    one sentence, so prosody and tag rendering reset at every boundary, and the
-    hybrid picker could even switch models mid-reply (flash ↔ v3, which sound
-    audibly different). One pass over the full text gives consistent prosody,
-    reliable v3 tag rendering (it needs ~250+ chars of context), and a single
-    voice. The fast acknowledgment already covers the perceived latency of
-    waiting for the complete reply; text still streams live so captions appear
-    as Gia "types". Every sentence is appended to *collected* so the caller can
-    persist the full reply.
+    The whole reply is synthesised in ONE pass (the full text is sent up-front),
+    so prosody and v3 tag rendering stay consistent and there's no mid-reply
+    flash↔v3 hop — v3 needs ~250+ chars of context to sound right, which a
+    per-sentence call can't give it. But the audio is pulled from ElevenLabs'
+    ``/stream`` endpoint and forwarded chunk-by-chunk, so the first audio bytes
+    reach the client well before the complete file is rendered — that's the
+    latency win that replaces the old fast acknowledgment. Text still streams
+    live so captions appear as Gia "types"; every sentence is appended to
+    *collected* so the caller can persist the full reply.
+
+    Frames: ``audio_start`` (once, before the first byte) → N ``audio_chunk``
+    (each ``streaming: true`` with a monotonic ``seq``) → ``audio_end``. The
+    frontend appends the chunks to a MediaSource buffer and plays progressively.
     """
     async for sentence in sentences:
         collected.append(sentence)
@@ -235,28 +223,42 @@ async def _stream_reply_frames(
     full = " ".join(s.strip() for s in collected).strip()
     if not full:
         return
+
+    # is_emotional(full) picks ONE model for the whole reply (no mid-reply
+    # flash↔v3 hop): any tag or a question → eleven_v3, else eleven_flash.
+    emotional = is_emotional(full)
+    started = False
+    seq = 0
     try:
-        chunk = await synthesize(full, provider=provider, api_key=api_key, voice_id=voice_id)
+        async for chunk in synthesize_stream(
+            full, provider=provider, api_key=api_key, voice_id=voice_id
+        ):
+            if not chunk:
+                continue
+            if not started:
+                started = True
+                yield _sse("audio_start", {"model": provider, "emotional": emotional})
+            yield _sse("audio_chunk", {
+                "data": base64.b64encode(chunk).decode(),
+                "model": provider,
+                "emotional": emotional,
+                "seq": seq,
+                "streaming": True,
+            })
+            seq += 1
     except Exception as exc:  # noqa: BLE001
         logger.warning("chat_tts_error", error=str(exc))
-        return
-    if chunk:
-        # is_emotional(full) picks ONE model for the whole reply (no mid-reply
-        # flash↔v3 hop): any tag or a question → eleven_v3, else eleven_flash.
-        yield _sse("audio_chunk", {
-            "data": base64.b64encode(chunk).decode(),
-            "model": provider,
-            "emotional": is_emotional(full),
-        })
+    if started:
+        yield _sse("audio_end", {"chunks": seq})
 
 
-# Heuristic intents that signal likely background work (retrieval / playback),
-# so a neutral filler is worth speaking before the LLM router even returns.
-# MIXED is excluded: it's the most ambiguous keyword verdict ("recommend an
-# artist like X" is usually a chat question, not retrieval), so the keyword path
-# and the LLM router disagree most often there. Conversational / status intents
-# are excluded too — they're fast already or would mis-fire a reaction.
-_FAST_ACK_INTENTS = {
+# Keyword-classified intents that clearly want a specialist (retrieval/playback),
+# so the conversational reply should NOT be pre-generated for them. Everything
+# else (greetings, questions, ambiguous MIXED) is treated as probably-chat and is
+# worth speculating on while the router LLM runs. MIXED is intentionally absent:
+# the keyword path and the router disagree most there, so speculating is the safe
+# bet (a wasted call costs cents; a serial router wait costs ~2s of silence).
+_SPECULATE_SKIP_INTENTS = {
     IntentType.MUSIC_FIND,
     IntentType.MUSIC_QUEUE,
     IntentType.ARTIST_INFO,
@@ -264,92 +266,55 @@ _FAST_ACK_INTENTS = {
 }
 
 
-# An explicit action verb — a music intent only earns an instant filler when the
-# user is actually commanding playback, not just mentioning music ("his music is
-# fire" must not draw an "On it." before a chat reply).
-_FAST_ACK_VERB_RE = re.compile(
-    r"\b(play|queue|put (me )?on|throw on|add|skip|save|find|recommend|shuffle|resume)\b",
-    re.IGNORECASE,
-)
+def _should_speculate(message: str) -> bool:
+    """Whether to pre-generate the conversational reply concurrently with the router.
 
-
-def _fast_ack_intent(message: str) -> IntentType | None:
-    """Return a keyword-classified intent worth acknowledging *before* the router.
-
-    Uses the sub-millisecond keyword classifier so Gia can react without waiting
-    on the router LLM round-trip. Returns ``None`` when the keywords are ambiguous
-    or conversational so a misfired ack never lands in front of a clarifying reply.
-    Music intents additionally require an explicit action verb — a topical mention
-    ("Suono Sai's music is fire") is chat, not a command.
+    The router LLM is ~2s and fully blocks the reply. Most turns are chit-chat,
+    so we kick off the conversational reply in parallel and use it only if the
+    router confirms a conversational intent — correctness is unchanged (nothing
+    is emitted before the router lands), we just overlap the generation. We skip
+    speculation when the sub-ms keyword classifier already says a specialist will
+    clearly run, to avoid burning an LLM call the turn won't use.
     """
-    heuristic = _keyword_classify(message)
-    if heuristic not in _FAST_ACK_INTENTS:
-        return None
-    if heuristic in (IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE) and not _FAST_ACK_VERB_RE.search(message):
-        return None
-    return heuristic
+    return _keyword_classify(message) not in _SPECULATE_SKIP_INTENTS
 
 
-async def _emit_ack(
-    intent: IntentType,
-    tone: Tone,
-    session_id: str,
-    trace,
+async def _collect_general(
     message: str,
-    provider: str,
-    api_key: str,
-    voice_id: str,
-) -> AsyncIterator[str]:
-    """Select, emit and speak a single intent+tone acknowledgment as SSE frames.
+    user_context_text: str,
+    history_text: str,
+    cfg: Settings,
+) -> str:
+    """Run the conversational reply to completion and return the full text.
 
-    The *accurate* path: only reached after the router decision exists, so the
-    line's intent and tone are real and ``should_acknowledge`` has already gated
-    on actual retrieval/clarify/confirm.
+    Drains :func:`stream_general` into a single string. Used both for the
+    speculative pre-generation and the in-band fallback; the assembled reply is
+    streamed to the client (text + progressive audio) in section 5.
     """
-    with trace.span("acknowledgment", message) as span:
-        t0 = time.monotonic()
-        ack_line = get_selector().select(intent, tone, session_id)
-        spoken = _voice_adapter.apply(tone.value, ack_line)
-        span.set_output(spoken)
-        yield _sse("reply_chunk", {"text": spoken})
-        yield _sse("acknowledgment", {
-            "text": spoken,
-            "tone": tone.value,
-            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-        })
-        frame = await _tts_frame(spoken, provider, api_key, voice_id)
-        if frame:
-            yield frame
+    parts: list[str] = []
+    async for delta in stream_general(message, user_context_text, cfg=cfg, history=history_text):
+        if delta:
+            parts.append(delta)
+    return "".join(parts).strip()
 
 
-async def _emit_filler(
-    session_id: str,
-    trace,
+async def _speculative_general(
     message: str,
-    provider: str,
-    api_key: str,
-    voice_id: str,
-) -> AsyncIterator[str]:
-    """Emit a neutral filler before the router's decision exists (the fast path).
-
-    Claims nothing specific and carries no tone tag, so it can front whatever the
-    router lands on — a recommendation, a clarifying question, or pure chat —
-    without contradicting the reply. This is what keeps a keyword/LLM intent
-    disagreement from producing an ack that promises work the turn never does.
-    """
-    with trace.span("acknowledgment", message) as span:
-        t0 = time.monotonic()
-        line = get_selector().select_filler(session_id)
-        span.set_output(line)
-        yield _sse("reply_chunk", {"text": line})
-        yield _sse("acknowledgment", {
-            "text": line,
-            "tone": "neutral",
-            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-        })
-        frame = await _tts_frame(line, provider, api_key, voice_id)
-        if frame:
-            yield frame
+    memory_task: asyncio.Task | None,
+    history_text: str,
+    cfg: Settings,
+) -> str:
+    """Pre-generate the conversational reply, awaiting the in-flight memory task
+    for personalisation context first. Never raises — a failed memory lookup just
+    yields an un-personalised (but still warm) reply."""
+    user_context_text = ""
+    if memory_task is not None:
+        try:
+            ctx = await memory_task
+            user_context_text = ctx.to_prompt_text()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("speculative_memory_error", error=str(exc))
+    return await _collect_general(message, user_context_text, history_text, cfg)
 
 
 async def _run_crew(
@@ -391,11 +356,11 @@ async def _run_crew(
     async with crew_trace(session_id, user_id, user_input=request.message) as trace, \
             _task_scope() as bg_tasks:
 
-        # ── 1. Kick off the two slowest pre-reply steps concurrently ──────────
-        # Memory-context building and the router LLM are independent, and the
-        # acknowledgment needs neither — so we start both as background tasks and
-        # let Gia react first, instead of paying memory + router serially before
-        # the user hears anything.
+        # ── 1. Kick off the slowest pre-reply steps concurrently ──────────────
+        # Memory-context building and the router LLM are independent, so we start
+        # both as background tasks. We also speculatively pre-generate the
+        # conversational reply (below) concurrently with the router, so the ~2s
+        # router round-trip overlaps the reply generation instead of preceding it.
         #
         # Recent turns of THIS conversation let the router resolve "play it now"/
         # "that one" and let Gia pick up where she left off — fetched first because
@@ -428,10 +393,32 @@ async def _run_crew(
         # search/recommend (which is how Gia used to invent an answer).
         now_playing_query = _is_now_playing_query(request.message)
 
+        # ── 1b. Speculatively pre-generate the conversational reply ───────────
+        # The conversational reply is the turn's content whenever no specialist
+        # runs. Most turns are chit-chat, so we start generating it NOW — in
+        # parallel with the router — and use it only if the router confirms a
+        # conversational intent. Nothing is emitted before the router lands, so
+        # correctness is identical; we just stop paying the router latency and the
+        # reply latency back-to-back. Skipped when a specialist is clearly coming
+        # (keyword classifier), when a proactive note will lead the reply, for
+        # now-playing status queries, and for providers without token streaming.
+        general_task: asyncio.Task | None = None
+        if (
+            not now_playing_query
+            and not proactive
+            and len(request.message.strip()) >= 3
+            and cfg.llm_provider in ("openai", "anthropic")
+            and _should_speculate(request.message)
+        ):
+            general_task = asyncio.create_task(
+                _speculative_general(request.message, memory_task, history_text, cfg)
+            )
+            bg_tasks.append(general_task)
+
         # ── 2. Route the turn (structured: intent + tone + engagement) ─────────
         # One small-model call classifies everything the turn needs. It never
         # raises — a failed call degrades to a warm GENERAL_CHAT default. Started
-        # as a task so the fast acknowledgment below overlaps the round-trip.
+        # as a task so the speculative reply above overlaps the round-trip.
         yield _sse("agent_start", {"agent": "router", "input": request.message})
         with trace.span("router", request.message) as span:
             router_t0 = time.monotonic()
@@ -441,24 +428,6 @@ async def _run_crew(
                 classify_turn(request.message, cfg, history=router_history)
             )
             bg_tasks.append(router_task)
-
-            # ── 2a. Fast acknowledgment — react before the router LLM returns ──
-            # Gia speaks a *neutral* filler in ~1s on every substantive turn while
-            # the router, memory, and (whole-reply) TTS are still in flight — so
-            # she always feels responsive, not just on retrieval commands. The
-            # filler claims nothing specific, so it can front whatever the reply
-            # turns out to be (chat, a recommendation, a clarifying question)
-            # without contradicting it. The intent-flavoured ack is still reserved
-            # for the accurate post-router path. Skipped for now-playing status
-            # queries (answered instantly) and noise blips (< 3 chars).
-            acked = False
-            if not now_playing_query and len(request.message.strip()) >= 3:
-                async for frame in _emit_filler(
-                    session_id, trace, request.message,
-                    tts_provider, tts_api_key, tts_voice_id,
-                ):
-                    yield frame
-                acked = True
 
             decision = await router_task
             intent, confidence = decision.intent, decision.confidence
@@ -488,17 +457,6 @@ async def _run_crew(
                 "artist_lookup": decision.needs_artist_lookup,
             },
         })
-
-        # ── 2b. Accurate acknowledgment — only if we didn't already fast-ack ───
-        # When the keyword path was unsure, the router's real intent/tone/mode
-        # decide whether (and how) to react, so a clarify/confirm turn never gets
-        # a generic "On it." in front of its question.
-        if not acked and should_acknowledge(decision):
-            async for frame in _emit_ack(
-                decision.intent, decision.tone, session_id, trace, request.message,
-                tts_provider, tts_api_key, tts_voice_id,
-            ):
-                yield frame
 
         # ── 3. Resolve the memory context (needed by agents + the reply) ──────
         user_context_text = ""
@@ -669,71 +627,51 @@ async def _run_crew(
         # turn where no specialist produced output — get a persona-grounded reply
         # in Gia's own voice instead of a canned string.
         substantive_parts = [p for p in reply_parts if p.strip()]
-        streamed_inline = False
         full_reply = ""
         if not now_playing_query and (
             intent in _CONVERSATIONAL_INTENTS or not substantive_parts
         ):
-            # When the conversational reply is the *sole* content (no proactive
-            # note to keep verbatim, no specialist part to merge) we stream the
-            # model's tokens straight into per-sentence TTS — so audio for the
-            # first sentence starts while the rest is still being generated,
-            # instead of waiting for the whole reply. Otherwise fall back to a
-            # blocking reply that the unified section-5 streaming handles.
-            can_stream_inline = (
-                cfg.llm_provider in ("openai", "anthropic")
-                and not proactive
-                and not substantive_parts
-            )
+            # Use the speculative reply generated alongside the router when we have
+            # one (the common chit-chat path — it's already done or nearly so, so
+            # the router latency was absorbed). Otherwise generate it now: this
+            # covers turns we declined to speculate on (a specialist looked likely
+            # but produced nothing, or the keyword path flagged a command). The
+            # assembled reply is streamed (text + progressive audio) in section 5.
             yield _sse("agent_start", {"agent": "gia", "input": request.message})
             with trace.span("general", request.message) as span:
                 t0 = time.monotonic()
-                if can_stream_inline:
-                    collected: list[str] = []
-                    sentences = stream_sentences(stream_general(
-                        request.message, user_context_text, cfg=cfg, history=history_text,
-                    ))
-                    async for frame in _stream_reply_frames(
-                        sentences, tts_provider, tts_api_key, tts_voice_id, collected,
-                    ):
-                        yield frame
-                    full_reply = " ".join(collected)
-                    streamed_inline = True
-                    span.set_output(full_reply)
+                if general_task is not None:
+                    reply = await general_task
                 else:
-                    reply = await respond_general(
-                        request.message, user_context_text, cfg=cfg, history=history_text
+                    reply = await _collect_general(
+                        request.message, user_context_text, history_text, cfg
                     )
-                    reply_parts.append(reply)
-                    span.set_output(reply)
+                reply_parts.append(reply)
+                span.set_output(reply)
                 yield _sse("agent_done", {
                     "agent": "gia",
                     "latency_ms": round((time.monotonic() - t0) * 1000, 1),
                 })
 
         # ── 5. Synthesise + stream reply + TTS ────────────────────────────────
-        # The inline-streamed conversational reply is already on the wire; only
-        # the parts path (specialists / proactive / blocking fallback) needs
-        # merging + streaming here. When several agents contributed (and synthesis
-        # is enabled), merge them into one coherent reply; otherwise join. A
-        # pending proactive note is kept verbatim at the front so its phrasing is
-        # never reworded.
-        if not streamed_inline:
-            if cfg.synthesis_enabled and len([p for p in reply_parts if p.strip()]) > 1:
-                with trace.span("synthesis", request.message) as span:
-                    synth_input = reply_parts[1:] if proactive else reply_parts
-                    merged = await synthesize_reply(synth_input, request.message, cfg)
-                    full_reply = f"{proactive} {merged}".strip() if proactive else merged
-                    span.set_output(full_reply)
-            else:
-                full_reply = " ".join(reply_parts)
+        # Merge the contributing parts into one reply. When several agents
+        # contributed (and synthesis is enabled), synthesise them into one
+        # coherent reply; otherwise join. A pending proactive note is kept verbatim
+        # at the front so its phrasing is never reworded.
+        if cfg.synthesis_enabled and len([p for p in reply_parts if p.strip()]) > 1:
+            with trace.span("synthesis", request.message) as span:
+                synth_input = reply_parts[1:] if proactive else reply_parts
+                merged = await synthesize_reply(synth_input, request.message, cfg)
+                full_reply = f"{proactive} {merged}".strip() if proactive else merged
+                span.set_output(full_reply)
+        else:
+            full_reply = " ".join(reply_parts)
 
         # Trace-level output for the turn (visible at the top of the Langfuse trace).
         trace.set_output(full_reply)
 
         # Persist this exchange so the next turn has continuity ("play it now",
-        # "that one", "what did you just say"). The ack filler is intentionally
-        # not stored — only the substantive reply.
+        # "that one", "what did you just say").
         await append_turn(redis, session_id, "user", request.message)
         await append_turn(redis, session_id, "gia", full_reply)
 
@@ -757,15 +695,13 @@ async def _run_crew(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("chat_extract_enqueue_error", error=str(exc))
 
-        # Parts path: stream the assembled reply sentence-by-sentence with TTS
-        # pipelined one sentence ahead. (The inline-streamed conversational reply
-        # was already emitted above.)
-        if not streamed_inline:
-            async for frame in _stream_reply_frames(
-                _aiter(split_sentences(full_reply)),
-                tts_provider, tts_api_key, tts_voice_id, [],
-            ):
-                yield frame
+        # Stream the assembled reply: captions sentence-by-sentence, then the
+        # whole-reply audio forwarded progressively as ElevenLabs renders it.
+        async for frame in _stream_reply_frames(
+            _aiter(split_sentences(full_reply)),
+            tts_provider, tts_api_key, tts_voice_id, [],
+        ):
+            yield frame
 
         # Record recent plays for mood patterning — throttled, and only after the
         # reply has streamed so it never adds perceived latency (the db session is

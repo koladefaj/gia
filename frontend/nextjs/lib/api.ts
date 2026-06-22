@@ -19,9 +19,10 @@ export type ChatEventName =
   | 'tool_call'
   | 'plan'
   | 'signal'
-  | 'acknowledgment'
   | 'reply_chunk'
+  | 'audio_start'
   | 'audio_chunk'
+  | 'audio_end'
   | 'error'
   | 'done';
 

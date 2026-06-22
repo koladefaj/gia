@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { chatStream, speak as speakApi, transcribe } from './api';
-import { AudioPlayer, stripTags } from './audio';
+import { AudioPlayer, StreamPlayer, createAnalyser, stripTags } from './audio';
 
 export type VoicePhase = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error';
 
@@ -80,6 +80,7 @@ export function useVoiceSession(
 
   const ctxRef = useRef<AudioContext | null>(null);
   const playerRef = useRef<AudioPlayer | null>(null);
+  const streamPlayerRef = useRef<StreamPlayer | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const timeData = useRef<Uint8Array<ArrayBuffer> | null>(null);
@@ -148,11 +149,28 @@ export function useVoiceSession(
               }
               break;
             }
-            case 'audio_chunk':
-              if (player && typeof data.data === 'string') {
-                player.enqueueBase64(data.data);
+            case 'audio_start':
+              // A progressive (MediaSource) reply is starting.
+              if (streamPlayerRef.current) {
+                streamPlayerRef.current.begin();
                 setPhaseBoth('speaking');
               }
+              break;
+            case 'audio_chunk':
+              if (typeof data.data === 'string') {
+                // `streaming` chunks are MP3 fragments for the MediaSource buffer;
+                // a plain chunk (Kokoro blob, or MSE unsupported) is a complete
+                // file for the one-shot decoder.
+                if (data.streaming && streamPlayerRef.current) {
+                  streamPlayerRef.current.pushBase64(data.data);
+                } else if (player) {
+                  player.enqueueBase64(data.data);
+                }
+                setPhaseBoth('speaking');
+              }
+              break;
+            case 'audio_end':
+              streamPlayerRef.current?.end();
               break;
             case 'error':
               setStatus(`error: ${String(data.error ?? 'unknown')}`);
@@ -167,9 +185,12 @@ export function useVoiceSession(
       } finally {
         streamingRef.current = false;
         // Resume listening once any trailing audio finishes (or immediately when
-        // there was none). resumeListening starts the grace window, so it counts
-        // from when she actually stops speaking — not from here.
-        if (!player || !player.isActive) resumeListening();
+        // there was none). Either player may be carrying this turn's audio; the
+        // active one's onDrained resumes listening when it stops, so we only
+        // resume here when nothing is sounding. resumeListening starts the grace
+        // window, so it counts from when she actually stops speaking.
+        const sounding = player?.isActive || streamPlayerRef.current?.isActive;
+        if (!sounding) resumeListening();
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -290,10 +311,18 @@ export function useVoiceSession(
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       ctxRef.current = new Ctor();
-      playerRef.current = new AudioPlayer(ctxRef.current);
-      playerRef.current.onDrained = () => {
+      // One analyser shared by both players so the ring reacts to whichever is
+      // sounding (the one-shot greeting or the streamed reply).
+      const analyser = createAnalyser(ctxRef.current);
+      const onDrained = () => {
         if (!streamingRef.current) resumeListening();
       };
+      playerRef.current = new AudioPlayer(ctxRef.current, analyser);
+      playerRef.current.onDrained = onDrained;
+      if (StreamPlayer.supported) {
+        streamPlayerRef.current = new StreamPlayer(ctxRef.current, analyser);
+        streamPlayerRef.current.onDrained = onDrained;
+      }
     }
     if (ctxRef.current.state === 'suspended') await ctxRef.current.resume();
   }, []);
@@ -340,6 +369,7 @@ export function useVoiceSession(
     activeRef.current = false;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
+    streamPlayerRef.current?.clear();
     stopRecorder();
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;

@@ -143,9 +143,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
+    from backend.app.providers.tts import aclose_http_client
+
     await app.state.spotify.close()
     await app.state.redis.aclose()
     await asyncio.to_thread(app.state.weaviate.close)
+    await aclose_http_client()
     await engine.dispose()
     logger.info("gia_shutdown")
 

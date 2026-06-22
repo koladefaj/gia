@@ -12,6 +12,19 @@ from backend.app.schemas.chat import IntentType
 from backend.app.schemas.router import EngagementMode, RouterDecision, Tone
 
 
+def _no_audio(*_args, **_kwargs):
+    """Stub for ``synthesize_stream`` — an async iterator that yields no audio.
+
+    The streaming TTS path is exercised separately in test_tts; here we only care
+    about the text/SSE control flow, so synthesis produces nothing (mirrors a dev
+    env with no ElevenLabs key).
+    """
+    async def _gen():
+        return
+        yield b""  # pragma: no cover — makes this an async generator
+    return _gen()
+
+
 def _parse_sse(text: str) -> list[dict]:
     """Parse a raw SSE response body into a list of {event, data} dicts."""
     events = []
@@ -75,7 +88,7 @@ async def test_chat_streams_sse_events(client: AsyncClient) -> None:
     with patch("backend.app.api.chat.classify_turn",
                new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         mock_instance = MagicMock()
@@ -100,7 +113,7 @@ async def test_chat_includes_router_event(client: AsyncClient) -> None:
     with patch("backend.app.api.chat.classify_turn",
                new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         mock_instance = MagicMock()
@@ -121,7 +134,7 @@ async def test_chat_mood_check_intent(client: AsyncClient) -> None:
     with patch("backend.app.api.chat.classify_turn",
                new=AsyncMock(return_value=_decision(IntentType.MOOD_CHECK))), \
          patch("backend.app.api.chat.MoodService") as mock_mood, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         from backend.app.agents.mood import MoodResult
@@ -158,7 +171,7 @@ async def test_chat_proactive_draft_surfaced(client: AsyncClient) -> None:
                new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND))), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=proactive)), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")):
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio):
 
         mock_instance = MagicMock()
         mock_instance.recommend = AsyncMock(return_value=_dj_response())
@@ -181,7 +194,7 @@ async def test_now_playing_query_reports_track(client: AsyncClient) -> None:
     with patch("backend.app.api.chat.classify_turn",
                new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         response = await client.post("/chat", json={"message": "what's currently playing?"})
@@ -203,7 +216,7 @@ async def test_dj_uses_resolved_search_query_and_playback(client: AsyncClient) -
                new=AsyncMock(return_value=_decision(
                    IntentType.MUSIC_FIND, search_query="Fortworth Drake", start_playback=True))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         mock_instance = MagicMock()
@@ -239,7 +252,7 @@ async def test_chat_general_intent_conversational(client: AsyncClient) -> None:
     with patch("backend.app.api.chat.classify_turn",
                new=AsyncMock(return_value=_decision(IntentType.GENERAL_CHAT))), \
          patch("backend.app.api.chat.stream_general", _fake_stream), \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         response = await client.post("/chat", json={"message": "hello gia"})
@@ -251,17 +264,16 @@ async def test_chat_general_intent_conversational(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fast_ack_precedes_router_decision(client: AsyncClient) -> None:
-    """A clear retrieval intent is acknowledged before the router decision lands.
+async def test_speculative_reply_skipped_for_clear_music_command(client: AsyncClient) -> None:
+    """A clear playback command shouldn't pre-generate a conversational reply.
 
-    The keyword classifier recognises "find me something" as MUSIC_FIND, so Gia
-    reacts (the ``acknowledgment`` event) ahead of the ``plan`` event rather than
-    waiting on the router LLM round-trip.
+    "find me something chill" keyword-classifies to MUSIC_FIND, so the DJ runs and
+    the speculative conversational reply is skipped — no ``gia`` agent span.
     """
     with patch("backend.app.api.chat.classify_turn",
                new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         mock_instance = MagicMock()
@@ -270,47 +282,21 @@ async def test_fast_ack_precedes_router_decision(client: AsyncClient) -> None:
 
         response = await client.post("/chat", json={"message": "find me something chill"})
 
-    names = [e.get("event") for e in _parse_sse(response.text)]
-    assert "acknowledgment" in names
-    assert names.index("acknowledgment") < names.index("plan")
+    events = _parse_sse(response.text)
+    agents = [e["data"].get("agent") for e in events if e.get("event") == "agent_start"]
+    assert "dj" in agents
+    assert "gia" not in agents
 
 
-def test_fast_ack_skips_ambiguous_mixed_intent() -> None:
-    """The fast filler fires for clear retrieval intents, not ambiguous MIXED ones."""
-    from backend.app.api.chat import _fast_ack_intent
+def test_should_speculate_gates_on_keyword_intent() -> None:
+    """Chit-chat speculates; a clear playback command does not."""
+    from backend.app.api.chat import _should_speculate
 
-    # "tell me about X and play something" keyword-classifies to MIXED — the case
-    # where the keyword guess most often disagrees with the LLM router — so no
-    # fast filler should fire.
-    assert _fast_ack_intent("tell me about Tems and play something") is None
-    # A clear single retrieval intent still triggers a filler.
-    assert _fast_ack_intent("play something chill") is not None
-
-
-def test_fast_ack_requires_action_verb_for_music() -> None:
-    """Topical music chat (no command verb) doesn't draw a premature filler."""
-    from backend.app.api.chat import _fast_ack_intent
-
-    assert _fast_ack_intent("suono sai music is fire") is None
-    assert _fast_ack_intent("his songs are so good honestly") is None
-    # An explicit play command still fires.
-    assert _fast_ack_intent("play me something") is not None
-
-
-@pytest.mark.asyncio
-async def test_greeting_does_not_fast_ack(client: AsyncClient) -> None:
-    """A pure greeting carries no retrieval work, so Gia doesn't fire an ack."""
-    with patch("backend.app.api.chat.classify_turn",
-               new=AsyncMock(return_value=_decision(IntentType.GENERAL_CHAT))), \
-         patch("backend.app.api.chat.respond_general",
-               new=AsyncMock(return_value="Hey you — good to see you.")), \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
-         patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
-
-        response = await client.post("/chat", json={"message": "hey there"})
-
-    names = [e.get("event") for e in _parse_sse(response.text)]
-    assert "acknowledgment" not in names
+    assert _should_speculate("hey there, how are you") is True
+    assert _should_speculate("what have you been up to") is True
+    # Clear retrieval commands are left to the specialist path.
+    assert _should_speculate("play something chill") is False
+    assert _should_speculate("queue me some Tems") is False
 
 
 @pytest.mark.asyncio
@@ -319,7 +305,7 @@ async def test_chat_weather_signal_fetches_weather(client: AsyncClient) -> None:
     with patch("backend.app.api.chat.classify_turn",
                new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND, needs_music=True))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         mock_instance = MagicMock()
