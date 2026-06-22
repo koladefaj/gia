@@ -299,6 +299,110 @@ def test_should_speculate_gates_on_keyword_intent() -> None:
     assert _should_speculate("queue me some Tems") is False
 
 
+def test_is_music_command_requires_command_verb() -> None:
+    """A play/queue command counts; topical music chat doesn't."""
+    from backend.app.api.chat import _is_music_command
+
+    assert _is_music_command("play some Travis Scott") is True
+    assert _is_music_command("queue Drake then Asake") is True
+    # Mentioning music without a command verb is chat, not a request.
+    assert _is_music_command("his music is fire honestly") is False
+    assert _is_music_command("how's your day going") is False
+
+
+def test_speculative_query_strips_command_words() -> None:
+    """The speculative search query drops leading verbs / trailing fillers."""
+    from backend.app.api.chat import _speculative_query
+
+    assert _speculative_query("play some Travis Scott right now") == "some Travis Scott"
+    assert _speculative_query("queue Asake") == "Asake"
+    # Nothing strippable → fall back to the message itself (never empty).
+    assert _speculative_query("Travis Scott") == "Travis Scott"
+
+
+def test_query_tokens_present_reconciliation() -> None:
+    """Prefetch is reused only when the resolved query is 'in' the message."""
+    from backend.app.api.chat import _query_tokens_present
+
+    # Resolved query is right there in what they said → reuse the prefetch.
+    assert _query_tokens_present("Travis Scott", "play some travis scott") is True
+    # Empty resolved query → nothing to disagree with.
+    assert _query_tokens_present("", "just play it now") is True
+    # Reference resolved from history (not in the message) → don't reuse.
+    assert _query_tokens_present("Fortworth Drake", "just play it now") is False
+
+
+@pytest.mark.asyncio
+async def test_music_command_acks_before_plan(client: AsyncClient) -> None:
+    """A clear play command speaks an ack before the router's plan lands."""
+    with patch("backend.app.api.chat.classify_turn",
+               new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND))), \
+         patch("backend.app.api.chat.DJService") as mock_dj, \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
+         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
+
+        mock_instance = MagicMock()
+        mock_instance.search_only = AsyncMock(side_effect=ValueError("no match"))
+        mock_instance.recommend = AsyncMock(return_value=_dj_response())
+        mock_dj.return_value = mock_instance
+
+        response = await client.post("/chat", json={"message": "play something chill"})
+
+    events = _parse_sse(response.text)
+    names = [e.get("event") for e in events]
+    # The ack reply_chunk is emitted, and before the plan event.
+    assert "reply_chunk" in names and "plan" in names
+    assert names.index("reply_chunk") < names.index("plan")
+
+
+@pytest.mark.asyncio
+async def test_dj_reuses_prefetched_search_when_query_in_message(client: AsyncClient) -> None:
+    """When the resolved query is in the message, the DJ reuses the speculative search."""
+    from backend.app.schemas.dj import TrackItem
+
+    seed = TrackItem(uri="spotify:track:ts1", name="SICKO MODE", artist="Travis Scott")
+    prefetched = (seed, [])
+
+    with patch("backend.app.api.chat.classify_turn",
+               new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND, search_query="Travis Scott"))), \
+         patch("backend.app.api.chat.DJService") as mock_dj, \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
+         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
+
+        mock_instance = MagicMock()
+        mock_instance.search_only = AsyncMock(return_value=prefetched)
+        mock_instance.recommend = AsyncMock(return_value=_dj_response())
+        mock_dj.return_value = mock_instance
+
+        await client.post("/chat", json={"message": "play some Travis Scott"})
+
+    assert mock_instance.recommend.call_args.kwargs["prefetched"] == prefetched
+
+
+@pytest.mark.asyncio
+async def test_dj_skips_prefetched_for_reference_command(client: AsyncClient) -> None:
+    """A reference command ('play it now') resolves to a query not in the message,
+    so the prefetched search is discarded and recommend searches itself."""
+    with patch("backend.app.api.chat.classify_turn",
+               new=AsyncMock(return_value=_decision(
+                   IntentType.MUSIC_FIND, search_query="Fortworth Drake", start_playback=True))), \
+         patch("backend.app.api.chat.DJService") as mock_dj, \
+         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
+         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
+         patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
+
+        mock_instance = MagicMock()
+        mock_instance.search_only = AsyncMock(return_value=("seed", []))
+        mock_instance.recommend = AsyncMock(return_value=_dj_response())
+        mock_dj.return_value = mock_instance
+
+        await client.post("/chat", json={"message": "just play it now"})
+
+    assert mock_instance.recommend.call_args.kwargs["prefetched"] is None
+
+
 @pytest.mark.asyncio
 async def test_chat_weather_signal_fetches_weather(client: AsyncClient) -> None:
     """A plan with a weather signal emits a weather tool_call and signal event."""

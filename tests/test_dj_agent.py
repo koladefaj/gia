@@ -23,6 +23,39 @@ def fake_spotify_dj() -> MagicMock:
 
 
 @pytest.mark.asyncio
+async def test_dj_search_only_returns_seed_and_queue(fake_spotify_dj, test_settings) -> None:
+    """``search_only`` returns (seed, queue) without LLM or playback."""
+    from backend.app.agents.dj import DJService
+
+    service = DJService(spotify=fake_spotify_dj, cfg=test_settings)
+    seed, queue = await service.search_only("chill Afrobeats", n=2)
+
+    assert seed.uri == "spotify:track:001"
+    assert len(queue) == 2
+    fake_spotify_dj.start_playback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dj_recommend_uses_prefetched_without_searching(test_settings) -> None:
+    """``prefetched`` is used verbatim — recommend does not search again."""
+    from backend.app.agents.dj import DJService
+    from backend.app.schemas.dj import TrackItem
+
+    sp = MagicMock()
+    sp.search_tracks = AsyncMock(return_value=[])  # would raise if called
+    seed = TrackItem(uri="spotify:track:zz", name="SICKO MODE", artist="Travis Scott")
+    prefetched = (seed, [TrackItem(uri="spotify:track:yy", name="FE!N", artist="Travis Scott")])
+
+    with patch("backend.app.agents.dj.asyncio.to_thread", new=AsyncMock(return_value="On it.")):
+        service = DJService(spotify=sp, cfg=test_settings)
+        result = await service.recommend("Travis Scott", prefetched=prefetched)
+
+    assert result.primary_track.uri == "spotify:track:zz"
+    assert len(result.queue.tracks) == 1
+    sp.search_tracks.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_dj_service_returns_response(fake_spotify_dj, test_settings) -> None:
     """``DJService.recommend`` returns a ``DJResponse`` with seed + queue."""
     from backend.app.agents.dj import DJService

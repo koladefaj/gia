@@ -40,6 +40,7 @@ from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
+from backend.app.agents.acknowledgment import get_selector
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
 from backend.app.agents.general import opening_line, stream_general
@@ -66,8 +67,9 @@ from backend.app.mood.ingest import ingest_recently_played
 from backend.app.mood.proactive import pop_proactive_draft
 from backend.app.observability.langfuse import crew_trace
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import is_emotional, synthesize_stream
+from backend.app.providers.tts import is_emotional, synthesize, synthesize_stream
 from backend.app.schemas.chat import ChatRequest, IntentType
+from backend.app.schemas.dj import TrackItem
 from backend.app.schemas.router import RouterDecision
 from backend.app.tools.brave import BraveSearchClient
 from backend.app.voice.streaming import split_sentences
@@ -317,6 +319,103 @@ async def _speculative_general(
     return await _collect_general(message, user_context_text, history_text, cfg)
 
 
+# ── Music command fast-path (ack + speculative search) ────────────────────────
+
+# Music is the product, so a clear play/queue command earns (a) an instant spoken
+# ack while the router + search run, and (b) a Spotify search started in parallel
+# with the router. Both are gated on the sub-ms keyword classifier seeing a real
+# command — never fires in front of a fast chat reply.
+_MUSIC_COMMAND_INTENTS = {IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE}
+
+# An explicit action verb — a music intent only counts as a *command* when the
+# user is actually asking for playback, not just mentioning music ("his music is
+# fire" is chat, not a request).
+_MUSIC_VERB_RE = re.compile(
+    r"\b(play|queue|put (me )?on|throw on|add|skip|save|find|recommend|shuffle|resume)\b",
+    re.IGNORECASE,
+)
+
+# Leading command verbs / trailing fillers stripped to turn a raw command into a
+# cleaner speculative search query ("play some Travis Scott right now" → "some
+# Travis Scott"). The result need not be perfect — it only seeds the *speculative*
+# search, which is discarded unless the router's resolved query matches the text.
+_SPEC_STRIP_RE = re.compile(
+    r"^\s*(please\s+)?(can you\s+|could you\s+)?"
+    r"(play|queue|put (me )?on|throw on|add|skip|save|find|recommend|shuffle|resume)\s+"
+    r"|\b(right now|for me|please)\b\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_music_command(message: str) -> bool:
+    """Whether *message* is a clear play/queue command (keyword, sub-ms)."""
+    return (
+        _keyword_classify(message) in _MUSIC_COMMAND_INTENTS
+        and bool(_MUSIC_VERB_RE.search(message))
+    )
+
+
+def _speculative_query(message: str) -> str:
+    """Strip command verbs / trailing fillers to seed the speculative search."""
+    return _SPEC_STRIP_RE.sub("", message).strip() or message.strip()
+
+
+def _query_tokens_present(search_query: str, message: str) -> bool:
+    """Whether the router's resolved query is "in" the user's words.
+
+    The speculative search ran on the raw message, so its results are only
+    representative when the router didn't resolve a reference to something *not*
+    said (e.g. "play it now" → a track pulled from history). True when the query
+    is empty (nothing to disagree with) or every significant token of it appears
+    in the message — then the prefetched results are safe to reuse.
+    """
+    sq = (search_query or "").strip().lower()
+    if not sq:
+        return True
+    words = set(re.findall(r"[a-z0-9]+", message.lower()))
+    tokens = [t for t in re.findall(r"[a-z0-9]+", sq) if len(t) >= 3]
+    return bool(tokens) and all(t in words for t in tokens)
+
+
+async def _safe_search(
+    dj_svc: DJService, query: str
+) -> tuple[TrackItem, list[TrackItem]] | None:
+    """Run a speculative DJ search, swallowing any error (returns ``None``)."""
+    try:
+        return await dj_svc.search_only(query, n=4)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("speculative_search_failed", query=query, error=str(exc))
+        return None
+
+
+async def _build_music_ack(
+    session_id: str, provider: str, api_key: str, voice_id: str
+) -> list[str]:
+    """Synthesise a short flash-TTS ack and return the SSE frames to emit.
+
+    A neutral filler ("On it.") rendered with the FAST flash model (the lines
+    carry no tags/questions, so ``synthesize`` routes to flash) — which matches
+    the DJ reply's model, so the two blend instead of jumping voice. Delivered as
+    a one-shot ``audio_chunk`` (the frontend's buffered player), keeping it
+    separate from the streamed reply that follows. Returns ``[]`` on synth
+    failure so a missing key never blocks the turn.
+    """
+    line = get_selector().select_filler(session_id)
+    frames = [_sse("reply_chunk", {"text": line})]
+    try:
+        chunk = await synthesize(line, provider=provider, api_key=api_key, voice_id=voice_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("music_ack_tts_error", error=str(exc))
+        chunk = b""
+    if chunk:
+        frames.append(_sse("audio_chunk", {
+            "data": base64.b64encode(chunk).decode(),
+            "model": provider,
+            "emotional": False,
+        }))
+    return frames
+
+
 async def _run_crew(
     request: ChatRequest,
     spotify: SpotifyClientProtocol,
@@ -415,6 +514,27 @@ async def _run_crew(
             )
             bg_tasks.append(general_task)
 
+        # ── 1c. Music command fast-path: ack now + search in parallel ─────────
+        # Music is the product, so a clear play/queue command gets the responsive
+        # treatment: an instant spoken ack (synthesised below, overlapping the
+        # router) and a Spotify search kicked off NOW, in parallel with the router,
+        # instead of after it. The ack covers the wait on reference commands the
+        # search can't pre-guess ("play it now"); the search cuts real latency on
+        # the ones it can ("play Travis Scott"). Both gated on a real command.
+        dj_svc: DJService | None = None
+        ack_task: asyncio.Task | None = None
+        spec_search_task: asyncio.Task | None = None
+        if not now_playing_query and _is_music_command(request.message):
+            dj_svc = DJService(spotify=spotify, cfg=cfg)
+            ack_task = asyncio.create_task(
+                _build_music_ack(session_id, tts_provider, tts_api_key, tts_voice_id)
+            )
+            bg_tasks.append(ack_task)
+            spec_search_task = asyncio.create_task(
+                _safe_search(dj_svc, _speculative_query(request.message))
+            )
+            bg_tasks.append(spec_search_task)
+
         # ── 2. Route the turn (structured: intent + tone + engagement) ─────────
         # One small-model call classifies everything the turn needs. It never
         # raises — a failed call degrades to a warm GENERAL_CHAT default. Started
@@ -428,6 +548,12 @@ async def _run_crew(
                 classify_turn(request.message, cfg, history=router_history)
             )
             bg_tasks.append(router_task)
+
+            # Speak the ack while the router runs — it's the first thing the user
+            # hears on a music command, ~0.4s in, fully under the router round-trip.
+            if ack_task is not None:
+                for frame in await ack_task:
+                    yield frame
 
             decision = await router_task
             intent, confidence = decision.intent, decision.confidence
@@ -519,14 +645,31 @@ async def _run_crew(
             with trace.span("dj", dj_query) as span:
                 t0 = time.monotonic()
                 try:
-                    yield _sse("tool_call", {"agent": "dj", "tool": "search_tracks", "input": dj_query})
-                    dj_svc = DJService(spotify=spotify, cfg=cfg)
+                    # Reuse the speculative search started alongside the router when
+                    # the router's resolved query is "in" what the user said (not a
+                    # reference resolved from history) and they didn't name multiple
+                    # specific titles — otherwise the prefetch isn't representative
+                    # and we let recommend() search the resolved query itself.
+                    prefetched: tuple[TrackItem, list[TrackItem]] | None = None
+                    if (
+                        spec_search_task is not None
+                        and len(decision.track_titles) < 2
+                        and _query_tokens_present(decision.search_query or "", request.message)
+                    ):
+                        prefetched = await spec_search_task
+                    yield _sse("tool_call", {
+                        "agent": "dj", "tool": "search_tracks", "input": dj_query,
+                        "prefetched": prefetched is not None,
+                    })
+                    if dj_svc is None:
+                        dj_svc = DJService(spotify=spotify, cfg=cfg)
                     dj_result = await dj_svc.recommend(
                         query=dj_query,
                         user_context_text=user_context_text,
                         start_playback=decision.start_playback,
                         n=4,
                         requested_titles=decision.track_titles,
+                        prefetched=prefetched,
                     )
                     # Push tracks onto Spotify's queue when the user wants them
                     # queued — an explicit MUSIC_QUEUE, or a per-title request that

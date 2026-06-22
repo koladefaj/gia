@@ -78,6 +78,19 @@ class DJService:
     # Honour at most this many explicitly-named tracks in a per-title request.
     _MAX_NAMED_QUEUE = 10
 
+    async def search_only(
+        self, query: str, n: int = 4
+    ) -> tuple[TrackItem, list[TrackItem]]:
+        """Search *query* and return ``(seed, queue_tracks)`` — nothing else.
+
+        Read-only: no playback, no LLM. Used to run the Spotify search
+        *speculatively* (in parallel with the router) so a music command's
+        lookup is already done by the time the router lands. The result is fed
+        back into :meth:`recommend` via ``prefetched`` to skip the duplicate
+        search. Safe to call without committing to anything.
+        """
+        return await self._search_query(query, n)
+
     async def recommend(
         self,
         query: str,
@@ -85,6 +98,7 @@ class DJService:
         start_playback: bool = False,
         n: int = 4,
         requested_titles: list[str] | None = None,
+        prefetched: tuple[TrackItem, list[TrackItem]] | None = None,
     ) -> DJResponse:
         """Search for tracks, build the queue, and generate a recommendation.
 
@@ -110,6 +124,11 @@ class DJService:
                                user named the tracks — those are honoured in full).
             requested_titles:  Specific titles the user named, in order. The first
                                is the primary "did you mean…?" target.
+            prefetched:        A ``(seed, queue_tracks)`` pair from a speculative
+                               :meth:`search_only` run. When given (and the user did
+                               not name multiple specific titles), it's used instead
+                               of searching again — the latency win. Ignored on the
+                               per-title path, which needs its own per-title search.
 
         Returns:
             A ``DJResponse`` with the recommendation, seed track, and queue.
@@ -125,6 +144,9 @@ class DJService:
             seed, queue_tracks, missing = await self._search_named_titles(titles)
             if seed is None:  # none of the named tracks resolved → plain search
                 seed, queue_tracks = await self._search_query(query, n)
+        elif prefetched is not None:
+            # Reuse the speculative search that ran alongside the router.
+            seed, queue_tracks = prefetched
         else:
             seed, queue_tracks = await self._search_query(query, n)
 
