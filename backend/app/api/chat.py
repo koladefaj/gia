@@ -40,7 +40,6 @@ from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
-from backend.app.agents.acknowledgment import get_selector
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
 from backend.app.agents.general import opening_line, stream_general
@@ -67,7 +66,7 @@ from backend.app.mood.ingest import ingest_recently_played
 from backend.app.mood.proactive import pop_proactive_draft
 from backend.app.observability.langfuse import crew_trace
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import is_emotional, synthesize, synthesize_stream
+from backend.app.providers.tts import is_emotional, synthesize_stream
 from backend.app.schemas.chat import ChatRequest, IntentType
 from backend.app.schemas.dj import TrackItem
 from backend.app.schemas.router import RouterDecision
@@ -388,34 +387,6 @@ async def _safe_search(
         return None
 
 
-async def _build_music_ack(
-    session_id: str, provider: str, api_key: str, voice_id: str
-) -> list[str]:
-    """Synthesise a short flash-TTS ack and return the SSE frames to emit.
-
-    A neutral filler ("On it.") rendered with the FAST flash model (the lines
-    carry no tags/questions, so ``synthesize`` routes to flash) — which matches
-    the DJ reply's model, so the two blend instead of jumping voice. Delivered as
-    a one-shot ``audio_chunk`` (the frontend's buffered player), keeping it
-    separate from the streamed reply that follows. Returns ``[]`` on synth
-    failure so a missing key never blocks the turn.
-    """
-    line = get_selector().select_filler(session_id)
-    frames = [_sse("reply_chunk", {"text": line})]
-    try:
-        chunk = await synthesize(line, provider=provider, api_key=api_key, voice_id=voice_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("music_ack_tts_error", error=str(exc))
-        chunk = b""
-    if chunk:
-        frames.append(_sse("audio_chunk", {
-            "data": base64.b64encode(chunk).decode(),
-            "model": provider,
-            "emotional": False,
-        }))
-    return frames
-
-
 async def _run_crew(
     request: ChatRequest,
     spotify: SpotifyClientProtocol,
@@ -514,23 +485,15 @@ async def _run_crew(
             )
             bg_tasks.append(general_task)
 
-        # ── 1c. Music command fast-path: ack now + search in parallel ─────────
-        # Music is the product, so a clear play/queue command gets the responsive
-        # treatment: an instant spoken ack (synthesised below, overlapping the
-        # router) and a Spotify search kicked off NOW, in parallel with the router,
-        # instead of after it. The ack covers the wait on reference commands the
-        # search can't pre-guess ("play it now"); the search cuts real latency on
-        # the ones it can ("play Travis Scott"). Both gated on a real command.
+        # ── 1c. Music command fast-path: search in parallel with the router ───
+        # Music is the product, so a clear play/queue command kicks off the Spotify
+        # search NOW, in parallel with the router, instead of after it. The result
+        # is reused (recommend(prefetched=...)) when the router's resolved query is
+        # "in" the user's words; reference commands fall back to a fresh search.
         dj_svc: DJService | None = None
-        ack_task: asyncio.Task | None = None
         spec_search_task: asyncio.Task | None = None
-        acked = False
         if not now_playing_query and _is_music_command(request.message):
             dj_svc = DJService(spotify=spotify, cfg=cfg)
-            ack_task = asyncio.create_task(
-                _build_music_ack(session_id, tts_provider, tts_api_key, tts_voice_id)
-            )
-            bg_tasks.append(ack_task)
             spec_search_task = asyncio.create_task(
                 _safe_search(dj_svc, _speculative_query(request.message))
             )
@@ -549,13 +512,6 @@ async def _run_crew(
                 classify_turn(request.message, cfg, history=router_history)
             )
             bg_tasks.append(router_task)
-
-            # Speak the ack while the router runs — it's the first thing the user
-            # hears on a music command, ~0.4s in, fully under the router round-trip.
-            if ack_task is not None:
-                for frame in await ack_task:
-                    yield frame
-                acked = True
 
             decision = await router_task
             intent, confidence = decision.intent, decision.confidence
@@ -585,19 +541,6 @@ async def _run_crew(
                 "artist_lookup": decision.needs_artist_lookup,
             },
         })
-
-        # ── 2b. Post-router ack for music turns the keyword path missed ───────
-        # Elliptical commands ("Yeah", "no, I said Dave", "land on something") only
-        # read as music once the router (with history) resolves them, so the
-        # pre-router ack never fired. Speak it now — it still fronts the ~3s DJ
-        # search + phrasing, so every music command gets a spoken reaction, just a
-        # beat later than the keyword-detected ones.
-        if "dj" in steps and not acked:
-            for frame in await _build_music_ack(
-                session_id, tts_provider, tts_api_key, tts_voice_id
-            ):
-                yield frame
-            acked = True
 
         # ── 3. Resolve the memory context (needed by agents + the reply) ──────
         user_context_text = ""

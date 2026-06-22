@@ -333,64 +333,6 @@ def test_query_tokens_present_reconciliation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_music_command_acks_before_plan(client: AsyncClient) -> None:
-    """A clear play command speaks an ack before the router's plan lands."""
-    with patch("backend.app.api.chat.classify_turn",
-               new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND))), \
-         patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
-         patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
-
-        mock_instance = MagicMock()
-        mock_instance.search_only = AsyncMock(side_effect=ValueError("no match"))
-        mock_instance.recommend = AsyncMock(return_value=_dj_response())
-        mock_dj.return_value = mock_instance
-
-        response = await client.post("/chat", json={"message": "play something chill"})
-
-    events = _parse_sse(response.text)
-    names = [e.get("event") for e in events]
-    # The ack reply_chunk is emitted, and before the plan event.
-    assert "reply_chunk" in names and "plan" in names
-    assert names.index("reply_chunk") < names.index("plan")
-
-
-@pytest.mark.asyncio
-async def test_elliptical_music_command_acks_after_router(client: AsyncClient) -> None:
-    """A music command the keyword path can't see ('yeah') still gets an ack —
-    emitted after the router resolves it to music, before the DJ runs."""
-    def _fake_stream(*_args, **_kwargs):
-        async def _gen():
-            yield "Sure thing."
-        return _gen()
-
-    with patch("backend.app.api.chat.classify_turn",
-               new=AsyncMock(return_value=_decision(IntentType.MUSIC_QUEUE))), \
-         patch("backend.app.api.chat.DJService") as mock_dj, \
-         patch("backend.app.api.chat.stream_general", _fake_stream), \
-         patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
-         patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
-
-        mock_instance = MagicMock()
-        mock_instance.recommend = AsyncMock(return_value=_dj_response())
-        mock_dj.return_value = mock_instance
-
-        response = await client.post("/chat", json={"message": "yeah"})
-
-    events = _parse_sse(response.text)
-    names = [e.get("event") for e in events]
-    dj_start = next(
-        i for i, e in enumerate(events)
-        if e.get("event") == "agent_start" and e["data"].get("agent") == "dj"
-    )
-    # An ack reply_chunk lands before the DJ agent starts.
-    assert "reply_chunk" in names
-    assert names.index("reply_chunk") < dj_start
-
-
-@pytest.mark.asyncio
 async def test_dj_reuses_prefetched_search_when_query_in_message(client: AsyncClient) -> None:
     """When the resolved query is in the message, the DJ reuses the speculative search."""
     from backend.app.schemas.dj import TrackItem
@@ -402,7 +344,6 @@ async def test_dj_reuses_prefetched_search_when_query_in_message(client: AsyncCl
                new=AsyncMock(return_value=_decision(IntentType.MUSIC_FIND, search_query="Travis Scott"))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
          patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         mock_instance = MagicMock()
@@ -424,7 +365,6 @@ async def test_dj_skips_prefetched_for_reference_command(client: AsyncClient) ->
                    IntentType.MUSIC_FIND, search_query="Fortworth Drake", start_playback=True))), \
          patch("backend.app.api.chat.DJService") as mock_dj, \
          patch("backend.app.api.chat.synthesize_stream", new=_no_audio), \
-         patch("backend.app.api.chat.synthesize", new=AsyncMock(return_value=b"")), \
          patch("backend.app.api.chat.pop_proactive_draft", new=AsyncMock(return_value=None)):
 
         mock_instance = MagicMock()
