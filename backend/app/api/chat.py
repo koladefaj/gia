@@ -524,6 +524,7 @@ async def _run_crew(
         dj_svc: DJService | None = None
         ack_task: asyncio.Task | None = None
         spec_search_task: asyncio.Task | None = None
+        acked = False
         if not now_playing_query and _is_music_command(request.message):
             dj_svc = DJService(spotify=spotify, cfg=cfg)
             ack_task = asyncio.create_task(
@@ -554,6 +555,7 @@ async def _run_crew(
             if ack_task is not None:
                 for frame in await ack_task:
                     yield frame
+                acked = True
 
             decision = await router_task
             intent, confidence = decision.intent, decision.confidence
@@ -583,6 +585,19 @@ async def _run_crew(
                 "artist_lookup": decision.needs_artist_lookup,
             },
         })
+
+        # ── 2b. Post-router ack for music turns the keyword path missed ───────
+        # Elliptical commands ("Yeah", "no, I said Dave", "land on something") only
+        # read as music once the router (with history) resolves them, so the
+        # pre-router ack never fired. Speak it now — it still fronts the ~3s DJ
+        # search + phrasing, so every music command gets a spoken reaction, just a
+        # beat later than the keyword-detected ones.
+        if "dj" in steps and not acked:
+            for frame in await _build_music_ack(
+                session_id, tts_provider, tts_api_key, tts_voice_id
+            ):
+                yield frame
+            acked = True
 
         # ── 3. Resolve the memory context (needed by agents + the reply) ──────
         user_context_text = ""
