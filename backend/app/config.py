@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     app_env: str = Field(default="development")
     log_level: str = Field(default="debug")
     secret_key: str = Field(default="change-me-in-production")
+    # Where the browser is sent back to after a successful Spotify OAuth flow.
+    # The callback appends ``?user_id=…&connected=1`` so the SPA can adopt the
+    # freshly-created identity. Must match the deployed frontend origin.
+    frontend_url: str = Field(default="http://localhost:3000")
 
     # --- Database ---
     database_url: str = Field(default="postgresql+asyncpg://gia:gia@localhost:5432/gia")
@@ -94,7 +98,9 @@ class Settings(BaseSettings):
     spotify_config_path: str = Field(default="")
 
     # --- TTS ---
-    tts_provider: str = Field(default="kokoro")
+    # ElevenLabs (HTTP, no local deps) is the default now. Set to "kokoro" only
+    # with the local-tts extra installed for zero-cost local synthesis.
+    tts_provider: str = Field(default="elevenlabs")
     elevenlabs_api_key: str = Field(default="")
     elevenlabs_voice_id: str = Field(default="")
 
@@ -151,6 +157,22 @@ class Settings(BaseSettings):
     rerank_model: str = Field(default="BAAI/bge-reranker-base")
     # When reranking, fetch this many candidates before trimming to the final k.
     rerank_candidate_multiplier: int = Field(default=3, ge=1, le=10)
+
+    # CrewAI multi-agent curation (Scout → Curator) — a real collaborative crew.
+    # OFF by default and OFF the live voice path: inter-agent hand-off adds LLM
+    # round-trips, so it belongs in enrichment / "deep pick" flows, not the
+    # sub-second reply. See backend/app/agents/curator_crew.py.
+    crewai_curator_enabled: bool = Field(default=False)
+
+    # Speech-to-text. "local" runs faster-whisper on the GPU (free, fast).
+    # "openai" uses the Whisper API (whisper-1) — a larger multilingual model
+    # that handles accented English (e.g. Nigerian) noticeably better, at a
+    # per-minute cost. Set STT_PROVIDER=openai in .env to switch.
+    stt_provider: str = Field(default="local")  # local | openai
+    # Local faster-whisper model. base.en is fast but English-only and weak on
+    # heavy accents; "large-v3" (multilingual) is far more accurate and fits the
+    # RTX 4060. Changing this re-downloads the model on next start.
+    stt_model: str = Field(default="base.en")
 
     # =============================================================================
     # Tool resilience

@@ -73,7 +73,7 @@ async def transcribe_audio(
         raise HTTPException(status_code=400, detail="Empty audio file")
 
     logger.info("voice_transcribe_request", bytes=len(audio_bytes), language=language)
-    text = await transcribe(audio_bytes, language=language)
+    text = await transcribe(audio_bytes, language=language, cfg=cfg)
     logger.info("voice_transcribe_done", transcript_len=len(text))
 
     return TranscribeResponse(transcript=text, language=language)

@@ -67,6 +67,20 @@ async def _prewarm_postgres() -> None:
         await conn.execute(text("SELECT 1"))
 
 
+async def _prewarm_stt() -> None:
+    """Load the faster-whisper model (into VRAM when a GPU is present) so the
+    first spoken turn doesn't pay the model-load cost mid-conversation.
+
+    Skipped when STT runs through the OpenAI API — there is no local model to
+    warm. Runs in a worker thread; the load is blocking and allocates VRAM.
+    """
+    if settings.stt_provider == "openai":
+        return
+    from backend.app.providers.stt import warmup
+
+    await asyncio.to_thread(warmup, settings.stt_model)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application-scoped resources for the lifetime of the process.
@@ -116,9 +130,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _prewarm_postgres(),
         app.state.redis.ping(),
         app.state.spotify.prewarm(),
+        _prewarm_stt(),
         return_exceptions=True,
     )
-    for name, result in zip(("postgres", "redis", "spotify"), results, strict=True):
+    for name, result in zip(("postgres", "redis", "spotify", "stt"), results, strict=True):
         if isinstance(result, Exception):
             logger.warning("prewarm_failed", service=name, error=str(result))
         else:

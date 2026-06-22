@@ -126,14 +126,20 @@ def _build_llm(cfg: Settings, model: str) -> LLM:
     """
     provider = cfg.llm_provider
 
+    # CrewAI/litellm resolve the backend from a ``provider/model`` prefix. Add it
+    # when the configured model id isn't already qualified, so an explicit
+    # override like ``openai/gpt-4o`` is never double-prefixed.
+    def _qualified(prefix: str) -> str:
+        return model if "/" in model else f"{prefix}/{model}"
+
     if provider == "anthropic":
-        return LLM(model=model, api_key=cfg.anthropic_api_key)
+        return LLM(model=_qualified("anthropic"), api_key=cfg.anthropic_api_key)
 
     if provider == "openai":
-        return LLM(model=model, api_key=cfg.openai_api_key)
+        return LLM(model=_qualified("openai"), api_key=cfg.openai_api_key)
 
     if provider == "ollama":
-        return LLM(model=f"ollama/{model}", base_url=cfg.ollama_base_url)
+        return LLM(model=_qualified("ollama"), base_url=cfg.ollama_base_url)
 
     raise ValueError(
         f"Unknown LLM provider: {provider!r}. "

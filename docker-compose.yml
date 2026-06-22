@@ -52,9 +52,24 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # Dev: install local Kokoro TTS (no ElevenLabs credits spent). Set to
-        # "false" for a prod build that uses ElevenLabs over HTTP (no torch).
-        INSTALL_LOCAL_TTS: "true"
+        # We test against real ElevenLabs (v3) now, so skip Kokoro/torch — it
+        # pulls a huge dependency tree and a 327MB model that slow the build.
+        # ElevenLabs is HTTP-only (no package). Flip back to "true" only if you
+        # want zero-cost local TTS while iterating.
+        INSTALL_LOCAL_TTS: "false"
+        # Keep faster-whisper for local STT (voice input from the browser).
+        # Pre-downloads the base.en model (~150 MB) into the image.
+        INSTALL_LOCAL_STT: "true"
+    # Pass the host GPU (RTX 4060) through so faster-whisper transcribes on CUDA
+    # instead of CPU — several times faster, lower per-turn latency. Falls back
+    # to CPU automatically if the GPU isn't available (see stt._pick_device).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     ports:
       - "8000:8000"
     env_file: .env
@@ -64,6 +79,16 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # Real TTS via ElevenLabs (v3 for emotional lines, flash for logistics).
+      # ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID come from .env.
+      TTS_PROVIDER: elevenlabs
+      # Local STT on the GPU. large-v3 (baked into the image) is multilingual and
+      # far better on accented English than base.en. To A/B the OpenAI Whisper
+      # API instead, set STT_PROVIDER=openai in .env.
+      STT_MODEL: large-v3
+      # Never write .pyc — Windows bind-mount mtimes are unreliable, so cached
+      # bytecode goes stale and the reloader keeps running old code.
+      PYTHONDONTWRITEBYTECODE: "1"
       # Remap Ollama to the host machine — inside Docker "localhost" is the
       # container itself, not the machine running Ollama.
       OLLAMA_BASE_URL: http://host.docker.internal:11434
@@ -106,9 +131,9 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # The Celery worker never synthesises speech → no torch/CUDA/Kokoro.
-        # This is the build that was timing out on the CUDA wheels.
+        # The Celery worker never synthesises speech or transcribes audio.
         INSTALL_LOCAL_TTS: "false"
+        INSTALL_LOCAL_STT: "false"
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://gia:gia@postgres:5432/gia
@@ -125,6 +150,21 @@ services:
       - ./backend:/app/backend
     command: celery -A backend.worker.celery_app worker --loglevel=info
 
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend/nextjs:/app
+      # Named volume keeps node_modules Linux-native (Windows paths don't bleed in)
+      # and makes subsequent `npm install` near-instant after the first run.
+      - nextjs_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      # Browser makes API calls directly to the exposed host port.
+      NEXT_PUBLIC_API_URL: "http://localhost:8000"
+    command: sh -c "npm install && npm run dev"
+
 volumes:
   postgres_data:
   weaviate_data:
@@ -133,3 +173,4 @@ volumes:
   # host's Windows-built copies never shadow into the container.
   mcp_node_modules:
   mcp_build:
+  nextjs_node_modules:

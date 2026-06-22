@@ -32,11 +32,9 @@ from backend.app.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
-_EMOTIONAL_TAGS = {"[laughs]", "[light laugh]", "[warmly]", "[thoughtful]",
-                   "[curious]", "[excited]", "[pause]", "[sighs]", "[whispers]"}
-
-# Matches any ``[audio tag]`` so it can be removed before non-ElevenLabs TTS.
-_AUDIO_TAG_RE = re.compile(r"\[[a-z][a-z ]*\]")
+# Matches any ``[audio tag]`` (case-insensitive) — used both to strip tags for
+# non-ElevenLabs TTS and to decide which ElevenLabs model a sentence needs.
+_AUDIO_TAG_RE = re.compile(r"\[[a-z][a-z ]*\]", re.IGNORECASE)
 
 
 def strip_audio_tags(text: str) -> str:
@@ -62,8 +60,9 @@ def is_emotional(sentence: str) -> bool:
     Returns:
         ``True`` if the sentence contains an audio tag or is a question.
     """
-    lower = sentence.lower()
-    return any(tag in lower for tag in _EMOTIONAL_TAGS) or sentence.strip().endswith("?")
+    # ANY audio tag must route to eleven_v3 — the faster eleven_flash_v2_5 can't
+    # render tags and would read them aloud (e.g. saying "laughs softly").
+    return bool(_AUDIO_TAG_RE.search(sentence)) or sentence.strip().endswith("?")
 
 
 # ── Kokoro (local) ─────────────────────────────────────────────────────────────

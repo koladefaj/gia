@@ -215,48 +215,38 @@ async def _stream_reply_frames(
     voice_id: str,
     collected: list[str],
 ) -> AsyncIterator[str]:
-    """Yield ``reply_chunk`` + ``audio_chunk`` frames, pipelining TTS one ahead.
+    """Stream the reply text sentence-by-sentence, then synthesise the WHOLE
+    reply in a single TTS pass.
 
-    Synthesis for sentence *N+1* is kicked off (as a task) the moment its text
-    arrives, while sentence *N*'s frame is still being emitted — so the network /
-    Kokoro round-trips overlap instead of running strictly back-to-back. Every
-    sentence is also appended to *collected* so the caller can persist the full
-    reply after streaming.
+    Per-sentence synthesis made the voice lurch: each ElevenLabs call saw only
+    one sentence, so prosody and tag rendering reset at every boundary, and the
+    hybrid picker could even switch models mid-reply (flash ↔ v3, which sound
+    audibly different). One pass over the full text gives consistent prosody,
+    reliable v3 tag rendering (it needs ~250+ chars of context), and a single
+    voice. The fast acknowledgment already covers the perceived latency of
+    waiting for the complete reply; text still streams live so captions appear
+    as Gia "types". Every sentence is appended to *collected* so the caller can
+    persist the full reply.
     """
-    prev_sentence: str | None = None
-    prev_task: asyncio.Task | None = None
-
     async for sentence in sentences:
         collected.append(sentence)
-        task = asyncio.create_task(
-            synthesize(sentence, provider=provider, api_key=api_key, voice_id=voice_id)
-        )
-        if prev_task is not None:
-            yield _sse("reply_chunk", {"text": prev_sentence})
-            async for frame in _drain_tts(prev_sentence, prev_task, provider):
-                yield frame
-        prev_sentence, prev_task = sentence, task
+        yield _sse("reply_chunk", {"text": sentence})
 
-    if prev_task is not None:
-        yield _sse("reply_chunk", {"text": prev_sentence})
-        async for frame in _drain_tts(prev_sentence, prev_task, provider):
-            yield frame
-
-
-async def _drain_tts(
-    text: str, task: asyncio.Task, provider: str
-) -> AsyncIterator[str]:
-    """Await a pending synthesis *task* and yield its ``audio_chunk`` frame."""
+    full = " ".join(s.strip() for s in collected).strip()
+    if not full:
+        return
     try:
-        chunk = await task
+        chunk = await synthesize(full, provider=provider, api_key=api_key, voice_id=voice_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("chat_tts_error", error=str(exc))
         return
     if chunk:
+        # is_emotional(full) picks ONE model for the whole reply (no mid-reply
+        # flash↔v3 hop): any tag or a question → eleven_v3, else eleven_flash.
         yield _sse("audio_chunk", {
             "data": base64.b64encode(chunk).decode(),
             "model": provider,
-            "emotional": is_emotional(text),
+            "emotional": is_emotional(full),
         })
 
 
@@ -453,13 +443,16 @@ async def _run_crew(
             bg_tasks.append(router_task)
 
             # ── 2a. Fast acknowledgment — react before the router LLM returns ──
-            # A keyword-classified retrieval intent means real work is likely, so
-            # Gia speaks a *neutral* filler in ~1s while the router and memory are
-            # still in flight. The filler claims nothing specific, so a keyword/LLM
-            # intent disagreement can't make it contradict the eventual reply; the
-            # intent-flavoured ack is reserved for the accurate post-router path.
+            # Gia speaks a *neutral* filler in ~1s on every substantive turn while
+            # the router, memory, and (whole-reply) TTS are still in flight — so
+            # she always feels responsive, not just on retrieval commands. The
+            # filler claims nothing specific, so it can front whatever the reply
+            # turns out to be (chat, a recommendation, a clarifying question)
+            # without contradicting it. The intent-flavoured ack is still reserved
+            # for the accurate post-router path. Skipped for now-playing status
+            # queries (answered instantly) and noise blips (< 3 chars).
             acked = False
-            if not now_playing_query and _fast_ack_intent(request.message) is not None:
+            if not now_playing_query and len(request.message.strip()) >= 3:
                 async for frame in _emit_filler(
                     session_id, trace, request.message,
                     tts_provider, tts_api_key, tts_voice_id,
