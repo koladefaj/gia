@@ -513,7 +513,7 @@ async def _run_crew(
         yield _sse("agent_start", {"agent": "router", "input": request.message})
         with trace.span("router", request.message) as span:
             router_t0 = time.monotonic()
-            decision = await router_prewarm.take(session_id, request.message)
+            decision = await router_prewarm.take(redis, session_id, request.message)
             prewarmed = decision is not None
             if decision is None:
                 # Created inside the span so the OpenAI drop-in generation nests
@@ -892,7 +892,8 @@ async def prewarm(
         return {"prewarmed": False}
     turns = await get_history(redis, session_id)
     router_history = format_history(turns[-_ROUTER_HISTORY_TURNS:])
-    router_prewarm.start(
+    await router_prewarm.start(
+        redis,
         session_id,
         request.message,
         lambda: classify_turn(request.message, cfg, history=router_history),
