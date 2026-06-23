@@ -1,22 +1,32 @@
-"""Day 2 seed script — creates a rich returning user so the demo feels alive from turn 1.
+"""Seed (or re-seed) the demo user so Gia feels like she already knows *you*.
 
-Run:
-    python scripts/seed_user.py
+Run inside the api container (so the in-cluster hostnames resolve):
 
-What it creates:
-  Postgres  — User, Profile, 30 ListeningEvents across time buckets
-  Weaviate  — 8 UserMemory objects (preferences + mood pattern + episodes)
+    docker compose exec api python scripts/seed_user.py --reset
 
-Vectors: random 768-dim placeholders for now. Real BGE embeddings wired on Day 3.
+What it creates for the demo user (`USER_ID`):
+  Postgres  — User, Profile (name/timezone/genres), listening history across
+              time buckets (morning runs / late nights / vibing)
+  Weaviate  — UserMemory objects: insights + preferences + life facts +
+              mood patterns + a recent episode, each with a real embedding
+
+`--reset` first deletes everything tied to this one demo user (Postgres rows,
+Weaviate objects, Redis keys) so a re-seed is a clean replace, not a merge. It
+only touches `USER_ID` — it is not a full-database wipe.
+
+To use the seeded identity in the browser, open once:
+    http://localhost:3000/?user_id=<USER_ID>
+(the frontend adopts it from the URL and persists it in localStorage).
 """
 
 import asyncio
-import random
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import weaviate
 import weaviate.classes as wvc
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.app.config import settings
@@ -26,80 +36,224 @@ from backend.app.db.weaviate_init import init_weaviate_schema_sync
 from backend.app.memory.embeddings import embed
 from backend.app.observability.logging import get_logger, setup_logging
 
-setup_logging("debug")
+setup_logging("info")
 log = get_logger(__name__)
 
-# Stable, deterministic UUIDs so the demo user is the same across reseeds and the
-# id is a real UUID (the User/Profile columns are native ``Uuid`` — Postgres
-# rejects non-UUID strings, and the API's profile lookup parses ``uuid.UUID``).
+# Stable, deterministic UUID so the demo user is the same across re-seeds and the
+# id is a real UUID (the User/Profile columns are native ``Uuid``).
 USER_UUID = uuid.uuid5(uuid.NAMESPACE_DNS, "gia.kolade-demo")
 PROFILE_UUID = uuid.uuid5(uuid.NAMESPACE_DNS, "gia.kolade-demo.profile")
-USER_ID = str(USER_UUID)  # string form used for the Weaviate user_id filter
+USER_ID = str(USER_UUID)
 PROFILE_ID = str(PROFILE_UUID)
 
-# ── Postgres seed ─────────────────────────────────────────────────────────────
+DISPLAY_NAME = "Kolade"  # change here if the demo user's name differs
 
-_TRACK_POOL = [
-    ("spotify:track:001", "Free Mind", "Tems", 0.38, 0.71, 92.0, 0.62, 5, 0),
-    ("spotify:track:002", "Last Last", "Burna Boy", 0.78, 0.68, 118.0, 0.80, 7, 1),
-    ("spotify:track:003", "Essence", "Wizkid", 0.61, 0.76, 108.0, 0.75, 2, 1),
-    ("spotify:track:004", "Infinity", "Odumodublvck", 0.85, 0.55, 142.0, 0.72, 9, 0),
-    ("spotify:track:005", "Bounce", "Omah Lay", 0.45, 0.73, 98.0, 0.68, 4, 1),
-    ("spotify:track:006", "Calm Down", "Rema", 0.52, 0.82, 105.0, 0.78, 6, 1),
-    ("spotify:track:007", "Peru", "Fireboy DML", 0.41, 0.69, 95.0, 0.65, 3, 0),
-    ("spotify:track:008", "Ye", "Burna Boy", 0.33, 0.77, 88.0, 0.60, 1, 1),
-    ("spotify:track:009", "Ku Lo Sa", "Oxlade", 0.44, 0.79, 102.0, 0.70, 8, 1),
-    ("spotify:track:010", "Soweto", "Victony", 0.58, 0.74, 112.0, 0.76, 0, 1),
+# ── Listening history ─────────────────────────────────────────────────────────
+# (uri, track, artist, energy, valence, tempo). URIs are placeholders — listening
+# history is mood/taste signal; live recommendations come from Spotify search, not
+# these ids. Energy/valence are coarse vibe hints (Spotify removed audio features
+# for new apps; mood is now LLM-labeled from titles/artists, these are belt-and-braces).
+
+# Morning runs — Central Cee, "Can't Rush Greatness" (UK rap, high energy)
+_MORNING = [
+    ("spotify:track:cc01", "Sprinter", "Central Cee", 0.82, 0.62, 141.0),
+    ("spotify:track:cc02", "Limitless", "Central Cee", 0.80, 0.58, 144.0),
+    ("spotify:track:cc03", "GenZ Luv", "Central Cee", 0.78, 0.60, 138.0),
+    ("spotify:track:cc04", "Commitment Issues", "Central Cee", 0.79, 0.55, 140.0),
+    ("spotify:track:cc05", "CRG", "Central Cee", 0.84, 0.57, 143.0),
+    ("spotify:track:cc06", "Truth in the Lies", "Central Cee", 0.77, 0.59, 139.0),
+]
+
+# Late nights — Drake (R&B leaning, lower energy)
+_NIGHT = [
+    ("spotify:track:dk01", "Marvins Room", "Drake", 0.38, 0.42, 90.0),
+    ("spotify:track:dk02", "Jaded", "Drake", 0.42, 0.48, 92.0),
+    ("spotify:track:dk03", "Teenage Fever", "Drake", 0.45, 0.50, 95.0),
+    ("spotify:track:dk04", "Whisper My Name", "Drake", 0.40, 0.46, 88.0),
+    ("spotify:track:dk05", "Dust", "Drake", 0.44, 0.45, 91.0),
+    ("spotify:track:dk06", "Shabang", "Drake", 0.55, 0.52, 102.0),
+    ("spotify:track:dk07", "Somebody Loves Me", "Drake, PARTYNEXTDOOR", 0.50, 0.49, 98.0),
+    ("spotify:track:dk08", "Fortworth", "Drake, PARTYNEXTDOOR", 0.52, 0.51, 100.0),
+]
+
+# Just vibing — Afrobeats / new-wave "burti" + upcoming artists
+_VIBE = [
+    ("spotify:track:mv01", "Mofe", "Mavo", 0.62, 0.74, 106.0),
+    ("spotify:track:mv02", "Aura Salad", "Mavo", 0.60, 0.78, 104.0),
+    ("spotify:track:mv03", "Guapanese", "Mavo", 0.64, 0.76, 108.0),
+    ("spotify:track:mv04", "Money Constant", "Mavo", 0.61, 0.72, 105.0),
+    ("spotify:track:ss01", "Super Power", "Suono Sai", 0.58, 0.75, 102.0),
+    ("spotify:track:ss02", "Igbo Boy", "Suono Sai", 0.59, 0.73, 103.0),
+    ("spotify:track:zl01", "Chose Me", "Zaylevelten", 0.57, 0.77, 101.0),
+    ("spotify:track:zl02", "Go Again", "Zaylevelten", 0.60, 0.74, 104.0),
+    ("spotify:track:mc01", "We 2 Fly", "Monochrome", 0.63, 0.76, 107.0),
+    ("spotify:track:mc02", "LV 444", "Monochrome", 0.61, 0.75, 105.0),
 ]
 
 
 def _make_listening_events(user_id: uuid.UUID) -> list[ListeningEvent]:
-    """30 events spread across time buckets so mood inference has signal."""
+    """Listening history across time buckets so mood inference has real signal."""
+    import random
+
     now = datetime.now(UTC)
-    events = []
+    events: list[ListeningEvent] = []
 
     def _event(track: tuple, played_at: datetime) -> ListeningEvent:
-        uri, name, artist, energy, valence, tempo, dance, key, mode = track
+        uri, name, artist, energy, valence, tempo = track
         return ListeningEvent(
             id=uuid.uuid4(),
             user_id=user_id,
             track_uri=uri,
             track_name=name,
             artist_name=artist,
-            energy=energy + random.uniform(-0.05, 0.05),
-            valence=valence + random.uniform(-0.05, 0.05),
+            energy=energy + random.uniform(-0.04, 0.04),
+            valence=valence + random.uniform(-0.04, 0.04),
             tempo=tempo + random.uniform(-3, 3),
-            danceability=dance,
-            key=key,
-            mode=mode,
             played_at=played_at,
         )
 
-    # Sunday evenings (8–10 PM) — low energy, wind-down → 10 events
-    low_energy_tracks = [t for t in _TRACK_POOL if t[3] < 0.50]
+    # Weekday mornings (7–9 AM) — runs, Central Cee → 10 events
     for i in range(10):
-        days_ago = 7 * (i // 2 + 1)
-        hour = random.randint(20, 22)
-        ts = (now - timedelta(days=days_ago)).replace(hour=hour, minute=random.randint(0, 59))
-        events.append(_event(random.choice(low_energy_tracks), ts))
+        ts = (now - timedelta(days=i + 1)).replace(hour=random.randint(7, 9), minute=random.randint(0, 59))
+        events.append(_event(random.choice(_MORNING), ts))
 
-    # Monday mornings (7–9 AM) — high energy, focus → 10 events
-    high_energy_tracks = [t for t in _TRACK_POOL if t[3] > 0.70]
-    for i in range(10):
-        days_ago = 7 * (i // 2 + 1) - 1  # day before Sunday
-        hour = random.randint(7, 9)
-        ts = (now - timedelta(days=days_ago)).replace(hour=hour, minute=random.randint(0, 59))
-        events.append(_event(random.choice(high_energy_tracks), ts))
+    # Late nights (10 PM–1 AM) — Drake → 12 events
+    for i in range(12):
+        ts = (now - timedelta(days=i + 1)).replace(hour=random.choice([22, 23, 0, 1]), minute=random.randint(0, 59))
+        events.append(_event(random.choice(_NIGHT), ts))
 
-    # Miscellaneous weekday afternoons → 10 events
-    for _ in range(10):
-        days_ago = random.randint(1, 30)
-        hour = random.randint(13, 18)
-        ts = (now - timedelta(days=days_ago)).replace(hour=hour, minute=random.randint(0, 59))
-        events.append(_event(random.choice(_TRACK_POOL), ts))
+    # Afternoons / weekends (1–6 PM) — vibing, Afrobeats → 12 events
+    for _ in range(12):
+        ts = (now - timedelta(days=random.randint(1, 21))).replace(hour=random.randint(13, 18), minute=random.randint(0, 59))
+        events.append(_event(random.choice(_VIBE), ts))
 
     return events
 
+
+# ── Memories (Weaviate UserMemory) ────────────────────────────────────────────
+# Types must match what retrieval reads: insight | preference | life_fact |
+# mood_pattern | episode. Insights are normally generated by the consolidation
+# worker; seeding them directly makes the "who they are" section alive from turn 1.
+
+_MEMORIES = [
+    # — Insights: the synthesised big picture —
+    {"type": "insight", "confidence": 0.95,
+     "text": "Maps music to the moment: UK rap (Central Cee) to move on morning runs, "
+             "Drake's R&B to wind down late at night, and Afrobeats when just vibing. "
+             "Genre-fluid, but intentional about which mood gets which sound."},
+    {"type": "insight", "confidence": 0.92,
+     "text": "Has an ear for the new wave — actively champions upcoming artists "
+             "(Suono Sai, Monochrome, Zaylevelten) and the emerging 'burti' Afrobeats "
+             "sound Mavo is shaping. Likes being early on talent."},
+
+    # — Preferences: the taste, with the WHY —
+    {"type": "preference", "confidence": 0.95,
+     "text": "Loves Drake, especially his R&B side — Drake is late-night listening "
+             "(Marvins Room, Jaded, Whisper My Name, Teenage Fever)."},
+    {"type": "preference", "confidence": 0.93,
+     "text": "Into Central Cee for his UK rap; runs the album 'Can't Rush Greatness' "
+             "on morning jogs (Sprinter, Limitless, GenZ Luv, CRG)."},
+    {"type": "preference", "confidence": 0.90,
+     "text": "Big on Mavo for the way they reshaped the Afrobeats sound into the new "
+             "'burti' wave (Mofe, Aura Salad, Guapanese, Money Constant)."},
+    {"type": "preference", "confidence": 0.88,
+     "text": "Champions upcoming artists and likes discovering them early — Suono Sai "
+             "(Super Power, Igbo Boy), Zaylevelten (Chose Me, Go Again), Monochrome "
+             "(We 2 Fly, LV 444)."},
+    {"type": "preference", "confidence": 0.90,
+     "text": "Loves the Drake x PARTYNEXTDOOR collabs (Somebody Loves Me, Fortworth)."},
+    {"type": "preference", "confidence": 0.85,
+     "text": "Afrobeats is the default when just vibing; switches to Drake's R&B at "
+             "night and Central Cee's UK rap to get moving."},
+
+    # — Life facts: what makes her a companion, not a jukebox —
+    {"type": "life_fact", "confidence": 1.0,
+     "text": "21 years old; birthday is in August."},
+    {"type": "life_fact", "confidence": 1.0,
+     "text": "Lives in Abuja, Nigeria."},
+    {"type": "life_fact", "confidence": 0.9,
+     "text": "Used to play football but hasn't in months — thinking about coming out of "
+             "'retirement' and getting back to it."},
+    {"type": "life_fact", "confidence": 1.0,
+     "text": "Has a dog named Rex."},
+
+    # — Mood patterns: time-of-day tendencies —
+    {"type": "mood_pattern", "confidence": 0.9,
+     "text": "Morning runs: high-energy UK rap — Central Cee's 'Can't Rush Greatness' on repeat."},
+    {"type": "mood_pattern", "confidence": 0.9,
+     "text": "Late nights: winds down with Drake, R&B-leaning and lower energy."},
+    {"type": "mood_pattern", "confidence": 0.88,
+     "text": "When just vibing (afternoons/weekends): Afrobeats — Mavo, Suono Sai, and the new-wave upcoming artists."},
+
+    # — Episode: a recent session for callbacks —
+    {"type": "episode", "confidence": 1.0,
+     "text": "Recent session: went full Drake for the night — played 'Fortworth' (with "
+             "PARTYNEXTDOOR) and queued a few more of his tracks."},
+]
+
+
+# ── Reset (scoped to this one demo user) ──────────────────────────────────────
+
+async def reset_user() -> None:
+    """Delete everything tied to USER_ID — Postgres rows, Weaviate objects, Redis
+    keys — so a re-seed is a clean replace. Scoped to the demo user only."""
+    log.info("reset_starting", user_id=USER_ID)
+
+    # Postgres — children first (FK order), then profile + user.
+    engine = create_async_engine(settings.database_url, echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session: AsyncSession
+        await session.execute(delete(ListeningEvent).where(ListeningEvent.user_id == USER_UUID))
+        await session.execute(delete(ConversationSession).where(ConversationSession.user_id == USER_UUID))
+        await session.execute(delete(Profile).where(Profile.user_id == USER_UUID))
+        await session.execute(delete(User).where(User.id == USER_UUID))
+        await session.commit()
+    await engine.dispose()
+    log.info("reset_postgres_done")
+
+    # Weaviate — delete this user's objects in both collections.
+    def _wipe_weaviate() -> None:
+        host = settings.weaviate_url.replace("http://", "").replace("https://", "")
+        h, _, p = host.partition(":")
+        client = weaviate.connect_to_custom(
+            http_host=h, http_port=int(p or 8080), http_secure=False,
+            grpc_host=h, grpc_port=50051, grpc_secure=False,
+        )
+        try:
+            for name in ("UserMemory", "MoodPattern"):
+                if client.collections.exists(name):
+                    client.collections.get(name).data.delete_many(
+                        where=wvc.query.Filter.by_property("user_id").equal(USER_ID)
+                    )
+        finally:
+            client.close()
+
+    await asyncio.to_thread(_wipe_weaviate)
+    log.info("reset_weaviate_done")
+
+    # Redis — drop any keys mentioning this user (session notes, retrieval cache).
+    # SCAN keeps it scoped; no FLUSHDB. Pending-flush members are set entries
+    # (not keys), so they're removed separately.
+    try:
+        import redis.asyncio as aioredis
+
+        r = aioredis.from_url(settings.redis_url, decode_responses=True)
+        async for key in r.scan_iter(match=f"*{USER_ID}*", count=200):
+            await r.delete(key)
+        members = await r.zrange("gia:pending_flush", 0, -1)
+        mine = [m for m in members if m.startswith(f"{USER_ID}:")]
+        if mine:
+            await r.zrem("gia:pending_flush", *mine)
+        await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — redis is best-effort here
+        log.warning("reset_redis_skipped", error=str(exc))
+    log.info("reset_redis_done")
+
+
+# ── Seed ──────────────────────────────────────────────────────────────────────
 
 async def seed_postgres() -> None:
     engine = create_async_engine(settings.database_url, echo=False)
@@ -109,12 +263,9 @@ async def seed_postgres() -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as session:
         session: AsyncSession
-
-        # Idempotent — skip if already seeded
-        from sqlalchemy import select
         existing = await session.execute(select(User).where(User.id == USER_UUID))
         if existing.scalar_one_or_none():
-            log.info("seed_postgres_skipped", reason="user already exists")
+            log.info("seed_postgres_skipped", reason="user exists (pass --reset to replace)")
             await engine.dispose()
             return
 
@@ -123,23 +274,22 @@ async def seed_postgres() -> None:
             id=PROFILE_UUID,
             user_id=USER_UUID,
             spotify_user_id="kolade_spotify",
-            timezone="Europe/London",
-            preferred_genres=["afrobeats", "afropop", "r&b"],
+            display_name=DISPLAY_NAME,
+            timezone="Africa/Lagos",
+            preferred_genres=["afrobeats", "uk rap", "r&b", "hip-hop"],
             preferred_volume=0.75,
         )
-        session.add(user)
-        session.add(profile)
+        session.add_all([user, profile])
 
         events = _make_listening_events(USER_UUID)
         session.add_all(events)
 
-        # One past session so memory extractor has something to reference
         past_session = ConversationSession(
             id=uuid.uuid4(),
             user_id=USER_UUID,
-            started_at=datetime.now(UTC) - timedelta(days=4),
-            ended_at=datetime.now(UTC) - timedelta(days=4, minutes=-35),
-            summary="User asked for Afrobeats wind-down. Confirmed Tems, saved Free Mind. Created playlist 'Afro Vibes'.",
+            started_at=datetime.now(UTC) - timedelta(days=1),
+            ended_at=datetime.now(UTC) - timedelta(days=1, minutes=-25),
+            summary="Late-night Drake session — played Fortworth (with PARTYNEXTDOOR) and queued more.",
         )
         session.add(past_session)
 
@@ -149,80 +299,23 @@ async def seed_postgres() -> None:
     await engine.dispose()
 
 
-# ── Weaviate seed ─────────────────────────────────────────────────────────────
-
-_MEMORIES = [
-    {
-        "type": "preference",
-        "text": "Loves Tems for wind-down sessions — low-energy, high-valence tracks like Free Mind.",
-        "confidence": 0.92,
-    },
-    {
-        "type": "preference",
-        "text": "Core Afrobeats listener. Burna Boy, Wizkid, and Davido are staples in regular rotation.",
-        "confidence": 0.95,
-    },
-    {
-        "type": "preference",
-        "text": "Currently going through an Odumodublvck phase — drawn to his Afro-fusion style.",
-        "confidence": 0.85,
-    },
-    {
-        "type": "preference",
-        "text": "Prefers high-energy tracks during weekday morning sessions (7–9 AM).",
-        "confidence": 0.88,
-    },
-    {
-        "type": "preference",
-        "text": "Rejects club-energy tracks before 10 PM unless explicitly requested.",
-        "confidence": 0.80,
-    },
-    {
-        "type": "preference",
-        "text": "Has confirmed Tems tracks across 3+ sessions — reliable positive signal.",
-        "confidence": 0.90,
-    },
-    {
-        "type": "mood_pattern",
-        "text": "Sunday 8–10 PM: consistently low energy (avg 0.35) + high valence (avg 0.73). Unwinding pattern — 8 sessions of evidence.",
-        "confidence": 0.87,
-    },
-    {
-        "type": "episode",
-        "text": "Session 2026-06-15: asked for Afrobeats wind-down, Gia recommended Tems, user confirmed and saved Free Mind. Created playlist 'Afro Vibes' with 5 tracks.",
-        "confidence": 1.0,
-    },
-]
-
-
 def seed_weaviate(vectors: list[list[float]]) -> None:
-    """Insert the seed memories with real BGE embeddings.
-
-    Args:
-        vectors: One 768-dim BGE embedding per entry in ``_MEMORIES`` (same
-                 order). Computed in ``main`` because ``embed`` is async.
-    """
+    """Insert the seed memories with real embeddings (same order as ``_MEMORIES``)."""
     init_weaviate_schema_sync()
 
+    host = settings.weaviate_url.replace("http://", "").replace("https://", "")
+    h, _, p = host.partition(":")
     client = weaviate.connect_to_custom(
-        http_host=settings.weaviate_url.replace("http://", "").split(":")[0],
-        http_port=int(settings.weaviate_url.split(":")[-1]),
-        http_secure=False,
-        grpc_host=settings.weaviate_url.replace("http://", "").split(":")[0],
-        grpc_port=50051,
-        grpc_secure=False,
+        http_host=h, http_port=int(p or 8080), http_secure=False,
+        grpc_host=h, grpc_port=50051, grpc_secure=False,
     )
-
     try:
         collection = client.collections.get("UserMemory")
-
-        # Idempotent — check if already seeded
         existing = collection.query.fetch_objects(
-            filters=wvc.query.Filter.by_property("user_id").equal(USER_ID),
-            limit=1,
+            filters=wvc.query.Filter.by_property("user_id").equal(USER_ID), limit=1,
         )
         if existing.objects:
-            log.info("seed_weaviate_skipped", reason="memories already exist")
+            log.info("seed_weaviate_skipped", reason="memories exist (pass --reset to replace)")
             return
 
         now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -239,24 +332,27 @@ def seed_weaviate(vectors: list[list[float]]) -> None:
                     },
                     vector=vector,
                 )
-
         log.info("seed_weaviate_done", user_id=USER_ID, memories=len(_MEMORIES))
     finally:
         client.close()
 
 
 async def main() -> None:
-    log.info("seed_starting")
+    do_reset = "--reset" in sys.argv
+    log.info("seed_starting", reset=do_reset)
+    if do_reset:
+        await reset_user()
+
     await seed_postgres()
-    # Real BGE embeddings (not random) so semantic recall actually works.
     log.info("seed_embedding_memories", count=len(_MEMORIES))
     vectors = [await embed(mem["text"]) for mem in _MEMORIES]
     await asyncio.to_thread(seed_weaviate, vectors)
+
     log.info("seed_complete", user_id=USER_ID)
-    print(f"\n[OK] Seed complete. Demo user id (use as user_id in /chat): {USER_ID}")
-    print("  Try:  curl -N -X POST http://localhost:8000/chat \\")
-    print('          -H "Content-Type: application/json" \\')
-    print(f'          -d \'{{"message":"find me something for tonight","user_id":"{USER_ID}"}}\'')
+    print("\n[OK] Demo user seeded.")
+    print(f"  user_id: {USER_ID}")
+    print(f"  Open the browser with this identity:  http://localhost:3000/?user_id={USER_ID}")
+    print("  (the frontend adopts it from the URL and remembers it)")
 
 
 if __name__ == "__main__":
