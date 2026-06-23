@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
 from backend.app.agents import router_prewarm
+from backend.app.agents.acknowledgment import get_selector
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
 from backend.app.agents.general import opening_line, stream_general
@@ -68,7 +69,7 @@ from backend.app.mood.ingest import ingest_recently_played
 from backend.app.mood.proactive import pop_proactive_draft
 from backend.app.observability.langfuse import crew_trace
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import is_emotional, synthesize_stream
+from backend.app.providers.tts import is_emotional, synthesize, synthesize_stream
 from backend.app.schemas.chat import ChatRequest, IntentType
 from backend.app.schemas.dj import TrackItem
 from backend.app.schemas.router import RouterDecision
@@ -564,6 +565,25 @@ async def _run_crew(
             )
             bg_tasks.append(spec_search_task)
 
+        # ── 1d. Instant warm ack for music commands ───────────────────────────
+        # A music search takes ~3-5s. Synthesise a short, content-NEUTRAL filler
+        # NOW — concurrently with the router + search — so when the DJ step starts
+        # we can speak it immediately and the user hears warmth instead of silence
+        # while the search runs. Neutral by design ("Say less." / "On it." — never
+        # "playing it now"), so it fronts a found track OR a "couldn't find it"
+        # without ever contradicting the result. The [warmly] tag routes it to
+        # eleven_v3 for human warmth; it's emitted only if the DJ actually runs.
+        ack_task: asyncio.Task | None = None
+        if spec_search_task is not None:
+            ack_line = get_selector().select_filler(session_id)
+            ack_task = asyncio.create_task(
+                synthesize(
+                    f"[warmly] {ack_line}",
+                    provider=tts_provider, api_key=tts_api_key, voice_id=tts_voice_id,
+                )
+            )
+            bg_tasks.append(ack_task)
+
         # ── 2. Route the turn (structured: intent + tone + engagement) ─────────
         # One small-model call classifies everything the turn needs. It never
         # raises — a failed call degrades to a warm GENERAL_CHAT default. Started
@@ -733,6 +753,25 @@ async def _run_crew(
             # play-vs-queue via start_playback.
             dj_query = decision.search_query or request.message
             yield _sse("agent_start", {"agent": "dj", "input": dj_query})
+
+            # Speak the pre-synthesised warm ack now, before the ~3-5s search, so
+            # the user hears "Say less." while we look. One-shot (non-streaming)
+            # audio → the frontend plays it on the AudioPlayer; the DJ reply
+            # streams progressively after, on the StreamPlayer. The synth started
+            # back in §1d, so this await is effectively instant.
+            if ack_task is not None:
+                try:
+                    ack_audio = await ack_task
+                    if ack_audio:
+                        yield _sse("audio_chunk", {
+                            "data": base64.b64encode(ack_audio).decode(),
+                            "model": tts_provider,
+                            "streaming": False,
+                            "ack": True,
+                        })
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("chat_ack_error", error=str(exc))
+
             with trace.span("dj", dj_query) as span:
                 t0 = time.monotonic()
                 try:
