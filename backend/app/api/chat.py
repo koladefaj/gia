@@ -397,6 +397,14 @@ _MUSIC_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Verbs that actually mean "start it NOW" (vs. queue/add for later). A MUSIC_QUEUE
+# turn only auto-plays the seed when one of these is present ("play X and queue Y");
+# a pure "queue X after this" must NOT start playback, whatever the router guessed.
+_PLAY_VERB_RE = re.compile(
+    r"\b(play|put (me )?on|throw on|resume|start|blast|bump)\b",
+    re.IGNORECASE,
+)
+
 # Leading command verbs / trailing fillers stripped to turn a raw command into a
 # cleaner speculative search query ("play some Travis Scott right now" → "some
 # Travis Scott"). The result need not be perfect — it only seeds the *speculative*
@@ -620,6 +628,12 @@ async def _run_crew(
                 decision = await router_task
 
             intent, confidence = decision.intent, decision.confidence
+            # A pure queue request ("queue X after this") must NOT start playback —
+            # the router sometimes sets start_playback anyway, which made the DJ play
+            # the track now instead of lining it up. Only honour playback on a queue
+            # turn when the user actually said a play verb ("play X and queue Y").
+            if intent == IntentType.MUSIC_QUEUE and not _PLAY_VERB_RE.search(request.message):
+                decision.start_playback = False
             steps = [] if now_playing_query else _steps_for_decision(decision)
             signals = ["weather"] if _wants_weather(request.message, steps) else []
             _src = "fast" if fast_path else "prewarmed" if prewarmed else "llm"
