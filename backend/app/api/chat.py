@@ -218,8 +218,19 @@ def _steps_for_decision(decision: RouterDecision) -> list[str]:
 
 
 _NOW_PLAYING_RE = re.compile(
-    r"\b(what('?s| is| am i)?\s+(currently\s+)?(playing|on right now|on now)"
-    r"|what song is this|what'?s this song|now playing|current track)\b",
+    r"\b("
+    # "what's (currently/now) playing" / "what are we listening to" / "what am i playing"
+    r"what(?:'?s| is| are we| am i)?\s+(?:currently\s+|now\s+)?(?:playing|listening to)"
+    # "what's on right now" / "what's on now" (require 'now' so "what's on your mind" doesn't match)
+    r"|what(?:'?s| is)\s+on(?:\s+right)?\s+now"
+    # "what's this song" / "what is the track" / "what's this tune"
+    r"|what(?:'?s| is)\s+(?:this|the)\s+(?:song|track|tune)"
+    # "what song is this" / "what track is playing"
+    r"|what\s+(?:song|track|tune)\s+is\s+(?:this|playing|on)"
+    r"|now playing|current track"
+    # "is something/anything/music playing"
+    r"|is\s+(?:something|anything|music)\s+playing"
+    r")\b",
     re.IGNORECASE,
 )
 
