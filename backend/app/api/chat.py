@@ -200,8 +200,13 @@ def _steps_for_decision(decision: RouterDecision) -> list[str]:
     conversational responder (the streaming conversation agent lands in Slice B).
     """
     steps: list[str] = []
-    if decision.needs_music or decision.intent in (
-        IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE,
+    # Run the DJ only on an actual music intent — or on MIXED when the user asked
+    # for music alongside something else. ``needs_music`` on its own does NOT pull
+    # in the DJ: the router sets it spuriously on ARTIST_INFO ("tell me about X"),
+    # which used to append a stray "Playing … now" to an info answer and auto-play
+    # without a request. Music stays opt-in, per the no-auto-play rule.
+    if decision.intent in (IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE) or (
+        decision.intent == IntentType.MIXED and decision.needs_music
     ):
         steps.append("dj")
     if decision.needs_artist_lookup or decision.intent == IntentType.ARTIST_INFO:
