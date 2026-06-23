@@ -41,8 +41,8 @@ _AUDIO_TAG_RE = re.compile(r"\[[a-z][a-z ]*\]", re.IGNORECASE)
 def strip_audio_tags(text: str) -> str:
     """Remove ElevenLabs-style ``[audio tags]`` and tidy the leftover spacing.
 
-    ElevenLabs v3 interprets tags like ``[warmly]`` as delivery cues, but a
-    plain TTS engine (Kokoro) would read the literal word "warmly" aloud. We
+    ElevenLabs v3 interprets tags like ``[warm]`` as delivery cues, but a
+    plain TTS engine (Kokoro) would read the literal word "warm" aloud. We
     strip them so local audio stays clean; the production ElevenLabs path keeps
     the tags untouched.
     """
@@ -109,7 +109,7 @@ def _kokoro_synthesize_sync(text: str, voice: str = "af_heart") -> bytes:
         return b""
 
     # Kokoro has no notion of delivery tags — strip them so it doesn't read
-    # "[warmly]" aloud. Empty after stripping → nothing to synthesise.
+    # "[warm]" aloud. Empty after stripping → nothing to synthesise.
     text = strip_audio_tags(text)
     if not text:
         return b""

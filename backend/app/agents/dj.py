@@ -182,7 +182,7 @@ class DJService:
         # to flash (the robotic sound). Guarantee a delivery cue when the LLM
         # didn't add one — v3 renders it as warmth, captions strip it.
         if not has_audio_tag(recommendation):
-            recommendation = f"[warmly] {recommendation}"
+            recommendation = f"[warm] {recommendation}"
 
         # ── 3. Optionally start playback ─────────────────────────────────────
         playback_started = False

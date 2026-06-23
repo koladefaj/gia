@@ -571,7 +571,7 @@ async def _run_crew(
         # we can speak it immediately and the user hears warmth instead of silence
         # while the search runs. Neutral by design ("Say less." / "On it." — never
         # "playing it now"), so it fronts a found track OR a "couldn't find it"
-        # without ever contradicting the result. The [warmly] tag routes it to
+        # without ever contradicting the result. The [warm] tag routes it to
         # eleven_v3 for human warmth; it's emitted only if the DJ actually runs.
         ack_task: asyncio.Task | None = None
         if spec_search_task is not None:

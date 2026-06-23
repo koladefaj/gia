@@ -24,7 +24,7 @@ what each turn tests and what to watch/listen for.
 ## The flow
 
 **0 · Gia greets first (on load).**
-🎧 *Listen:* warm and alive, with a single tag (`[warmly]`/`[softly]`). Reload once or twice — the phrasing **and** the tag should vary, never the same hello twice.
+🎧 *Listen:* warm and alive, with a single tag (`[warm]`/`[softly]`). Reload once or twice — the phrasing **and** the tag should vary, never the same hello twice.
 
 ---
 

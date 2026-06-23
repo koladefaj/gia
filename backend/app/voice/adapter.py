@@ -19,7 +19,7 @@ from backend.app.schemas.router import Tone
 _TONE_TAGS: dict[str, str] = {
     Tone.CURIOUS.value: "[curious]",
     Tone.SURPRISED.value: "[surprised]",
-    Tone.WARM.value: "[warmly]",
+    Tone.WARM.value: "[warm]",
     Tone.PLAYFUL.value: "[light laugh]",
     Tone.THOUGHTFUL.value: "[thoughtful]",
     Tone.EXCITED.value: "[excited]",

@@ -14,7 +14,7 @@ class TestStripAudioTags:
     """Audio tags are delivery cues for ElevenLabs — never read aloud by Kokoro."""
 
     def test_removes_tags_and_tidies_spacing(self) -> None:
-        assert strip_audio_tags("[warmly] Hey there [pause] friend") == "Hey there friend"
+        assert strip_audio_tags("[warm] Hey there [pause] friend") == "Hey there friend"
 
     def test_plain_text_unchanged(self) -> None:
         assert strip_audio_tags("Here's Free Mind by Tems.") == "Here's Free Mind by Tems."
@@ -25,7 +25,7 @@ class TestStripAudioTags:
 
 class TestIsEmotional:
     def test_audio_tag_is_emotional(self) -> None:
-        assert is_emotional("[warmly] Hey, long week?")
+        assert is_emotional("[warm] Hey, long week?")
 
     def test_question_is_emotional(self) -> None:
         assert is_emotional("Everything okay?")
@@ -53,8 +53,8 @@ class TestSplitSentences:
         assert len(parts) == 2
 
     def test_preserves_audio_tags(self) -> None:
-        parts = split_sentences("[warmly] Hey. Long week?")
-        assert any("[warmly]" in p for p in parts)
+        parts = split_sentences("[warm] Hey. Long week?")
+        assert any("[warm]" in p for p in parts)
 
     def test_empty_string(self) -> None:
         assert split_sentences("") == []
