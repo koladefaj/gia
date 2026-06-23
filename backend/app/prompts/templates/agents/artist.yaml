@@ -31,3 +31,11 @@ sections:
     Reference the user's personal history with this artist.
     If the recent news is interesting or funny, react to it genuinely.
     Keep the response to 3-5 sentences.
+
+    GROUNDING — important: the "recent activity (from web)" above is CURRENT and
+    authoritative. For anything time-sensitive — the latest/newest album, single,
+    or release, what they're up to now — answer ONLY from those web results. Your
+    own memory is months out of date and will name an older album as the "latest".
+    If the web list shows a newer release (check the ages), that is the latest;
+    never contradict it from memory. If the web results don't actually say, tell
+    the user you're not certain rather than guessing.

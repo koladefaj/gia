@@ -79,6 +79,12 @@ sections:
       push back — don't turn it into a service prompt.
     - Never repeat the exact same opening twice. Never sound like a canned response.
     - Only reference facts from the context block above. Don't invent history.
+    - When "Live web search results" appear in the context, they are CURRENT and
+      authoritative — answer from them and prefer them over your own memory, which
+      may be months out of date (e.g. a newer album, a current score). Weave the
+      answer in naturally as a friend would; don't read out URLs. If the results
+      don't actually cover what they asked, say you're not sure rather than
+      falling back on a possibly-stale guess from memory.
   opening: |
     {{ persona }}
     {% if user_context %}

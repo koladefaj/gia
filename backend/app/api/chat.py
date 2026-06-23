@@ -32,6 +32,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -119,6 +120,61 @@ async def _weather_note(weather: WeatherClientProtocol, cfg: Settings) -> str | 
     return (
         f"**Weather:** It's {current['temperature_c']:.0f}°C and "
         f"{current['condition']} in {cfg.weather_default_label} right now."
+    )
+
+
+# Markers that a turn is asking about *current* facts — so the model must search
+# rather than answer from its (months-old) training data. Catches the cases the
+# router's needs_search can miss: "Drake's latest album", "who won", "score".
+_FRESH_SEARCH_RE = re.compile(
+    r"\b(latest|newest|recent(?:ly)?|current(?:ly)?|today|tonight|right now|"
+    r"this (?:week|month|year|season)|so far this year|update[ds]?|news|headlines?|"
+    r"happening|breaking|just (?:dropped|released|came out|out)|new (?:album|single|song|release)|"
+    r"who won|who'?s winning|the score|standings|fixtures?|results?)\b"
+    r"|\b20[2-9]\d\b",
+    re.IGNORECASE,
+)
+
+# A tighter subset that wants the news feed specifically (vs general web).
+_BREAKING_RE = re.compile(
+    r"\b(news|breaking|headlines?|what'?s (?:going on|happening)|latest on)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_fresh_search(message: str) -> bool:
+    """Whether *message* asks about current facts that need a live search."""
+    return bool(_FRESH_SEARCH_RE.search(message))
+
+
+def _is_breaking_news(message: str) -> bool:
+    """Whether *message* is a breaking-news ask → use the news feed, not web."""
+    return bool(_BREAKING_RE.search(message))
+
+
+async def _search_note(brave: BraveSearchClient, query: str, *, breaking: bool) -> str | None:
+    """Run a Brave search and render results as a grounding block for the reply.
+
+    Returns ``None`` when nothing comes back, so the turn proceeds (un-grounded
+    but warm) rather than blocking on a degraded search.
+    """
+    try:
+        results = await brave.recent(query, count=5, breaking=breaking)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("chat_search_error", error=str(exc))
+        return None
+    if not results:
+        return None
+    lines = []
+    for r in results:
+        age = f" · {r['age']}" if r.get("age") else ""
+        desc = (r.get("description") or "").strip()
+        lines.append(f"- {r['title']}{age}: {desc} ({r['url']})")
+    today = datetime.now(UTC).strftime("%A, %d %B %Y")
+    return (
+        f"**Live web search results (today is {today} — use these as the source of "
+        "truth for current facts and prefer them over anything you remember, which "
+        "may be out of date):**\n" + "\n".join(lines)
     )
 
 
@@ -480,6 +536,9 @@ async def _run_crew(
             and len(request.message.strip()) >= 3
             and cfg.llm_provider in ("openai", "anthropic")
             and _should_speculate(request.message)
+            # A current-facts turn will search and regenerate, discarding any
+            # speculative reply — so don't pay for one.
+            and not _wants_fresh_search(request.message)
         ):
             general_task = asyncio.create_task(
                 _speculative_general(request.message, memory_task, history_text, cfg)
@@ -592,6 +651,51 @@ async def _run_crew(
             if weather_note:
                 user_context_text = f"{user_context_text}\n{weather_note}".strip()
                 yield _sse("signal", {"name": "weather", "value": weather_note})
+
+        # Live web/news search for current-facts turns. The router answers news and
+        # general questions conversationally (no specialist), so without this the
+        # model replies from stale training data ("Drake's latest album" → a
+        # year-old answer; "World Cup update" → "I don't know"). We search when the
+        # turn is conversational AND either the router flagged needs_search or the
+        # message carries recency markers, then ground the reply in the results.
+        searched = False
+        # Will the artist specialist actually run? It's skipped when no clean name
+        # resolves ("whats Drake's newest album?" → no name), and the turn then
+        # falls back to the conversational reply — which must be search-grounded.
+        artist_will_run = (
+            intent == IntentType.ARTIST_INFO
+            and bool(extract_artist_name(request.message))
+        )
+        # Search-ground current-facts turns. Eligible intents answer
+        # conversationally; music/mood/memory have their own data sources.
+        # ARTIST_INFO is included only when its specialist WON'T run — otherwise the
+        # artist agent (which does its own freshness-filtered search) handles it.
+        search_eligible = (
+            intent in (
+                IntentType.GENERAL, IntentType.GENERAL_CHAT,
+                IntentType.NEWS_QUERY, IntentType.MIXED,
+            )
+            or (intent == IntentType.ARTIST_INFO and not artist_will_run)
+        )
+        do_search = (
+            not now_playing_query
+            and search_eligible
+            and (decision.needs_search or _wants_fresh_search(request.message))
+        )
+        if do_search:
+            search_query = decision.search_query or request.message
+            breaking = _is_breaking_news(request.message)
+            yield _sse("tool_call", {
+                "agent": "search", "tool": "brave_news" if breaking else "brave_web",
+                "input": search_query,
+            })
+            with trace.span("search", search_query) as span:
+                note = await _search_note(brave, search_query, breaking=breaking)
+                span.set_output(f"results={'yes' if note else 'none'}")
+            if note:
+                user_context_text = f"{user_context_text}\n{note}".strip()
+                searched = True
+                yield _sse("signal", {"name": "search", "value": search_query})
 
         # ── 4. Execute the planned agents ─────────────────────────────────────
         reply_parts: list[str] = []
@@ -765,7 +869,10 @@ async def _run_crew(
             yield _sse("agent_start", {"agent": "gia", "input": request.message})
             with trace.span("general", request.message) as span:
                 t0 = time.monotonic()
-                if general_task is not None:
+                # The speculative reply was generated BEFORE the search ran, so on a
+                # search turn it can't see the results — regenerate with the grounded
+                # context. Non-search turns reuse the speculative reply as before.
+                if general_task is not None and not searched:
                     reply = await general_task
                 else:
                     reply = await _collect_general(

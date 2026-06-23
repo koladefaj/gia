@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from crewai import Agent
 
@@ -189,7 +190,13 @@ class ArtistService:
         """
         # ── Parallel fetches ─────────────────────────────────────────────────
         top_tracks_coro = self.spotify.search_tracks(artist_name, limit=5)
-        brave_coro = self.brave.search(f"{artist_name} 2026", count=5)
+        # Freshness is essential here: a bare "{artist} {year}" query returns
+        # evergreen tour/ticket pages and misses new releases, so the model falls
+        # back to its stale memory ("latest album" → a year-old answer). A
+        # past-month window surfaces the actual recent activity (e.g. a new album
+        # released last week) for the prompt to ground on.
+        year = datetime.now(UTC).year
+        brave_coro = self.brave.search(f"{artist_name} {year}", count=5, freshness="pm")
 
         top_tracks_raw, brave_raw = await asyncio.gather(
             top_tracks_coro,
@@ -230,8 +237,10 @@ class ArtistService:
         ) or "No tracks available."
 
         brave_text = "\n".join(
-            f"- {r.get('title', '')}: {r.get('description', '')[:200]}"
-            for r in brave_results[:3]
+            f"- {r.get('title', '')}"
+            + (f" ({r['age']})" if r.get("age") else "")
+            + f": {r.get('description', '')[:200]}"
+            for r in brave_results[:5]
         ) or "No recent news found."
 
         prompt = self.registry.get(AGENT_KEY).render(
