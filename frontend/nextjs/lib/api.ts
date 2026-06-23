@@ -9,6 +9,19 @@
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
 
+/** Build a ws(s):// URL for a backend WebSocket path, with optional query. */
+export function wsUrl(
+  path: string,
+  params?: Record<string, string | null | undefined>,
+): string {
+  const base = API_BASE.replace(/^http/, 'ws');
+  const entries = Object.entries(params ?? {}).filter(
+    (e): e is [string, string] => Boolean(e[1]),
+  );
+  const q = entries.length ? `?${new URLSearchParams(entries).toString()}` : '';
+  return `${base}${path}${q}`;
+}
+
 /* -------------------------------------------------------------------------- */
 /* /chat — Server-Sent Events                                                  */
 /* -------------------------------------------------------------------------- */

@@ -164,15 +164,35 @@ class Settings(BaseSettings):
     # sub-second reply. See backend/app/agents/curator_crew.py.
     crewai_curator_enabled: bool = Field(default=False)
 
-    # Speech-to-text. "local" runs faster-whisper on the GPU (free, fast).
-    # "openai" uses the Whisper API (whisper-1) — a larger multilingual model
-    # that handles accented English (e.g. Nigerian) noticeably better, at a
-    # per-minute cost. Set STT_PROVIDER=openai in .env to switch.
-    stt_provider: str = Field(default="local")  # local | openai
+    # Speech-to-text. Two families behind one switch:
+    #   Batch (record → upload → transcribe; serial, before /chat):
+    #     "local"  — faster-whisper on the GPU (free, fast, English-only base.en)
+    #     "openai" — Whisper API (whisper-1), better on accented English, paid
+    #   Streaming (continuous audio over WS, interim + final transcripts):
+    #     "deepgram"      — nova-3 streaming, ~300ms finals, cheap, strong accents
+    #     "openai_stream" — OpenAI Realtime transcription (gpt-4o-mini-transcribe)
+    # The streaming providers feed the WS /voice/stream endpoint and remove the
+    # serial transcription wait from the voice path; the batch providers still
+    # back the one-shot /voice/transcribe used as a fallback.
+    stt_provider: str = Field(default="local")  # local | openai | deepgram | openai_stream
     # Local faster-whisper model. base.en is fast but English-only and weak on
     # heavy accents; "large-v3" (multilingual) is far more accurate and fits the
     # RTX 4060. Changing this re-downloads the model on next start.
     stt_model: str = Field(default="base.en")
+
+    # --- Deepgram (streaming STT) ---
+    deepgram_api_key: str = Field(default="")
+    # Streaming model. We use Deepgram **Flux** (/v2/listen) — the conversational
+    # model built for voice agents: it does end-of-turn detection itself and emits
+    # eager/confirmed turn-end events, which is exactly the early-intent signal.
+    # "flux-general-en" is English; "flux-general-multi" adds other languages.
+    deepgram_model: str = Field(default="flux-general-en")
+    # End-of-turn detection knobs (passed straight to Flux). eot_threshold gates
+    # the high-confidence EndOfTurn (final); eager_eot_threshold gates the early
+    # EagerEndOfTurn used for speculative replies. Lower eager = earlier but more
+    # false starts; higher eot = more reliable but slightly later.
+    deepgram_eot_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    deepgram_eager_eot_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # =============================================================================
     # Tool resilience

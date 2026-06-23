@@ -44,6 +44,7 @@ from backend.app.api import (
     onboarding,
     playlist,
     voice,
+    voice_stream,
 )
 from backend.app.config import settings
 from backend.app.db.session import engine
@@ -180,3 +181,4 @@ app.include_router(dj.router)
 app.include_router(artist.router)
 app.include_router(chat.router)
 app.include_router(voice.router)
+app.include_router(voice_stream.router)
