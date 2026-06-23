@@ -98,6 +98,21 @@ export async function* chatStream(
   }
 }
 
+/**
+ * Fire-and-forget: ask the backend to start the router early on an eager
+ * (medium-confidence) end-of-turn transcript, so the ~2s router overlaps the
+ * user's last words. `session_id` must match the one sent to /chat. Best-effort
+ * — failures are ignored (the turn still works, just without the head start).
+ */
+export function prewarmRouter(body: ChatBody): void {
+  void fetch(`${API_BASE}/chat/prewarm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    keepalive: true,
+  }).catch(() => {});
+}
+
 /* -------------------------------------------------------------------------- */
 /* /voice — STT + TTS                                                          */
 /* -------------------------------------------------------------------------- */

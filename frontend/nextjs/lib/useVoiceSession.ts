@@ -25,7 +25,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { chatStream, speak as speakApi, transcribe } from './api';
+import { chatStream, prewarmRouter, speak as speakApi, transcribe } from './api';
 import { AudioPlayer, StreamPlayer, createAnalyser, stripTags } from './audio';
 import { PcmCapture } from './pcm';
 import { FluxStream } from './sttStream';
@@ -119,6 +119,7 @@ export function useVoiceSession(
   const fluxRef = useRef<FluxStream | null>(null);
   const pcmRef = useRef<PcmCapture | null>(null);
   const streamActiveRef = useRef(false); // Flux socket is up; skip the recorder VAD
+  const lastPrewarmRef = useRef(''); // last eager text we prewarmed (dedupe)
 
   const setPhaseBoth = useCallback((p: VoicePhase) => {
     phaseRef.current = p;
@@ -237,6 +238,24 @@ export function useVoiceSession(
     [runChat],
   );
 
+  // Early-intent: on an eager (medium-confidence) end-of-turn, ask the backend
+  // to start the router now — its transcript is guaranteed to match the final,
+  // so by the time `final` runs /chat the router may already be done. Deduped
+  // per text and skipped mid-chat; a `resumed` clears the dedupe so the next,
+  // longer eager re-fires.
+  const handleEager = useCallback(
+    (text: string) => {
+      const clean = stripTags(text).trim();
+      if (!activeRef.current || streamingRef.current) return;
+      if (clean.length < MIN_FINAL_CHARS) return;
+      const norm = clean.toLowerCase();
+      if (norm === lastPrewarmRef.current) return;
+      lastPrewarmRef.current = norm;
+      prewarmRouter({ message: clean, user_id: userId, session_id: sessionId });
+    },
+    [userId, sessionId],
+  );
+
   /* ---- turn capture (batch fallback) ----------------------------------- */
 
   const finalizeTurn = useCallback(
@@ -344,6 +363,7 @@ export function useVoiceSession(
     capturingRef.current = false;
     manualRef.current = false;
     levelRef.current = 0;
+    lastPrewarmRef.current = ''; // fresh turn — allow prewarm again
     // The grace window starts NOW — when Gia stops speaking and listening
     // resumes — not when she started. A long reply no longer eats the window.
     engagedUntilRef.current = performance.now() + GRACE_MS;
@@ -383,8 +403,11 @@ export function useVoiceSession(
             done();
           },
           onFinal: (t) => handleStreamFinal(t),
-          // partial/eager/resumed are wired for Phase 2 (early-intent); Phase 1
-          // acts only on `final`.
+          onEager: (t) => handleEager(t),
+          onResumed: () => {
+            // The eager guess was wrong; let the next, longer eager prewarm again.
+            lastPrewarmRef.current = '';
+          },
           onError: () => {
             teardown();
             done();
@@ -420,7 +443,7 @@ export function useVoiceSession(
         // Don't block startup forever waiting on the socket.
         setTimeout(done, STREAM_READY_MS);
       }),
-    [handleStreamFinal],
+    [handleStreamFinal, handleEager],
   );
 
   /* ---- lifecycle -------------------------------------------------------- */

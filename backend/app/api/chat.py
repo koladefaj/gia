@@ -40,6 +40,7 @@ from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
+from backend.app.agents import router_prewarm
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
 from backend.app.agents.general import opening_line, stream_general
@@ -503,22 +504,32 @@ async def _run_crew(
         # One small-model call classifies everything the turn needs. It never
         # raises — a failed call degrades to a warm GENERAL_CHAT default. Started
         # as a task so the speculative reply above overlaps the round-trip.
+        #
+        # Early-intent: streaming STT (Flux) fires /chat/prewarm on the eager
+        # transcript a beat before the user finishes, so the router may already be
+        # done. We take that result when present (the common streaming case) and
+        # only classify cold on a miss (typed turns, batch STT, multi-worker) —
+        # either way the input is identical, so the decision is the same.
         yield _sse("agent_start", {"agent": "router", "input": request.message})
         with trace.span("router", request.message) as span:
             router_t0 = time.monotonic()
-            # Created inside the span so the OpenAI drop-in generation nests under
-            # "router" (asyncio tasks inherit the current OTel context).
-            router_task = asyncio.create_task(
-                classify_turn(request.message, cfg, history=router_history)
-            )
-            bg_tasks.append(router_task)
+            decision = await router_prewarm.take(session_id, request.message)
+            prewarmed = decision is not None
+            if decision is None:
+                # Created inside the span so the OpenAI drop-in generation nests
+                # under "router" (asyncio tasks inherit the current OTel context).
+                router_task = asyncio.create_task(
+                    classify_turn(request.message, cfg, history=router_history)
+                )
+                bg_tasks.append(router_task)
+                decision = await router_task
 
-            decision = await router_task
             intent, confidence = decision.intent, decision.confidence
             steps = [] if now_playing_query else _steps_for_decision(decision)
             signals = ["weather"] if _wants_weather(request.message, steps) else []
             span.set_output(
                 f"{intent.value}/{decision.tone.value}/{decision.engagement_mode.value}"
+                + (" (prewarmed)" if prewarmed else "")
             )
             yield _sse("agent_done", {
                 "agent": "router",
@@ -526,6 +537,7 @@ async def _run_crew(
                 "tone": decision.tone.value,
                 "engagement_mode": decision.engagement_mode.value,
                 "confidence": round(confidence, 2),
+                "prewarmed": prewarmed,
                 "latency_ms": round((time.monotonic() - router_t0) * 1000, 1),
             })
         yield _sse("plan", {
@@ -851,6 +863,41 @@ async def _run_crew(
                 for s in trace.spans
             ],
         })
+
+
+@router.post("/prewarm", status_code=202, summary="Speculatively warm the router on an eager transcript")
+async def prewarm(
+    request: ChatRequest,
+    redis: Annotated[Redis, Depends(get_redis)],
+    cfg: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    """Start the router classification early, before the turn is final.
+
+    Called by the streaming-STT client on Deepgram Flux's ``EagerEndOfTurn`` — a
+    medium-confidence turn end whose transcript is guaranteed to match the final
+    one. We kick ``classify_turn`` and stash the in-flight task; the subsequent
+    ``POST /chat`` (with the final transcript) awaits it instead of starting the
+    router cold, so the router latency overlaps the user's last words.
+
+    Read-only and side-effect free — only the *classification* is precomputed;
+    search/playback still happen in ``/chat`` after the final transcript. Returns
+    immediately (202) without waiting for the router.
+
+    Args:
+        request: ``ChatRequest`` — ``message`` is the eager transcript;
+                 ``session_id`` must match the one the client sends to ``/chat``.
+    """
+    session_id = request.session_id
+    if not session_id:
+        return {"prewarmed": False}
+    turns = await get_history(redis, session_id)
+    router_history = format_history(turns[-_ROUTER_HISTORY_TURNS:])
+    router_prewarm.start(
+        session_id,
+        request.message,
+        lambda: classify_turn(request.message, cfg, history=router_history),
+    )
+    return {"prewarmed": True}
 
 
 @router.get("/opening", summary="Gia's opening line — she speaks first")
