@@ -578,7 +578,7 @@ async def _run_crew(
             ack_line = get_selector().select_filler(session_id)
             ack_task = asyncio.create_task(
                 synthesize(
-                    f"[warmly] {ack_line}",
+                    f"[warm] {ack_line}",
                     provider=tts_provider, api_key=tts_api_key, voice_id=tts_voice_id,
                 )
             )

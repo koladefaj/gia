@@ -488,8 +488,13 @@ export function useVoiceSession(
       activeRef.current = true;
       rafRef.current = requestAnimationFrame(loop);
 
-      // Bring up streaming STT (best-effort; falls back to the recorder path).
-      await setupStreaming(stream);
+      // Bring up streaming STT in the BACKGROUND — never block the greeting on the
+      // Flux WS handshake. Gia must speak first the instant her audio is ready (the
+      // wake earcon covers only the synth, not a socket round-trip). Streaming is
+      // ready well before the user replies; until then the VAD loop uses the
+      // recorder fallback. Mic frames are gated to the 'listening' phase, so the
+      // capture that setupStreaming starts never picks up Gia's own greeting.
+      void setupStreaming(stream);
 
       // Gia greets first, if asked to. The browser only allows this audio now,
       // because the tap is a user gesture. While it plays the phase is 'speaking'
