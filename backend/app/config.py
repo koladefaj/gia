@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     conversation_model: str = Field(default="gpt-4o")
     # Below this router confidence, escalate to the Planner instead of dispatching.
     router_confidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    # Tier-1 router: when the sub-ms keyword classifier is confident a turn is pure
+    # conversation (a greeting/small-talk with zero music/artist/mood/queue signal),
+    # skip the ~2s gpt-4o-mini router entirely and use a warm GENERAL_CHAT decision.
+    # Conservative — only the unambiguous-chat case short-circuits; anything that
+    # might need query resolution still goes to the LLM. Flip off to force the LLM.
+    router_fast_path_enabled: bool = Field(default=True)
 
     # --- Spotify ---
     spotify_client_id: str = Field(default="")

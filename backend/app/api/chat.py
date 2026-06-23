@@ -44,7 +44,7 @@ from backend.app.agents import router_prewarm
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
 from backend.app.agents.general import opening_line, stream_general
-from backend.app.agents.hybrid_router import classify_turn
+from backend.app.agents.hybrid_router import classify_turn, fast_keyword_decision
 from backend.app.agents.mood import MoodService
 from backend.app.agents.planner import _wants_weather
 from backend.app.agents.router import _keyword_classify
@@ -513,11 +513,22 @@ async def _run_crew(
         yield _sse("agent_start", {"agent": "router", "input": request.message})
         with trace.span("router", request.message) as span:
             router_t0 = time.monotonic()
-            decision = await router_prewarm.take(redis, session_id, request.message)
-            prewarmed = decision is not None
+            # Tier-1: a confident keyword read of pure conversation skips the LLM
+            # router (and the prewarm) entirely — sub-ms instead of ~2s.
+            decision = (
+                fast_keyword_decision(request.message)
+                if cfg.router_fast_path_enabled else None
+            )
+            fast_path = decision is not None
+            prewarmed = False
             if decision is None:
-                # Created inside the span so the OpenAI drop-in generation nests
-                # under "router" (asyncio tasks inherit the current OTel context).
+                # Tier-2: reuse the decision the eager prewarm already started.
+                decision = await router_prewarm.take(redis, session_id, request.message)
+                prewarmed = decision is not None
+            if decision is None:
+                # Tier-3: classify cold. Created inside the span so the OpenAI
+                # drop-in generation nests under "router" (asyncio tasks inherit
+                # the current OTel context).
                 router_task = asyncio.create_task(
                     classify_turn(request.message, cfg, history=router_history)
                 )
@@ -527,9 +538,9 @@ async def _run_crew(
             intent, confidence = decision.intent, decision.confidence
             steps = [] if now_playing_query else _steps_for_decision(decision)
             signals = ["weather"] if _wants_weather(request.message, steps) else []
+            _src = "fast" if fast_path else "prewarmed" if prewarmed else "llm"
             span.set_output(
-                f"{intent.value}/{decision.tone.value}/{decision.engagement_mode.value}"
-                + (" (prewarmed)" if prewarmed else "")
+                f"{intent.value}/{decision.tone.value}/{decision.engagement_mode.value} ({_src})"
             )
             yield _sse("agent_done", {
                 "agent": "router",
@@ -538,6 +549,7 @@ async def _run_crew(
                 "engagement_mode": decision.engagement_mode.value,
                 "confidence": round(confidence, 2),
                 "prewarmed": prewarmed,
+                "fast_path": fast_path,
                 "latency_ms": round((time.monotonic() - router_t0) * 1000, 1),
             })
         yield _sse("plan", {
@@ -889,6 +901,10 @@ async def prewarm(
     """
     session_id = request.session_id
     if not session_id:
+        return {"prewarmed": False}
+    # If the keyword fast-path will handle this turn without the LLM router,
+    # there's nothing to prewarm — don't spend an LLM call on it.
+    if cfg.router_fast_path_enabled and fast_keyword_decision(request.message) is not None:
         return {"prewarmed": False}
     turns = await get_history(redis, session_id)
     router_history = format_history(turns[-_ROUTER_HISTORY_TURNS:])
