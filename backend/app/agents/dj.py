@@ -24,6 +24,7 @@ from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.observability.logging import get_logger
 from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_llm
+from backend.app.providers.tts import has_audio_tag
 from backend.app.schemas.dj import CrossfadeQueue, DJResponse, TrackItem
 
 logger = get_logger(__name__)
@@ -173,6 +174,15 @@ class DJService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("dj_llm_error", error=str(exc))
             recommendation = f"Here's {seed.name} by {seed.artist} — should fit the vibe."
+
+        recommendation = recommendation.strip()
+        # Music is the product moment, so it must land on the warm eleven_v3 model,
+        # not the flat flash model. The TTS picker routes to v3 only when a line
+        # carries an [audio tag]; a plain "Playing X now..." has none and would go
+        # to flash (the robotic sound). Guarantee a delivery cue when the LLM
+        # didn't add one — v3 renders it as warmth, captions strip it.
+        if not has_audio_tag(recommendation):
+            recommendation = f"[warmly] {recommendation}"
 
         # ── 3. Optionally start playback ─────────────────────────────────────
         playback_started = False

@@ -49,6 +49,15 @@ def strip_audio_tags(text: str) -> str:
     return re.sub(r"\s{2,}", " ", _AUDIO_TAG_RE.sub("", text)).strip()
 
 
+def has_audio_tag(text: str) -> bool:
+    """Return ``True`` when *text* contains an ElevenLabs ``[audio tag]``.
+
+    Used to decide whether a line already carries a v3 delivery cue (so callers
+    can add one when it doesn't, routing the line to the expressive model).
+    """
+    return bool(_AUDIO_TAG_RE.search(text))
+
+
 def is_emotional(sentence: str) -> bool:
     """Return ``True`` when a sentence warrants expressive TTS (ElevenLabs v3).
 
