@@ -82,6 +82,21 @@ async def _prewarm_stt() -> None:
     await asyncio.to_thread(warmup, settings.stt_model)
 
 
+async def _prewarm_openai() -> None:
+    """Open the TCP+TLS connection to OpenAI at startup so the first router/reply
+    call doesn't pay the ~300-460ms handshake mid-turn.
+
+    A keyless ``models.list`` establishes a pooled connection (no tokens, no cost)
+    that the keepalive client then holds open for subsequent turns. No-op when no
+    OpenAI key is configured.
+    """
+    if not settings.openai_api_key:
+        return
+    from backend.app.providers.openai_client import get_async_openai
+
+    await get_async_openai(settings).models.list()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application-scoped resources for the lifetime of the process.
@@ -132,9 +147,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis.ping(),
         app.state.spotify.prewarm(),
         _prewarm_stt(),
+        _prewarm_openai(),
         return_exceptions=True,
     )
-    for name, result in zip(("postgres", "redis", "spotify", "stt"), results, strict=True):
+    for name, result in zip(("postgres", "redis", "spotify", "stt", "openai"), results, strict=True):
         if isinstance(result, Exception):
             logger.warning("prewarm_failed", service=name, error=str(result))
         else:
