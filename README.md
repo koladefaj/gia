@@ -243,6 +243,6 @@ pytest -q
 - Retrain the distilled router on **real** traffic (it's currently bootstrapped on synthetic + teacher labels) and lower the confidence gate as accuracy climbs
 - Memory consolidation → user-state precompute (mood, top artists, weekly trend) as a cached snapshot
 - LLM-as-judge self-evaluation + a small Ragas-style RAG eval, sampled from Langfuse traces (deferred until there's real query traffic to grade)
-- Real-time voice with barge-in (WebRTC)
+- **Barge-in (interrupt-and-correct UX)** — let the user cut in *while Gia is speaking* to correct or redirect her. Two paths: a lighter version on the current stack (keep the mic open during TTS, use Flux's `StartOfTurn` to stop playback and switch to listening, lean on browser echo-cancellation), or the robust version via a WebRTC pipeline (LiveKit / Pipecat) which also brings production-grade turn-taking and mobile/telephony. (Mid-sentence cut-offs are already tuned out via the Flux `eot_threshold`.)
 - User-editable memory ("Gia, forget that")
 - Shared listening — two users, one queue
