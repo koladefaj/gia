@@ -201,10 +201,16 @@ class Settings(BaseSettings):
     deepgram_model: str = Field(default="flux-general-en")
     # End-of-turn detection knobs (passed straight to Flux). eot_threshold gates
     # the high-confidence EndOfTurn (final); eager_eot_threshold gates the early
-    # EagerEndOfTurn used for speculative replies. Lower eager = earlier but more
-    # false starts; higher eot = more reliable but slightly later.
-    deepgram_eot_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # EagerEndOfTurn used for speculative replies. Higher eot = Flux waits for more
+    # confidence you're actually done, so it stops cutting you off mid-sentence
+    # (the tradeoff is the turn ends slightly later). 0.8 holds through natural
+    # pauses; eot_timeout_ms caps how long it will wait so a real pause still ends
+    # the turn. Lower eager = earlier prewarm but more false starts.
+    deepgram_eot_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     deepgram_eager_eot_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Max ms of trailing silence before Flux forces the turn end (so a high
+    # eot_threshold never leaves the turn hanging).
+    deepgram_eot_timeout_ms: int = Field(default=4000, ge=500, le=15000)
 
     # =============================================================================
     # Tool resilience

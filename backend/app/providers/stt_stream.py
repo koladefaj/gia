@@ -118,19 +118,23 @@ class DeepgramTranscriber:
         api_key: str,
         model: str = "flux-general-en",
         sample_rate: int = SAMPLE_RATE,
-        eot_threshold: float = 0.7,
+        eot_threshold: float = 0.8,
         eager_eot_threshold: float = 0.5,
+        eot_timeout_ms: int = 4000,
     ) -> None:
         self._api_key = api_key
         # Flux takes a smaller param set than nova: no smart_format/punctuate/
         # language for raw audio — just model, encoding, sample_rate, and the EOT
         # knobs. encoding+sample_rate are required for non-containerized PCM.
+        # eot_timeout_ms caps the wait so a high eot_threshold (which keeps Flux
+        # from cutting the speaker off mid-sentence) never leaves the turn hanging.
         self._params = {
             "model": model,
             "encoding": "linear16",
             "sample_rate": str(sample_rate),
             "eot_threshold": str(eot_threshold),
             "eager_eot_threshold": str(eager_eot_threshold),
+            "eot_timeout_ms": str(eot_timeout_ms),
         }
         self._ws: ClientConnection | None = None
 
@@ -317,8 +321,9 @@ def get_streaming_transcriber(
         return DeepgramTranscriber(
             api_key=key,
             model=getattr(cfg, "deepgram_model", "flux-general-en") or "flux-general-en",
-            eot_threshold=getattr(cfg, "deepgram_eot_threshold", 0.7),
+            eot_threshold=getattr(cfg, "deepgram_eot_threshold", 0.8),
             eager_eot_threshold=getattr(cfg, "deepgram_eager_eot_threshold", 0.5),
+            eot_timeout_ms=getattr(cfg, "deepgram_eot_timeout_ms", 4000),
         )
 
     if name == "openai_stream":
