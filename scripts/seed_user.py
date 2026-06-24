@@ -23,10 +23,11 @@ import asyncio
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import weaviate
 import weaviate.classes as wvc
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.app.config import settings
@@ -37,6 +38,48 @@ from backend.app.memory.embeddings import embed
 from backend.app.observability.logging import get_logger, setup_logging
 
 setup_logging("info")
+
+
+def _alembic_head() -> str:
+    """Head revision id, read from the migration files (no DB, no cwd dependency)."""
+    from alembic.config import Config  # noqa: PLC0415
+    from alembic.script import ScriptDirectory  # noqa: PLC0415
+
+    cfg = Config()
+    cfg.set_main_option(
+        "script_location", str(Path(__file__).resolve().parent.parent / "alembic")
+    )
+    return ScriptDirectory.from_config(cfg).get_current_head() or ""
+
+
+async def _stamp_alembic(conn) -> None:
+    """Stamp alembic to head after ``create_all``.
+
+    The seed builds the schema with ``Base.metadata.create_all``; without this,
+    the app container's startup ``alembic upgrade head`` then tries to re-create
+    the tables and crash-loops with "relation users already exists" on a fresh
+    DB. Stamping makes that upgrade a no-op. Only writes when ``alembic_version``
+    is empty, so it never clobbers a real migration state.
+    """
+    head = _alembic_head()
+    if not head:
+        return
+    await conn.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS alembic_version ("
+            "version_num VARCHAR(32) NOT NULL "
+            "CONSTRAINT alembic_version_pkc PRIMARY KEY)"
+        )
+    )
+    existing = (
+        await conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
+    ).first()
+    if existing is None:
+        await conn.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:v)"), {"v": head}
+        )
+
+
 log = get_logger(__name__)
 
 # Stable, deterministic UUID so the demo user is the same across re-seeds and the
@@ -203,6 +246,7 @@ async def reset_user() -> None:
     engine = create_async_engine(settings.database_url, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _stamp_alembic(conn)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as session:
         session: AsyncSession
@@ -259,6 +303,7 @@ async def seed_postgres() -> None:
     engine = create_async_engine(settings.database_url, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _stamp_alembic(conn)
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as session:
