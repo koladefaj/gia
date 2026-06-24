@@ -15,14 +15,14 @@ ARG STT_MODEL=large-v3
 # ~200MB (CPU torch) + the MiniLM encoder; opt-in so the lean image stays lean.
 ARG INSTALL_ROUTER_CLASSIFIER=false
 
-# System dependencies:
-#   nodejs / npm  — spawn the marcelmarais/spotify-mcp-server over MCP stdio
-#                   (it is a Node process; the api container is its parent).
-#   espeak-ng     — Kokoro's grapheme→phoneme fallback for out-of-vocabulary words.
-#   ffmpeg        — faster-whisper uses it to decode WebM/OGG audio from MediaRecorder.
-# python:3.12-slim is Debian trixie, which ships Node 20 (>= the MCP SDK's 18).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        nodejs npm espeak-ng ffmpeg \
+# System dependencies. nodejs/npm are always needed (the Spotify MCP server is a
+# Node process spawned over stdio). espeak-ng (Kokoro's phonemizer) and ffmpeg
+# (faster-whisper's WebM/OGG decoder) are only needed for the local TTS/STT paths,
+# so they're gated on those args — no point shipping them on a Deepgram+ElevenLabs
+# image. python:3.12-slim is Debian trixie, which ships Node 20 (>= MCP SDK's 18).
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+    && if [ "$INSTALL_LOCAL_TTS" = "true" ]; then apt-get install -y --no-install-recommends espeak-ng; fi \
+    && if [ "$INSTALL_LOCAL_STT" = "true" ]; then apt-get install -y --no-install-recommends ffmpeg; fi \
     && rm -rf /var/lib/apt/lists/*
 
 # Generous timeout + retries so a slow PyPI mirror doesn't abort the build

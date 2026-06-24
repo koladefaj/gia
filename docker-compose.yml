@@ -65,16 +65,9 @@ services:
         # Distilled local router classifier (CPU torch + MiniLM, ~200MB). Adds the
         # ~10ms local-routing tier; requires a rebuild to take effect.
         INSTALL_ROUTER_CLASSIFIER: "true"
-    # Pass the host GPU (RTX 4060) through so faster-whisper transcribes on CUDA
-    # instead of CPU — several times faster, lower per-turn latency. Falls back
-    # to CPU automatically if the GPU isn't available (see stt._pick_device).
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # No GPU reservation: STT is Deepgram (cloud), TTS is ElevenLabs (cloud), and
+    # the router classifier runs on CPU torch. Re-add a `deploy.resources` nvidia
+    # device reservation only if you flip INSTALL_LOCAL_STT back on for GPU whisper.
     ports:
       - "8000:8000"
     env_file: .env
@@ -87,10 +80,6 @@ services:
       # Real TTS via ElevenLabs (v3 for emotional lines, flash for logistics).
       # ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID come from .env.
       TTS_PROVIDER: elevenlabs
-      # STT model for the local path. large-v3 is baked into the image. STT_PROVIDER
-      # (in .env) selects local-GPU vs the OpenAI Whisper API; on local large-v3 and
-      # the OpenAI API measured ~the same latency (~2s), so .env currently uses openai.
-      STT_MODEL: large-v3
       # Never write .pyc — Windows bind-mount mtimes are unreliable, so cached
       # bytecode goes stale and the reloader keeps running old code.
       PYTHONDONTWRITEBYTECODE: "1"
