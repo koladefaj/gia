@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     # Conservative — only the unambiguous-chat case short-circuits; anything that
     # might need query resolution still goes to the LLM. Flip off to force the LLM.
     router_fast_path_enabled: bool = Field(default=True)
+    # Tier-2: the distilled local classifier (frozen MiniLM + linear heads, see
+    # ml/router). Predicts the categorical decision in ~20-40ms on CPU for the
+    # confident no-query-resolution turns, skipping the ~1.4s LLM router. OFF by
+    # default: needs sentence-transformers (torch) + the trained model present, so
+    # it's opt-in for environments that have them. Degrades to the LLM if absent.
+    router_local_enabled: bool = Field(default=False)
 
     # --- Spotify ---
     spotify_client_id: str = Field(default="")

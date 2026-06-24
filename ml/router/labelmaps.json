@@ -1,0 +1,28 @@
+{
+  "intent": [
+    "ARTIST_INFO",
+    "GENERAL_CHAT",
+    "MEMORY_QUERY",
+    "MIXED",
+    "MOOD_CHECK",
+    "MUSIC_FIND",
+    "MUSIC_QUEUE",
+    "NEWS_QUERY"
+  ],
+  "tone": [
+    "confident",
+    "curious",
+    "empathetic",
+    "excited",
+    "playful",
+    "surprised",
+    "thoughtful",
+    "warm"
+  ],
+  "engagement_mode": [
+    "clarify",
+    "confirm_action",
+    "direct_execute",
+    "react_then_execute"
+  ]
+}

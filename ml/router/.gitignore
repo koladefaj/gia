@@ -1,9 +1,8 @@
-# Generated training artifacts — regenerable from Langfuse + the generator.
+# Regenerable training data (pull from Langfuse + the generator). Kept out of git.
 dataset.jsonl
 synthetic.jsonl
 train.jsonl
-eval_report.txt
-# Model weights (frozen encoder is downloaded; heads are small but kept out of git).
-heads.joblib
-labelmaps.json
 __pycache__/
+# NOTE: heads.joblib, labelmaps.json, and eval_report.txt ARE committed (tiny,
+# ~40KB) so the classifier serves and the accuracy is documented without a
+# training step. The frozen MiniLM encoder is downloaded by sentence-transformers.

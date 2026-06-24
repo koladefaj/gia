@@ -50,6 +50,7 @@ from backend.app.agents.hybrid_router import classify_turn, fast_keyword_decisio
 from backend.app.agents.mood import MoodService
 from backend.app.agents.planner import _wants_weather
 from backend.app.agents.router import _keyword_classify
+from backend.app.agents.router_local import classify_local
 from backend.app.agents.synthesis import synthesize_reply
 from backend.app.config import Settings
 from backend.app.dependencies import (
@@ -623,13 +624,20 @@ async def _run_crew(
                 if cfg.router_fast_path_enabled else None
             )
             fast_path = decision is not None
+            local_path = False
             prewarmed = False
+            if decision is None and cfg.router_local_enabled:
+                # Tier-2: the distilled local classifier (~20-40ms CPU) handles the
+                # confident chat/mood/memory turns the keyword path misses, skipping
+                # the ~1.4s LLM. Returns None (→ LLM) when unsure or query-resolving.
+                decision = await asyncio.to_thread(classify_local, request.message)
+                local_path = decision is not None
             if decision is None:
-                # Tier-2: reuse the decision the eager prewarm already started.
+                # Tier-3: reuse the decision the eager prewarm already started.
                 decision = await router_prewarm.take(redis, session_id, request.message)
                 prewarmed = decision is not None
             if decision is None:
-                # Tier-3: classify cold. Created inside the span so the OpenAI
+                # Tier-4: classify cold. Created inside the span so the OpenAI
                 # drop-in generation nests under "router" (asyncio tasks inherit
                 # the current OTel context).
                 router_task = asyncio.create_task(
@@ -647,7 +655,10 @@ async def _run_crew(
                 decision.start_playback = False
             steps = [] if now_playing_query else _steps_for_decision(decision)
             signals = ["weather"] if _wants_weather(request.message, steps) else []
-            _src = "fast" if fast_path else "prewarmed" if prewarmed else "llm"
+            _src = (
+                "fast" if fast_path else "local" if local_path
+                else "prewarmed" if prewarmed else "llm"
+            )
             span.set_output(
                 f"{intent.value}/{decision.tone.value}/{decision.engagement_mode.value} ({_src})"
             )
@@ -659,6 +670,7 @@ async def _run_crew(
                 "confidence": round(confidence, 2),
                 "prewarmed": prewarmed,
                 "fast_path": fast_path,
+                "local_path": local_path,
                 "latency_ms": round((time.monotonic() - router_t0) * 1000, 1),
             })
         yield _sse("plan", {
