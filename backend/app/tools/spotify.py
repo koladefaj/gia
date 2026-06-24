@@ -57,14 +57,14 @@ def _span(cfg: Settings, name: str) -> Generator[Any, None, None]:
     """Yield a Langfuse span or a no-op context when tracing is disabled."""
     if cfg.langfuse_enabled:
         try:
-            from langfuse import Langfuse  # noqa: PLC0415
+            # Reuse the process-wide client registered at startup (don't build a
+            # new Langfuse per tool call) and the v4 API — the old start_span()
+            # doesn't exist on the v4 client and was failing on every call.
+            from langfuse import get_client  # noqa: PLC0415
 
-            lf = Langfuse(
-                public_key=cfg.langfuse_public_key,
-                secret_key=cfg.langfuse_secret_key,
-                host=cfg.langfuse_host,
-            )
-            with lf.start_span(name=name) as span:
+            with get_client().start_as_current_observation(
+                as_type="span", name=name
+            ) as span:
                 yield span
             return
         except Exception as exc:  # noqa: BLE001
