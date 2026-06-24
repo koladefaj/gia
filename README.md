@@ -28,7 +28,7 @@ flowchart LR
 
     subgraph Turn["Single turn — started concurrently"]
         direction TB
-        ROUTER[Router · gpt-4o-mini<br/>intent · tone · plan]
+        ROUTER[Router cascade<br/>keyword · distilled · prewarm · gpt-4o-mini]
         MEM[Memory context<br/>parallel fan-out]
         SPECREPLY[Speculative reply<br/>generated under the router]
         SPECSEARCH[Speculative Spotify search<br/>for play/queue commands]
@@ -57,7 +57,7 @@ flowchart LR
     API -.scores.-> LF[Langfuse]
 ```
 
-**Stack:** FastAPI (SSE + WebSocket streaming) · CrewAI-style agents · Weaviate (hybrid vector search) · Postgres (SQLAlchemy async) · Redis (session/cache/throttles) · Celery (reflection workers) · Langfuse (tracing + self-eval scores) · OpenAI / Anthropic / Ollama behind one provider abstraction · ElevenLabs v3/flash streaming TTS (Kokoro for local dev) · **Deepgram Flux** streaming STT over WebSocket, provider-agnostic behind `STT_PROVIDER` (OpenAI Realtime alternate; `whisper-1` / local faster-whisper as batch fallback) · Next.js voice frontend with an AudioWorklet capture + MediaSource progressive playback · Spotify via an MCP server.
+**Stack:** FastAPI (SSE + WebSocket streaming) · CrewAI-style agents · Weaviate (hybrid vector search) · Postgres (SQLAlchemy async) · Redis (session/cache/throttles) · Celery (reflection workers) · Langfuse (tracing + self-eval scores) · OpenAI / Anthropic / Ollama behind one provider abstraction · ElevenLabs v3/flash streaming TTS (Kokoro for local dev) · **Deepgram Flux** streaming STT over WebSocket, provider-agnostic behind `STT_PROVIDER` (OpenAI Realtime alternate; `whisper-1` / local faster-whisper as batch fallback) · Next.js voice frontend with an AudioWorklet capture + MediaSource progressive playback · Spotify via an MCP server · a distilled local router classifier (frozen MiniLM + scikit-learn heads, `ml/router/`) as the fast tier of the router cascade.
 
 ---
 
@@ -78,6 +78,19 @@ The metric isn't total response time — it's **TTFA**, when the user first hear
 **6. Streaming STT, and a router that starts before you finish.** The front of the pipe was the last serial block: record → upload → transcribe meant **~1.5–2.8s of dead air** before `/chat` could even begin. The fix is a transport change — the browser captures the mic through an **AudioWorklet** and streams 24 kHz PCM frames over a WebSocket to a provider-agnostic streaming-STT layer (behind the same `STT_PROVIDER` switch as everything else). I chose **Deepgram Flux** (`/v2/listen`), the conversational model that does end-of-turn detection itself — so the client-side silence timer goes away, and the turn fires the instant Flux emits a confirmed `EndOfTurn`.
 
 The same model unlocks **early-intent**: Flux emits an `EagerEndOfTurn` a beat *before* the user actually stops, with a transcript it guarantees will match the final. So the client fires `/chat/prewarm` on that eager text, the `gpt-4o-mini` router starts immediately, and when `/chat` arrives with the final transcript it **reuses the in-flight decision** instead of classifying cold — moving the router's ~2s off the critical path for the music/specialist turns where it was still serial. It's gated exactly like the speculative reply: classification is read-only, the prewarm key is the *exact* normalised transcript, and all search/playback still waits for the final, so a corrected utterance never acts on the wrong words. The prewarm result is cached in Redis, so the head start survives even when prewarm and `/chat` land on different workers. Both the streaming pipe and the prewarm reuse are validated end-to-end against the live Deepgram API; a full browser TTFA re-measure is the next step.
+
+**7. A four-tier router cascade — and a distilled local classifier for the rest.** Profiling the traces showed the router was *still* the floor: even prewarmed, `gpt-4o-mini` is ~1.4s, and the eager lead time often isn't long enough to fully hide it. So the router became a cascade, fastest tier first:
+
+```
+keyword (sub-ms)        → explicit greetings / play commands
+distilled classifier (~10ms, CPU)  → the confident chat/mood/memory majority   ← new
+eager prewarm reuse     → music/specialist turns the eager signal got ahead of
+cold gpt-4o-mini (~1.4s) → the genuinely ambiguous tail + anything needing a query
+```
+
+The new tier is a **distilled classifier**: every `router-classify` decision Langfuse has logged is a `(message → RouterDecision)` label, so the production `gpt-4o-mini` router is the **teacher** and a tiny local model is the **student**. The student is a *frozen* `all-MiniLM-L6-v2` sentence encoder + small `scikit-learn` linear heads — **not** an end-to-end fine-tune, which would be slow on CPU and overfit thin data. It predicts only the **categorical** fields (`intent`, `tone`, `engagement`, the `needs_*` flags) in **~10ms on CPU**; it never produces the free-form `search_query`, so it's gated to the intents that don't need one (`GENERAL_CHAT` / `MOOD_CHECK` / `MEMORY_QUERY`) and only when its top-class confidence clears a threshold. Everything else — music, artist, news, mixed, or low-confidence — falls through to the LLM, so **net accuracy stays the teacher's; only latency changes**. On the confident chat majority that's **~10ms instead of ~1.4s**.
+
+The honest part is the data: the real corpus was 410 examples, 59% `GENERAL_CHAT`, with `MOOD_CHECK`/`MIXED`/`ARTIST_INFO` in single digits — unlearnable as-is. I balanced it by generating varied phrasings per intent and **labelling each with the production router** (teacher labels, not my guesses), to ~1,440 examples. Held-out intent accuracy is **0.78** — fine *because* it's confidence-gated. It's trained partly on synthetic data, so it's OFF by default and would be retrained as real traffic accumulates; the whole pipeline (extract → augment → train → serve) lives in [`ml/router/`](ml/router/). The point isn't the model — it's the cascade design, the confidence gating, and being straight about the data.
 
 ### The feature I built, measured, and deleted
 
@@ -107,7 +120,8 @@ All numbers are end-to-end, measured from Langfuse traces and container-level mi
 |---|---:|---|
 | STT — batch (OpenAI `whisper-1`) | ~1.5–2.8s | the old serial cost, before `/chat`; now the **fallback** path |
 | STT — streaming (Deepgram Flux) | first interim <~0.3s, no serial wait | model does end-of-turn; the turn fires on `EndOfTurn`, the **new default** |
-| Router (`gpt-4o-mini`, JSON) | ~1.6–2.7s | occasional spike to ~6s (model variance); **overlapped via eager prewarm** on streaming turns |
+| Router — LLM (`gpt-4o-mini`, JSON) | ~1.6–2.7s | occasional spike to ~6s; **overlapped via eager prewarm**; the tail tier |
+| Router — distilled (MiniLM + linear heads, CPU) | **~7–10ms** | the confident chat/mood/memory majority; 0.78 held-out intent acc, confidence-gated |
 | Conversational reply (`gpt-4o` stream) | TTFT ~0.7–1.1s | **overlapped under the router** via speculation |
 | DJ specialist | ~2.8–4.5s | Spotify search ~2s + recommendation LLM ~1–2s; search removed from the path when speculation hits |
 | TTS | was ~3.3s blocking → **streamed first byte <1s** | the headline win |
@@ -186,7 +200,7 @@ Stated plainly, because honest scope reads better than a flawless pitch:
 
 - **Browser playback is verified by types/tests, not a full cross-browser pass.** The progressive `MediaSource` playback is unit-tested and type-checked end-to-end; a manual smoke test across browsers is still pending. Safari's `MediaSource` support for `audio/mpeg` is limited — Chrome/Edge/Firefox are the supported targets.
 - **Speculation only helps "guessable" music commands.** *"play some Drake"* lets the search run early; *"yeah, that one"* / *"land on something"* resolve from conversation history, so the query can't be pre-guessed and those turns pay the full serial `router → search → phrase`.
-- **The router is the latency wild card — softened, not erased.** `gpt-4o-mini` usually classifies in ~2s but occasionally spikes to ~6s. Early-intent now overlaps it with the user's last words on streaming turns, but the win is largest on longer utterances (more eager lead time) and small on short clipped commands (*"play Drake."*) where eager and final nearly coincide. A local/cached classifier is still the next lever for the tail.
+- **The router was the latency wild card — now largely tamed.** `gpt-4o-mini` is ~1.4s (spikes to ~6s). Three tiers now keep it off the hot path: the keyword fast-path, the distilled local classifier (~10ms for the confident chat majority), and eager prewarm for the rest — the cold LLM only runs on the genuinely ambiguous tail or turns needing a resolved `search_query`. The remaining caveat is the classifier's data: held-out accuracy is 0.78 and it's trained partly on synthetic phrasings, so it's confidence-gated (misses fall back to the LLM) and OFF by default until there's enough real traffic to retrain on.
 - **Streaming STT is validated against the live API, not yet browser-measured.** The Deepgram Flux pipe and the prewarm reuse are proven end-to-end server-side; the full in-browser TTFA with the AudioWorklet capture is the pending measurement. If streaming is unavailable, the client falls back to the batch `whisper-1` path automatically.
 - **One seeded demo user.** The memory and mood systems are structurally complete but validated against synthetic history, not real usage at scale — by design (see above).
 - **Dev ergonomics traded for stability.** `uvicorn --reload` is disabled in Docker because the file watcher is unstable on Windows bind mounts; code changes need a container recreate locally.
@@ -226,8 +240,9 @@ pytest -q
 
 ## Roadmap
 
+- Retrain the distilled router on **real** traffic (it's currently bootstrapped on synthetic + teacher labels) and lower the confidence gate as accuracy climbs
 - Memory consolidation → user-state precompute (mood, top artists, weekly trend) as a cached snapshot
-- LLM-as-judge self-evaluation, sampled from Langfuse traces
+- LLM-as-judge self-evaluation + a small Ragas-style RAG eval, sampled from Langfuse traces (deferred until there's real query traffic to grade)
 - Real-time voice with barge-in (WebRTC)
 - User-editable memory ("Gia, forget that")
 - Shared listening — two users, one queue
