@@ -11,6 +11,9 @@ ARG INSTALL_LOCAL_STT=true
 # Whisper model baked into the image. large-v3 is multilingual and far better on
 # accented English (Nigerian, etc.) than base.en; it runs on the GPU at runtime.
 ARG STT_MODEL=large-v3
+# Distilled local router classifier (sentence-transformers + sklearn, CPU). Adds
+# ~200MB (CPU torch) + the MiniLM encoder; opt-in so the lean image stays lean.
+ARG INSTALL_ROUTER_CLASSIFIER=false
 
 # System dependencies:
 #   nodejs / npm  — spawn the marcelmarais/spotify-mcp-server over MCP stdio
@@ -58,6 +61,19 @@ RUN if [ "$INSTALL_LOCAL_STT" = "true" ]; then \
 RUN if [ "$INSTALL_LOCAL_STT" = "true" ]; then \
         uv pip install --python /app/.venv \
             "nvidia-cublas-cu12" "nvidia-cudnn-cu12>=9.0,<10"; \
+    fi
+
+# Distilled router classifier serving. Install CPU-only torch explicitly (the
+# default sentence-transformers dep would pull the ~2GB CUDA torch wheel; the
+# classifier serves on CPU), then sentence-transformers + sklearn + joblib.
+RUN if [ "$INSTALL_ROUTER_CLASSIFIER" = "true" ]; then \
+        uv pip install --python /app/.venv torch --index-url https://download.pytorch.org/whl/cpu && \
+        uv pip install --python /app/.venv "sentence-transformers>=3.0.0" "scikit-learn>=1.4.0" joblib; \
+    fi
+
+# Bake the MiniLM encoder into the image so the first local-route is instant.
+RUN if [ "$INSTALL_ROUTER_CLASSIFIER" = "true" ]; then \
+        /app/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"; \
     fi
 
 # Pre-download Kokoro's model + default voice INTO the image (one synth warms

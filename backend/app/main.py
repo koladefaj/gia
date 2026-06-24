@@ -97,6 +97,17 @@ async def _prewarm_openai() -> None:
     await get_async_openai(settings).models.list()
 
 
+async def _prewarm_router_local() -> None:
+    """Load the distilled classifier (encoder + heads) into memory at startup so
+    the first local-routed turn doesn't pay the one-time model load. No-op when
+    the local router is disabled or its deps/model are absent."""
+    if not settings.router_local_enabled:
+        return
+    from backend.app.agents.router_local import classify_local
+
+    await asyncio.to_thread(classify_local, "hello")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application-scoped resources for the lifetime of the process.
@@ -148,9 +159,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.spotify.prewarm(),
         _prewarm_stt(),
         _prewarm_openai(),
+        _prewarm_router_local(),
         return_exceptions=True,
     )
-    for name, result in zip(("postgres", "redis", "spotify", "stt", "openai"), results, strict=True):
+    for name, result in zip(
+        ("postgres", "redis", "spotify", "stt", "openai", "router_local"),
+        results, strict=True,
+    ):
         if isinstance(result, Exception):
             logger.warning("prewarm_failed", service=name, error=str(result))
         else:

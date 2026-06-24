@@ -62,6 +62,9 @@ services:
         # here and rebuild — but only on a fast connection (the model is ~1.6GB and
         # the bake pulls apt packages too). On a slow link the build is impractical.
         INSTALL_LOCAL_STT: "true"
+        # Distilled local router classifier (CPU torch + MiniLM, ~200MB). Adds the
+        # ~10ms local-routing tier; requires a rebuild to take effect.
+        INSTALL_ROUTER_CLASSIFIER: "true"
     # Pass the host GPU (RTX 4060) through so faster-whisper transcribes on CUDA
     # instead of CPU — several times faster, lower per-turn latency. Falls back
     # to CPU automatically if the GPU isn't available (see stt._pick_device).
@@ -102,6 +105,10 @@ services:
       SPOTIFY_MCP_COMMAND: node
       SPOTIFY_MCP_SERVER_PATH: /opt/spotify-mcp-server/build/index.js
       SPOTIFY_CONFIG_PATH: /opt/spotify-mcp-server/spotify-config.json
+      # Enable the distilled local router tier (needs the image built with
+      # INSTALL_ROUTER_CLASSIFIER=true). Override in .env. No-ops to the LLM path
+      # if the deps/model are missing, so it's safe even on an un-rebuilt image.
+      ROUTER_LOCAL_ENABLED: "${ROUTER_LOCAL_ENABLED:-true}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -115,6 +122,9 @@ services:
       - ./backend:/app/backend
       - ./frontend:/app/frontend
       - ./scripts:/app/scripts
+      # The trained classifier heads live here; mount so a retrain on the host is
+      # picked up without an image rebuild.
+      - ./ml:/app/ml
       # The patched Spotify MCP server (sibling clone). node_modules + build are
       # shadowed by named volumes so they are (re)built Linux-native in-container.
       - ../spotify-mcp-server:/opt/spotify-mcp-server
