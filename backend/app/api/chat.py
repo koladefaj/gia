@@ -70,7 +70,7 @@ from backend.app.mood.ingest import ingest_recently_played
 from backend.app.mood.proactive import pop_proactive_draft
 from backend.app.observability.langfuse import crew_trace
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import is_emotional, synthesize, synthesize_stream
+from backend.app.providers.tts import should_use_v3, synthesize, synthesize_stream
 from backend.app.schemas.chat import ChatRequest, IntentType
 from backend.app.schemas.dj import TrackItem
 from backend.app.schemas.router import RouterDecision
@@ -300,9 +300,9 @@ async def _stream_reply_frames(
     if not full:
         return
 
-    # is_emotional(full) picks ONE model for the whole reply (no mid-reply
-    # flash↔v3 hop): any tag or a question → eleven_v3, else eleven_flash.
-    emotional = is_emotional(full)
+    # should_use_v3(full) picks ONE model for the whole reply (no mid-reply
+    # flash↔v3 hop): TTS_FORCE_V3 forces eleven_v3, else any tag/question → v3.
+    emotional = should_use_v3(full)
     started = False
     seq = 0
     try:

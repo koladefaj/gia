@@ -115,6 +115,11 @@ class Settings(BaseSettings):
     tts_provider: str = Field(default="elevenlabs")
     elevenlabs_api_key: str = Field(default="")
     elevenlabs_voice_id: str = Field(default="")
+    # Force eleven_v3 (warm, expressive) for EVERY line instead of the hybrid that
+    # drops plain logistics sentences to the faster-but-flatter eleven_flash_v2_5.
+    # ON for a consistently warm voice (the voice is the product); flash is ~1.1s
+    # faster per turn, so flip OFF to trade warmth for latency.
+    tts_force_v3: bool = Field(default=True)
 
     # --- Brave Search ---
     brave_api_key: str = Field(default="")
