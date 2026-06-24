@@ -234,7 +234,7 @@ curl localhost:8000/health
 pytest -q
 ```
 
-> STT defaults to **streaming Deepgram Flux** (`STT_PROVIDER=deepgram`); set `openai` or `local` for the batch fallback. The GPU passthrough in `docker-compose.yml` is for that local `faster-whisper` fallback; it falls back to CPU automatically.
+> STT defaults to **streaming Deepgram Flux** (`STT_PROVIDER=deepgram`). The api image no longer bakes local `faster-whisper` (`INSTALL_LOCAL_STT=false`) — it isn't needed for streaming, and it pulled ~1.3GB of CUDA wheels + a ~3GB model. If the streaming socket ever fails, the one-shot `/voice/transcribe` fallback auto-routes to the **OpenAI Whisper API**. Set `INSTALL_LOCAL_STT=true` only to run whisper locally on the GPU.
 
 ---
 

@@ -57,11 +57,11 @@ services:
         # ElevenLabs is HTTP-only (no package). Flip back to "true" only if you
         # want zero-cost local TTS while iterating.
         INSTALL_LOCAL_TTS: "false"
-        # Keep faster-whisper for local STT (voice input from the browser).
-        # NOTE: to bake the faster `large-v3-turbo` model, add `STT_MODEL: "large-v3-turbo"`
-        # here and rebuild — but only on a fast connection (the model is ~1.6GB and
-        # the bake pulls apt packages too). On a slow link the build is impractical.
-        INSTALL_LOCAL_STT: "true"
+        # STT is Deepgram Flux streaming (STT_PROVIDER=deepgram), so skip local
+        # faster-whisper entirely — it would otherwise pull ctranslate2 + the
+        # ~1.3GB nvidia CUDA wheels and bake the ~3GB large-v3 model for nothing.
+        # Flip back to "true" only to run the local/batch whisper fallback on GPU.
+        INSTALL_LOCAL_STT: "false"
         # Distilled local router classifier (CPU torch + MiniLM, ~200MB). Adds the
         # ~10ms local-routing tier; requires a rebuild to take effect.
         INSTALL_ROUTER_CLASSIFIER: "true"
