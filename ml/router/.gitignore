@@ -1,0 +1,9 @@
+# Generated training artifacts — regenerable from Langfuse + the generator.
+dataset.jsonl
+synthetic.jsonl
+train.jsonl
+eval_report.txt
+# Model weights (frozen encoder is downloaded; heads are small but kept out of git).
+heads.joblib
+labelmaps.json
+__pycache__/
