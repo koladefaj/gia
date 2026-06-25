@@ -85,7 +85,11 @@ def _transcribe_sync(audio_bytes: bytes, model_name: str, language: str | None) 
             io.BytesIO(audio_bytes),
             language=language,
             beam_size=1,  # greedy — ~2x faster than beam search, fine for short turns
-            vad_filter=True,  # drops leading/trailing silence → less audio to decode
+            # No server-side VAD: the frontend already segments on voice activity,
+            # so a second VAD pass here is redundant — and on short, browser-decoded
+            # (webm/opus) clips it was misclassifying the whole utterance as silence
+            # and dropping it, producing empty transcripts. Trust the client's turn.
+            vad_filter=False,
             condition_on_previous_text=False,  # no context carry → faster, fewer loops
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()

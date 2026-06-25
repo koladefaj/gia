@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import io
 import re
+from collections.abc import AsyncIterator
 from functools import lru_cache
 
 from backend.app.observability.logging import get_logger
@@ -40,12 +41,21 @@ _AUDIO_TAG_RE = re.compile(r"\[[a-z][a-z ]*\]", re.IGNORECASE)
 def strip_audio_tags(text: str) -> str:
     """Remove ElevenLabs-style ``[audio tags]`` and tidy the leftover spacing.
 
-    ElevenLabs v3 interprets tags like ``[warmly]`` as delivery cues, but a
-    plain TTS engine (Kokoro) would read the literal word "warmly" aloud. We
+    ElevenLabs v3 interprets tags like ``[warm]`` as delivery cues, but a
+    plain TTS engine (Kokoro) would read the literal word "warm" aloud. We
     strip them so local audio stays clean; the production ElevenLabs path keeps
     the tags untouched.
     """
     return re.sub(r"\s{2,}", " ", _AUDIO_TAG_RE.sub("", text)).strip()
+
+
+def has_audio_tag(text: str) -> bool:
+    """Return ``True`` when *text* contains an ElevenLabs ``[audio tag]``.
+
+    Used to decide whether a line already carries a v3 delivery cue (so callers
+    can add one when it doesn't, routing the line to the expressive model).
+    """
+    return bool(_AUDIO_TAG_RE.search(text))
 
 
 def is_emotional(sentence: str) -> bool:
@@ -99,7 +109,7 @@ def _kokoro_synthesize_sync(text: str, voice: str = "af_heart") -> bytes:
         return b""
 
     # Kokoro has no notion of delivery tags — strip them so it doesn't read
-    # "[warmly]" aloud. Empty after stripping → nothing to synthesise.
+    # "[warm]" aloud. Empty after stripping → nothing to synthesise.
     text = strip_audio_tags(text)
     if not text:
         return b""
@@ -124,6 +134,60 @@ def _kokoro_synthesize_sync(text: str, voice: str = "af_heart") -> bytes:
 
 # ── ElevenLabs v3 ─────────────────────────────────────────────────────────────
 
+_ELEVEN_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
+# Voice settings shared by the blocking and streaming paths — one place to tune.
+_VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75}
+
+# Pooled async client: a fresh AsyncClient per call paid a TLS handshake every
+# turn (a real chunk of TTS latency). One keep-alive pool reuses the connection.
+_http_client = None  # type: ignore[var-annotated]
+
+
+def _get_http_client():
+    """Return the process-wide pooled httpx client (built on first use)."""
+    global _http_client
+    if _http_client is None:
+        import httpx
+
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=60.0),
+        )
+    return _http_client
+
+
+async def aclose_http_client() -> None:
+    """Close the pooled client on app shutdown (idempotent)."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
+def _eleven_model(emotional: bool) -> str:
+    """Pick the ElevenLabs model: expressive ``eleven_v3`` vs faster flash."""
+    # eleven_v3 carries the emotional warmth + audio-tag rendering; it needs the
+    # full reply (~250+ chars) for good prosody, which is why we synthesize the
+    # whole reply at once rather than per sentence.
+    return "eleven_v3" if emotional else "eleven_flash_v2_5"
+
+
+def _eleven_payload(text: str, emotional: bool) -> dict:
+    """Build the JSON body for an ElevenLabs synthesis request."""
+    return {
+        "text": text,
+        "model_id": _eleven_model(emotional),
+        "voice_settings": _VOICE_SETTINGS,
+    }
+
+
+def _eleven_headers(api_key: str) -> dict:
+    return {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+
 
 async def _elevenlabs_synthesize(
     text: str,
@@ -131,7 +195,7 @@ async def _elevenlabs_synthesize(
     voice_id: str,
     emotional: bool = False,
 ) -> bytes:
-    """Synthesize *text* with ElevenLabs v3 (async HTTP call).
+    """Synthesize *text* with ElevenLabs v3 (async HTTP call, whole file).
 
     Args:
         text:      Text to synthesize (audio tags are passed through).
@@ -146,32 +210,54 @@ async def _elevenlabs_synthesize(
         logger.debug("elevenlabs_no_key")
         return b""
 
-    model_id = "eleven_v3" if emotional else "eleven_flash_v2_5"
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                url,
-                json={
-                    "text": text,
-                    "model_id": model_id,
-                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-                },
-                headers={
-                    "xi-api-key": api_key,
-                    "Content-Type": "application/json",
-                    "Accept": "audio/mpeg",
-                },
-            )
-            resp.raise_for_status()
-            logger.debug("elevenlabs_ok", model=model_id, chars=len(text))
-            return resp.content
+        client = _get_http_client()
+        resp = await client.post(
+            f"{_ELEVEN_BASE}/{voice_id}",
+            json=_eleven_payload(text, emotional),
+            headers=_eleven_headers(api_key),
+        )
+        resp.raise_for_status()
+        logger.debug("elevenlabs_ok", model=_eleven_model(emotional), chars=len(text))
+        return resp.content
     except Exception as exc:  # noqa: BLE001
         logger.warning("elevenlabs_error", error=str(exc))
         return b""
+
+
+async def _elevenlabs_stream(
+    text: str,
+    api_key: str,
+    voice_id: str,
+    emotional: bool = False,
+) -> AsyncIterator[bytes]:
+    """Stream MP3 audio for *text* from ElevenLabs' ``/stream`` endpoint.
+
+    The whole reply text is sent up-front (so v3 keeps full-context prosody and
+    tag rendering), but audio bytes are forwarded as they are generated — first
+    bytes arrive well before the complete file, cutting time-to-first-audio.
+
+    Yields raw MP3 byte chunks; yields nothing on error / missing key.
+    """
+    if not api_key:
+        logger.debug("elevenlabs_no_key")
+        return
+
+    try:
+        client = _get_http_client()
+        async with client.stream(
+            "POST",
+            f"{_ELEVEN_BASE}/{voice_id}/stream",
+            json=_eleven_payload(text, emotional),
+            headers=_eleven_headers(api_key),
+        ) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes():
+                if chunk:
+                    yield chunk
+        logger.debug("elevenlabs_stream_ok", model=_eleven_model(emotional), chars=len(text))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("elevenlabs_stream_error", error=str(exc))
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -203,3 +289,39 @@ async def synthesize(
         return await _elevenlabs_synthesize(text, api_key, voice_id, emotional)
 
     return await asyncio.to_thread(_kokoro_synthesize_sync, text, voice)
+
+
+async def synthesize_stream(
+    text: str,
+    *,
+    provider: str = "kokoro",
+    api_key: str = "",
+    voice_id: str = "",
+    voice: str = "af_heart",
+) -> AsyncIterator[bytes]:
+    """Stream audio bytes for *text* as they are produced by the provider.
+
+    For ElevenLabs this hits the ``/stream`` endpoint so the first audio bytes
+    reach the caller before the whole file is rendered — the latency win. Kokoro
+    has no streaming API, so it falls back to a single synthesized blob (still
+    correct, just not progressive). Yields nothing when the provider is
+    unavailable.
+
+    Args:
+        text:     Text to synthesise (audio tags supported for ElevenLabs v3).
+        provider: ``"kokoro"`` or ``"elevenlabs"``.
+        api_key:  ElevenLabs API key (ignored for Kokoro).
+        voice_id: ElevenLabs voice ID (ignored for Kokoro).
+        voice:    Kokoro voice code (ignored for ElevenLabs).
+
+    Yields:
+        Raw audio byte chunks (MP3 for ElevenLabs, one WAV blob for Kokoro).
+    """
+    if provider == "elevenlabs":
+        async for chunk in _elevenlabs_stream(text, api_key, voice_id, is_emotional(text)):
+            yield chunk
+        return
+
+    blob = await asyncio.to_thread(_kokoro_synthesize_sync, text, voice)
+    if blob:
+        yield blob

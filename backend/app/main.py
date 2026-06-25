@@ -44,6 +44,7 @@ from backend.app.api import (
     onboarding,
     playlist,
     voice,
+    voice_stream,
 )
 from backend.app.config import settings
 from backend.app.db.session import engine
@@ -79,6 +80,21 @@ async def _prewarm_stt() -> None:
     from backend.app.providers.stt import warmup
 
     await asyncio.to_thread(warmup, settings.stt_model)
+
+
+async def _prewarm_openai() -> None:
+    """Open the TCP+TLS connection to OpenAI at startup so the first router/reply
+    call doesn't pay the ~300-460ms handshake mid-turn.
+
+    A keyless ``models.list`` establishes a pooled connection (no tokens, no cost)
+    that the keepalive client then holds open for subsequent turns. No-op when no
+    OpenAI key is configured.
+    """
+    if not settings.openai_api_key:
+        return
+    from backend.app.providers.openai_client import get_async_openai
+
+    await get_async_openai(settings).models.list()
 
 
 @asynccontextmanager
@@ -131,9 +147,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.redis.ping(),
         app.state.spotify.prewarm(),
         _prewarm_stt(),
+        _prewarm_openai(),
         return_exceptions=True,
     )
-    for name, result in zip(("postgres", "redis", "spotify", "stt"), results, strict=True):
+    for name, result in zip(("postgres", "redis", "spotify", "stt", "openai"), results, strict=True):
         if isinstance(result, Exception):
             logger.warning("prewarm_failed", service=name, error=str(result))
         else:
@@ -143,9 +160,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
+    from backend.app.providers.tts import aclose_http_client
+
     await app.state.spotify.close()
     await app.state.redis.aclose()
     await asyncio.to_thread(app.state.weaviate.close)
+    await aclose_http_client()
     await engine.dispose()
     logger.info("gia_shutdown")
 
@@ -177,3 +197,4 @@ app.include_router(dj.router)
 app.include_router(artist.router)
 app.include_router(chat.router)
 app.include_router(voice.router)
+app.include_router(voice_stream.router)

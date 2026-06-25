@@ -14,7 +14,7 @@ class TestStripAudioTags:
     """Audio tags are delivery cues for ElevenLabs — never read aloud by Kokoro."""
 
     def test_removes_tags_and_tidies_spacing(self) -> None:
-        assert strip_audio_tags("[warmly] Hey there [pause] friend") == "Hey there friend"
+        assert strip_audio_tags("[warm] Hey there [pause] friend") == "Hey there friend"
 
     def test_plain_text_unchanged(self) -> None:
         assert strip_audio_tags("Here's Free Mind by Tems.") == "Here's Free Mind by Tems."
@@ -25,7 +25,7 @@ class TestStripAudioTags:
 
 class TestIsEmotional:
     def test_audio_tag_is_emotional(self) -> None:
-        assert is_emotional("[warmly] Hey, long week?")
+        assert is_emotional("[warm] Hey, long week?")
 
     def test_question_is_emotional(self) -> None:
         assert is_emotional("Everything okay?")
@@ -53,8 +53,8 @@ class TestSplitSentences:
         assert len(parts) == 2
 
     def test_preserves_audio_tags(self) -> None:
-        parts = split_sentences("[warmly] Hey. Long week?")
-        assert any("[warmly]" in p for p in parts)
+        parts = split_sentences("[warm] Hey. Long week?")
+        assert any("[warm]" in p for p in parts)
 
     def test_empty_string(self) -> None:
         assert split_sentences("") == []
@@ -127,25 +127,69 @@ async def test_synthesize_elevenlabs_returns_empty_without_key() -> None:
 
 @pytest.mark.asyncio
 async def test_synthesize_elevenlabs_calls_api() -> None:
-    """ElevenLabs hits the API when a key is provided — or falls back gracefully."""
-    from backend.app.providers.tts import synthesize
+    """ElevenLabs hits the API (via the pooled client) when a key is provided."""
+    from backend.app.providers import tts
 
     mock_resp = MagicMock()
     mock_resp.content = b"fake-mp3-bytes"
     mock_resp.raise_for_status = MagicMock()
 
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client = MagicMock()
     mock_client.post = AsyncMock(return_value=mock_resp)
 
-    with patch("httpx.AsyncClient", return_value=mock_client):
-        result = await synthesize(
+    with patch("backend.app.providers.tts._get_http_client", return_value=mock_client):
+        result = await tts.synthesize(
             "Hello.", provider="elevenlabs", api_key="test-key", voice_id="voice-123"
         )
 
-    # Either succeeded (mp3 bytes) or fell back gracefully (b"")
-    assert isinstance(result, bytes)
+    assert result == b"fake-mp3-bytes"
+    # The whole-file endpoint is used (no ``/stream`` suffix).
+    assert mock_client.post.call_args.args[0].endswith("/voice-123")
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_yields_chunks() -> None:
+    """``synthesize_stream`` forwards the ElevenLabs ``/stream`` byte chunks."""
+    from backend.app.providers import tts
+
+    class _FakeStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            for c in (b"mp3-part-1", b"mp3-part-2"):
+                yield c
+
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(return_value=_FakeStream())
+
+    with patch("backend.app.providers.tts._get_http_client", return_value=mock_client):
+        chunks = [
+            c async for c in tts.synthesize_stream(
+                "Everything okay?", provider="elevenlabs", api_key="k", voice_id="v"
+            )
+        ]
+
+    assert chunks == [b"mp3-part-1", b"mp3-part-2"]
+    # Streaming hits the ``/stream`` endpoint.
+    assert mock_client.stream.call_args.args[1].endswith("/v/stream")
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_no_key_yields_nothing() -> None:
+    """No API key → no audio chunks (graceful dev no-op)."""
+    from backend.app.providers.tts import synthesize_stream
+
+    chunks = [
+        c async for c in synthesize_stream("Hello.", provider="elevenlabs", api_key="", voice_id="")
+    ]
+    assert chunks == []
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
@@ -40,11 +41,12 @@ from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
-from backend.app.agents.acknowledgment import get_selector, should_acknowledge
+from backend.app.agents import router_prewarm
+from backend.app.agents.acknowledgment import get_selector
 from backend.app.agents.artist import ArtistService, extract_artist_name
 from backend.app.agents.dj import DJService
-from backend.app.agents.general import opening_line, respond_general, stream_general
-from backend.app.agents.hybrid_router import classify_turn
+from backend.app.agents.general import opening_line, stream_general
+from backend.app.agents.hybrid_router import classify_turn, fast_keyword_decision
 from backend.app.agents.mood import MoodService
 from backend.app.agents.planner import _wants_weather
 from backend.app.agents.router import _keyword_classify
@@ -67,12 +69,12 @@ from backend.app.mood.ingest import ingest_recently_played
 from backend.app.mood.proactive import pop_proactive_draft
 from backend.app.observability.langfuse import crew_trace
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import is_emotional, synthesize
+from backend.app.providers.tts import is_emotional, synthesize, synthesize_stream
 from backend.app.schemas.chat import ChatRequest, IntentType
-from backend.app.schemas.router import RouterDecision, Tone
+from backend.app.schemas.dj import TrackItem
+from backend.app.schemas.router import RouterDecision
 from backend.app.tools.brave import BraveSearchClient
-from backend.app.voice.adapter import VoiceAdapter
-from backend.app.voice.streaming import split_sentences, stream_sentences
+from backend.app.voice.streaming import split_sentences
 
 logger = get_logger(__name__)
 
@@ -122,7 +124,60 @@ async def _weather_note(weather: WeatherClientProtocol, cfg: Settings) -> str | 
     )
 
 
-_voice_adapter = VoiceAdapter()
+# Markers that a turn is asking about *current* facts — so the model must search
+# rather than answer from its (months-old) training data. Catches the cases the
+# router's needs_search can miss: "Drake's latest album", "who won", "score".
+_FRESH_SEARCH_RE = re.compile(
+    r"\b(latest|newest|recent(?:ly)?|current(?:ly)?|today|tonight|right now|"
+    r"this (?:week|month|year|season)|so far this year|update[ds]?|news|headlines?|"
+    r"happening|breaking|just (?:dropped|released|came out|out)|new (?:album|single|song|release)|"
+    r"who won|who'?s winning|the score|standings|fixtures?|results?)\b"
+    r"|\b20[2-9]\d\b",
+    re.IGNORECASE,
+)
+
+# A tighter subset that wants the news feed specifically (vs general web).
+_BREAKING_RE = re.compile(
+    r"\b(news|breaking|headlines?|what'?s (?:going on|happening)|latest on)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_fresh_search(message: str) -> bool:
+    """Whether *message* asks about current facts that need a live search."""
+    return bool(_FRESH_SEARCH_RE.search(message))
+
+
+def _is_breaking_news(message: str) -> bool:
+    """Whether *message* is a breaking-news ask → use the news feed, not web."""
+    return bool(_BREAKING_RE.search(message))
+
+
+async def _search_note(brave: BraveSearchClient, query: str, *, breaking: bool) -> str | None:
+    """Run a Brave search and render results as a grounding block for the reply.
+
+    Returns ``None`` when nothing comes back, so the turn proceeds (un-grounded
+    but warm) rather than blocking on a degraded search.
+    """
+    try:
+        results = await brave.recent(query, count=5, breaking=breaking)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("chat_search_error", error=str(exc))
+        return None
+    if not results:
+        return None
+    lines = []
+    for r in results:
+        age = f" · {r['age']}" if r.get("age") else ""
+        desc = (r.get("description") or "").strip()
+        lines.append(f"- {r['title']}{age}: {desc} ({r['url']})")
+    today = datetime.now(UTC).strftime("%A, %d %B %Y")
+    return (
+        f"**Live web search results (today is {today} — use these as the source of "
+        "truth for current facts and prefer them over anything you remember, which "
+        "may be out of date):**\n" + "\n".join(lines)
+    )
+
 
 # Recent turns of the session transcript handed to the router (≈3 exchanges).
 # The reply path keeps the full window (session_history._MAX_TURNS); the router
@@ -146,8 +201,13 @@ def _steps_for_decision(decision: RouterDecision) -> list[str]:
     conversational responder (the streaming conversation agent lands in Slice B).
     """
     steps: list[str] = []
-    if decision.needs_music or decision.intent in (
-        IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE,
+    # Run the DJ only on an actual music intent — or on MIXED when the user asked
+    # for music alongside something else. ``needs_music`` on its own does NOT pull
+    # in the DJ: the router sets it spuriously on ARTIST_INFO ("tell me about X"),
+    # which used to append a stray "Playing … now" to an info answer and auto-play
+    # without a request. Music stays opt-in, per the no-auto-play rule.
+    if decision.intent in (IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE) or (
+        decision.intent == IntentType.MIXED and decision.needs_music
     ):
         steps.append("dj")
     if decision.needs_artist_lookup or decision.intent == IntentType.ARTIST_INFO:
@@ -158,8 +218,19 @@ def _steps_for_decision(decision: RouterDecision) -> list[str]:
 
 
 _NOW_PLAYING_RE = re.compile(
-    r"\b(what('?s| is| am i)?\s+(currently\s+)?(playing|on right now|on now)"
-    r"|what song is this|what'?s this song|now playing|current track)\b",
+    r"\b("
+    # "what's (currently/now) playing" / "what are we listening to" / "what am i playing"
+    r"what(?:'?s| is| are we| am i)?\s+(?:currently\s+|now\s+)?(?:playing|listening to)"
+    # "what's on right now" / "what's on now" (require 'now' so "what's on your mind" doesn't match)
+    r"|what(?:'?s| is)\s+on(?:\s+right)?\s+now"
+    # "what's this song" / "what is the track" / "what's this tune"
+    r"|what(?:'?s| is)\s+(?:this|the)\s+(?:song|track|tune)"
+    # "what song is this" / "what track is playing"
+    r"|what\s+(?:song|track|tune)\s+is\s+(?:this|playing|on)"
+    r"|now playing|current track"
+    # "is something/anything/music playing"
+    r"|is\s+(?:something|anything|music)\s+playing"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -167,18 +238,6 @@ _NOW_PLAYING_RE = re.compile(
 def _is_now_playing_query(message: str) -> bool:
     """Return ``True`` when the user is asking what's playing right now."""
     return bool(_NOW_PLAYING_RE.search(message))
-
-
-async def _tts_frame(text: str, provider: str, api_key: str, voice_id: str) -> str | None:
-    """Synthesise *text* and return an ``audio_chunk`` SSE frame (or ``None``)."""
-    chunk = await synthesize(text, provider=provider, api_key=api_key, voice_id=voice_id)
-    if not chunk:
-        return None
-    return _sse("audio_chunk", {
-        "data": base64.b64encode(chunk).decode(),
-        "model": provider,
-        "emotional": is_emotional(text),
-    })
 
 
 async def _aiter(items: list[str]) -> AsyncIterator[str]:
@@ -215,18 +274,22 @@ async def _stream_reply_frames(
     voice_id: str,
     collected: list[str],
 ) -> AsyncIterator[str]:
-    """Stream the reply text sentence-by-sentence, then synthesise the WHOLE
-    reply in a single TTS pass.
+    """Stream the reply text sentence-by-sentence, then STREAM the WHOLE reply's
+    audio progressively as ElevenLabs renders it.
 
-    Per-sentence synthesis made the voice lurch: each ElevenLabs call saw only
-    one sentence, so prosody and tag rendering reset at every boundary, and the
-    hybrid picker could even switch models mid-reply (flash ↔ v3, which sound
-    audibly different). One pass over the full text gives consistent prosody,
-    reliable v3 tag rendering (it needs ~250+ chars of context), and a single
-    voice. The fast acknowledgment already covers the perceived latency of
-    waiting for the complete reply; text still streams live so captions appear
-    as Gia "types". Every sentence is appended to *collected* so the caller can
-    persist the full reply.
+    The whole reply is synthesised in ONE pass (the full text is sent up-front),
+    so prosody and v3 tag rendering stay consistent and there's no mid-reply
+    flash↔v3 hop — v3 needs ~250+ chars of context to sound right, which a
+    per-sentence call can't give it. But the audio is pulled from ElevenLabs'
+    ``/stream`` endpoint and forwarded chunk-by-chunk, so the first audio bytes
+    reach the client well before the complete file is rendered — that's the
+    latency win that replaces the old fast acknowledgment. Text still streams
+    live so captions appear as Gia "types"; every sentence is appended to
+    *collected* so the caller can persist the full reply.
+
+    Frames: ``audio_start`` (once, before the first byte) → N ``audio_chunk``
+    (each ``streaming: true`` with a monotonic ``seq``) → ``audio_end``. The
+    frontend appends the chunks to a MediaSource buffer and plays progressively.
     """
     async for sentence in sentences:
         collected.append(sentence)
@@ -235,28 +298,42 @@ async def _stream_reply_frames(
     full = " ".join(s.strip() for s in collected).strip()
     if not full:
         return
+
+    # is_emotional(full) picks ONE model for the whole reply (no mid-reply
+    # flash↔v3 hop): any tag or a question → eleven_v3, else eleven_flash.
+    emotional = is_emotional(full)
+    started = False
+    seq = 0
     try:
-        chunk = await synthesize(full, provider=provider, api_key=api_key, voice_id=voice_id)
+        async for chunk in synthesize_stream(
+            full, provider=provider, api_key=api_key, voice_id=voice_id
+        ):
+            if not chunk:
+                continue
+            if not started:
+                started = True
+                yield _sse("audio_start", {"model": provider, "emotional": emotional})
+            yield _sse("audio_chunk", {
+                "data": base64.b64encode(chunk).decode(),
+                "model": provider,
+                "emotional": emotional,
+                "seq": seq,
+                "streaming": True,
+            })
+            seq += 1
     except Exception as exc:  # noqa: BLE001
         logger.warning("chat_tts_error", error=str(exc))
-        return
-    if chunk:
-        # is_emotional(full) picks ONE model for the whole reply (no mid-reply
-        # flash↔v3 hop): any tag or a question → eleven_v3, else eleven_flash.
-        yield _sse("audio_chunk", {
-            "data": base64.b64encode(chunk).decode(),
-            "model": provider,
-            "emotional": is_emotional(full),
-        })
+    if started:
+        yield _sse("audio_end", {"chunks": seq})
 
 
-# Heuristic intents that signal likely background work (retrieval / playback),
-# so a neutral filler is worth speaking before the LLM router even returns.
-# MIXED is excluded: it's the most ambiguous keyword verdict ("recommend an
-# artist like X" is usually a chat question, not retrieval), so the keyword path
-# and the LLM router disagree most often there. Conversational / status intents
-# are excluded too — they're fast already or would mis-fire a reaction.
-_FAST_ACK_INTENTS = {
+# Keyword-classified intents that clearly want a specialist (retrieval/playback),
+# so the conversational reply should NOT be pre-generated for them. Everything
+# else (greetings, questions, ambiguous MIXED) is treated as probably-chat and is
+# worth speculating on while the router LLM runs. MIXED is intentionally absent:
+# the keyword path and the router disagree most there, so speculating is the safe
+# bet (a wasted call costs cents; a serial router wait costs ~2s of silence).
+_SPECULATE_SKIP_INTENTS = {
     IntentType.MUSIC_FIND,
     IntentType.MUSIC_QUEUE,
     IntentType.ARTIST_INFO,
@@ -264,92 +341,132 @@ _FAST_ACK_INTENTS = {
 }
 
 
-# An explicit action verb — a music intent only earns an instant filler when the
-# user is actually commanding playback, not just mentioning music ("his music is
-# fire" must not draw an "On it." before a chat reply).
-_FAST_ACK_VERB_RE = re.compile(
+def _should_speculate(message: str) -> bool:
+    """Whether to pre-generate the conversational reply concurrently with the router.
+
+    The router LLM is ~2s and fully blocks the reply. Most turns are chit-chat,
+    so we kick off the conversational reply in parallel and use it only if the
+    router confirms a conversational intent — correctness is unchanged (nothing
+    is emitted before the router lands), we just overlap the generation. We skip
+    speculation when the sub-ms keyword classifier already says a specialist will
+    clearly run, to avoid burning an LLM call the turn won't use.
+    """
+    return _keyword_classify(message) not in _SPECULATE_SKIP_INTENTS
+
+
+async def _collect_general(
+    message: str,
+    user_context_text: str,
+    history_text: str,
+    cfg: Settings,
+) -> str:
+    """Run the conversational reply to completion and return the full text.
+
+    Drains :func:`stream_general` into a single string. Used both for the
+    speculative pre-generation and the in-band fallback; the assembled reply is
+    streamed to the client (text + progressive audio) in section 5.
+    """
+    parts: list[str] = []
+    async for delta in stream_general(message, user_context_text, cfg=cfg, history=history_text):
+        if delta:
+            parts.append(delta)
+    return "".join(parts).strip()
+
+
+async def _speculative_general(
+    message: str,
+    memory_task: asyncio.Task | None,
+    history_text: str,
+    cfg: Settings,
+) -> str:
+    """Pre-generate the conversational reply, awaiting the in-flight memory task
+    for personalisation context first. Never raises — a failed memory lookup just
+    yields an un-personalised (but still warm) reply."""
+    user_context_text = ""
+    if memory_task is not None:
+        try:
+            ctx = await memory_task
+            user_context_text = ctx.to_prompt_text()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("speculative_memory_error", error=str(exc))
+    return await _collect_general(message, user_context_text, history_text, cfg)
+
+
+# ── Music command fast-path (ack + speculative search) ────────────────────────
+
+# Music is the product, so a clear play/queue command earns (a) an instant spoken
+# ack while the router + search run, and (b) a Spotify search started in parallel
+# with the router. Both are gated on the sub-ms keyword classifier seeing a real
+# command — never fires in front of a fast chat reply.
+_MUSIC_COMMAND_INTENTS = {IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE}
+
+# An explicit action verb — a music intent only counts as a *command* when the
+# user is actually asking for playback, not just mentioning music ("his music is
+# fire" is chat, not a request).
+_MUSIC_VERB_RE = re.compile(
     r"\b(play|queue|put (me )?on|throw on|add|skip|save|find|recommend|shuffle|resume)\b",
     re.IGNORECASE,
 )
 
+# Verbs that actually mean "start it NOW" (vs. queue/add for later). A MUSIC_QUEUE
+# turn only auto-plays the seed when one of these is present ("play X and queue Y");
+# a pure "queue X after this" must NOT start playback, whatever the router guessed.
+_PLAY_VERB_RE = re.compile(
+    r"\b(play|put (me )?on|throw on|resume|start|blast|bump)\b",
+    re.IGNORECASE,
+)
 
-def _fast_ack_intent(message: str) -> IntentType | None:
-    """Return a keyword-classified intent worth acknowledging *before* the router.
+# Leading command verbs / trailing fillers stripped to turn a raw command into a
+# cleaner speculative search query ("play some Travis Scott right now" → "some
+# Travis Scott"). The result need not be perfect — it only seeds the *speculative*
+# search, which is discarded unless the router's resolved query matches the text.
+_SPEC_STRIP_RE = re.compile(
+    r"^\s*(please\s+)?(can you\s+|could you\s+)?"
+    r"(play|queue|put (me )?on|throw on|add|skip|save|find|recommend|shuffle|resume)\s+"
+    r"|\b(right now|for me|please)\b\s*$",
+    re.IGNORECASE,
+)
 
-    Uses the sub-millisecond keyword classifier so Gia can react without waiting
-    on the router LLM round-trip. Returns ``None`` when the keywords are ambiguous
-    or conversational so a misfired ack never lands in front of a clarifying reply.
-    Music intents additionally require an explicit action verb — a topical mention
-    ("Suono Sai's music is fire") is chat, not a command.
+
+def _is_music_command(message: str) -> bool:
+    """Whether *message* is a clear play/queue command (keyword, sub-ms)."""
+    return (
+        _keyword_classify(message) in _MUSIC_COMMAND_INTENTS
+        and bool(_MUSIC_VERB_RE.search(message))
+    )
+
+
+def _speculative_query(message: str) -> str:
+    """Strip command verbs / trailing fillers to seed the speculative search."""
+    return _SPEC_STRIP_RE.sub("", message).strip() or message.strip()
+
+
+def _query_tokens_present(search_query: str, message: str) -> bool:
+    """Whether the router's resolved query is "in" the user's words.
+
+    The speculative search ran on the raw message, so its results are only
+    representative when the router didn't resolve a reference to something *not*
+    said (e.g. "play it now" → a track pulled from history). True when the query
+    is empty (nothing to disagree with) or every significant token of it appears
+    in the message — then the prefetched results are safe to reuse.
     """
-    heuristic = _keyword_classify(message)
-    if heuristic not in _FAST_ACK_INTENTS:
+    sq = (search_query or "").strip().lower()
+    if not sq:
+        return True
+    words = set(re.findall(r"[a-z0-9]+", message.lower()))
+    tokens = [t for t in re.findall(r"[a-z0-9]+", sq) if len(t) >= 3]
+    return bool(tokens) and all(t in words for t in tokens)
+
+
+async def _safe_search(
+    dj_svc: DJService, query: str
+) -> tuple[TrackItem, list[TrackItem]] | None:
+    """Run a speculative DJ search, swallowing any error (returns ``None``)."""
+    try:
+        return await dj_svc.search_only(query, n=4)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("speculative_search_failed", query=query, error=str(exc))
         return None
-    if heuristic in (IntentType.MUSIC_FIND, IntentType.MUSIC_QUEUE) and not _FAST_ACK_VERB_RE.search(message):
-        return None
-    return heuristic
-
-
-async def _emit_ack(
-    intent: IntentType,
-    tone: Tone,
-    session_id: str,
-    trace,
-    message: str,
-    provider: str,
-    api_key: str,
-    voice_id: str,
-) -> AsyncIterator[str]:
-    """Select, emit and speak a single intent+tone acknowledgment as SSE frames.
-
-    The *accurate* path: only reached after the router decision exists, so the
-    line's intent and tone are real and ``should_acknowledge`` has already gated
-    on actual retrieval/clarify/confirm.
-    """
-    with trace.span("acknowledgment", message) as span:
-        t0 = time.monotonic()
-        ack_line = get_selector().select(intent, tone, session_id)
-        spoken = _voice_adapter.apply(tone.value, ack_line)
-        span.set_output(spoken)
-        yield _sse("reply_chunk", {"text": spoken})
-        yield _sse("acknowledgment", {
-            "text": spoken,
-            "tone": tone.value,
-            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-        })
-        frame = await _tts_frame(spoken, provider, api_key, voice_id)
-        if frame:
-            yield frame
-
-
-async def _emit_filler(
-    session_id: str,
-    trace,
-    message: str,
-    provider: str,
-    api_key: str,
-    voice_id: str,
-) -> AsyncIterator[str]:
-    """Emit a neutral filler before the router's decision exists (the fast path).
-
-    Claims nothing specific and carries no tone tag, so it can front whatever the
-    router lands on — a recommendation, a clarifying question, or pure chat —
-    without contradicting the reply. This is what keeps a keyword/LLM intent
-    disagreement from producing an ack that promises work the turn never does.
-    """
-    with trace.span("acknowledgment", message) as span:
-        t0 = time.monotonic()
-        line = get_selector().select_filler(session_id)
-        span.set_output(line)
-        yield _sse("reply_chunk", {"text": line})
-        yield _sse("acknowledgment", {
-            "text": line,
-            "tone": "neutral",
-            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-        })
-        frame = await _tts_frame(line, provider, api_key, voice_id)
-        if frame:
-            yield frame
 
 
 async def _run_crew(
@@ -391,11 +508,11 @@ async def _run_crew(
     async with crew_trace(session_id, user_id, user_input=request.message) as trace, \
             _task_scope() as bg_tasks:
 
-        # ── 1. Kick off the two slowest pre-reply steps concurrently ──────────
-        # Memory-context building and the router LLM are independent, and the
-        # acknowledgment needs neither — so we start both as background tasks and
-        # let Gia react first, instead of paying memory + router serially before
-        # the user hears anything.
+        # ── 1. Kick off the slowest pre-reply steps concurrently ──────────────
+        # Memory-context building and the router LLM are independent, so we start
+        # both as background tasks. We also speculatively pre-generate the
+        # conversational reply (below) concurrently with the router, so the ~2s
+        # router round-trip overlaps the reply generation instead of preceding it.
         #
         # Recent turns of THIS conversation let the router resolve "play it now"/
         # "that one" and let Gia pick up where she left off — fetched first because
@@ -428,44 +545,111 @@ async def _run_crew(
         # search/recommend (which is how Gia used to invent an answer).
         now_playing_query = _is_now_playing_query(request.message)
 
+        # ── 1b. Speculatively pre-generate the conversational reply ───────────
+        # The conversational reply is the turn's content whenever no specialist
+        # runs. Most turns are chit-chat, so we start generating it NOW — in
+        # parallel with the router — and use it only if the router confirms a
+        # conversational intent. Nothing is emitted before the router lands, so
+        # correctness is identical; we just stop paying the router latency and the
+        # reply latency back-to-back. Skipped when a specialist is clearly coming
+        # (keyword classifier), when a proactive note will lead the reply, for
+        # now-playing status queries, and for providers without token streaming.
+        general_task: asyncio.Task | None = None
+        if (
+            not now_playing_query
+            and not proactive
+            and len(request.message.strip()) >= 3
+            and cfg.llm_provider in ("openai", "anthropic")
+            and _should_speculate(request.message)
+            # A current-facts turn will search and regenerate, discarding any
+            # speculative reply — so don't pay for one.
+            and not _wants_fresh_search(request.message)
+        ):
+            general_task = asyncio.create_task(
+                _speculative_general(request.message, memory_task, history_text, cfg)
+            )
+            bg_tasks.append(general_task)
+
+        # ── 1c. Music command fast-path: search in parallel with the router ───
+        # Music is the product, so a clear play/queue command kicks off the Spotify
+        # search NOW, in parallel with the router, instead of after it. The result
+        # is reused (recommend(prefetched=...)) when the router's resolved query is
+        # "in" the user's words; reference commands fall back to a fresh search.
+        dj_svc: DJService | None = None
+        spec_search_task: asyncio.Task | None = None
+        if not now_playing_query and _is_music_command(request.message):
+            dj_svc = DJService(spotify=spotify, cfg=cfg)
+            spec_search_task = asyncio.create_task(
+                _safe_search(dj_svc, _speculative_query(request.message))
+            )
+            bg_tasks.append(spec_search_task)
+
+        # ── 1d. Instant warm ack for music commands ───────────────────────────
+        # A music search takes ~3-5s. Synthesise a short, content-NEUTRAL filler
+        # NOW — concurrently with the router + search — so when the DJ step starts
+        # we can speak it immediately and the user hears warmth instead of silence
+        # while the search runs. Neutral by design ("Say less." / "On it." — never
+        # "playing it now"), so it fronts a found track OR a "couldn't find it"
+        # without ever contradicting the result. The [warm] tag routes it to
+        # eleven_v3 for human warmth; it's emitted only if the DJ actually runs.
+        ack_task: asyncio.Task | None = None
+        if spec_search_task is not None:
+            ack_line = get_selector().select_filler(session_id)
+            ack_task = asyncio.create_task(
+                synthesize(
+                    f"[warm] {ack_line}",
+                    provider=tts_provider, api_key=tts_api_key, voice_id=tts_voice_id,
+                )
+            )
+            bg_tasks.append(ack_task)
+
         # ── 2. Route the turn (structured: intent + tone + engagement) ─────────
         # One small-model call classifies everything the turn needs. It never
         # raises — a failed call degrades to a warm GENERAL_CHAT default. Started
-        # as a task so the fast acknowledgment below overlaps the round-trip.
+        # as a task so the speculative reply above overlaps the round-trip.
+        #
+        # Early-intent: streaming STT (Flux) fires /chat/prewarm on the eager
+        # transcript a beat before the user finishes, so the router may already be
+        # done. We take that result when present (the common streaming case) and
+        # only classify cold on a miss (typed turns, batch STT, multi-worker) —
+        # either way the input is identical, so the decision is the same.
         yield _sse("agent_start", {"agent": "router", "input": request.message})
         with trace.span("router", request.message) as span:
             router_t0 = time.monotonic()
-            # Created inside the span so the OpenAI drop-in generation nests under
-            # "router" (asyncio tasks inherit the current OTel context).
-            router_task = asyncio.create_task(
-                classify_turn(request.message, cfg, history=router_history)
+            # Tier-1: a confident keyword read of pure conversation skips the LLM
+            # router (and the prewarm) entirely — sub-ms instead of ~2s.
+            decision = (
+                fast_keyword_decision(request.message)
+                if cfg.router_fast_path_enabled else None
             )
-            bg_tasks.append(router_task)
+            fast_path = decision is not None
+            prewarmed = False
+            if decision is None:
+                # Tier-2: reuse the decision the eager prewarm already started.
+                decision = await router_prewarm.take(redis, session_id, request.message)
+                prewarmed = decision is not None
+            if decision is None:
+                # Tier-3: classify cold. Created inside the span so the OpenAI
+                # drop-in generation nests under "router" (asyncio tasks inherit
+                # the current OTel context).
+                router_task = asyncio.create_task(
+                    classify_turn(request.message, cfg, history=router_history)
+                )
+                bg_tasks.append(router_task)
+                decision = await router_task
 
-            # ── 2a. Fast acknowledgment — react before the router LLM returns ──
-            # Gia speaks a *neutral* filler in ~1s on every substantive turn while
-            # the router, memory, and (whole-reply) TTS are still in flight — so
-            # she always feels responsive, not just on retrieval commands. The
-            # filler claims nothing specific, so it can front whatever the reply
-            # turns out to be (chat, a recommendation, a clarifying question)
-            # without contradicting it. The intent-flavoured ack is still reserved
-            # for the accurate post-router path. Skipped for now-playing status
-            # queries (answered instantly) and noise blips (< 3 chars).
-            acked = False
-            if not now_playing_query and len(request.message.strip()) >= 3:
-                async for frame in _emit_filler(
-                    session_id, trace, request.message,
-                    tts_provider, tts_api_key, tts_voice_id,
-                ):
-                    yield frame
-                acked = True
-
-            decision = await router_task
             intent, confidence = decision.intent, decision.confidence
+            # A pure queue request ("queue X after this") must NOT start playback —
+            # the router sometimes sets start_playback anyway, which made the DJ play
+            # the track now instead of lining it up. Only honour playback on a queue
+            # turn when the user actually said a play verb ("play X and queue Y").
+            if intent == IntentType.MUSIC_QUEUE and not _PLAY_VERB_RE.search(request.message):
+                decision.start_playback = False
             steps = [] if now_playing_query else _steps_for_decision(decision)
             signals = ["weather"] if _wants_weather(request.message, steps) else []
+            _src = "fast" if fast_path else "prewarmed" if prewarmed else "llm"
             span.set_output(
-                f"{intent.value}/{decision.tone.value}/{decision.engagement_mode.value}"
+                f"{intent.value}/{decision.tone.value}/{decision.engagement_mode.value} ({_src})"
             )
             yield _sse("agent_done", {
                 "agent": "router",
@@ -473,6 +657,8 @@ async def _run_crew(
                 "tone": decision.tone.value,
                 "engagement_mode": decision.engagement_mode.value,
                 "confidence": round(confidence, 2),
+                "prewarmed": prewarmed,
+                "fast_path": fast_path,
                 "latency_ms": round((time.monotonic() - router_t0) * 1000, 1),
             })
         yield _sse("plan", {
@@ -488,17 +674,6 @@ async def _run_crew(
                 "artist_lookup": decision.needs_artist_lookup,
             },
         })
-
-        # ── 2b. Accurate acknowledgment — only if we didn't already fast-ack ───
-        # When the keyword path was unsure, the router's real intent/tone/mode
-        # decide whether (and how) to react, so a clarify/confirm turn never gets
-        # a generic "On it." in front of its question.
-        if not acked and should_acknowledge(decision):
-            async for frame in _emit_ack(
-                decision.intent, decision.tone, session_id, trace, request.message,
-                tts_provider, tts_api_key, tts_voice_id,
-            ):
-                yield frame
 
         # ── 3. Resolve the memory context (needed by agents + the reply) ──────
         user_context_text = ""
@@ -526,6 +701,51 @@ async def _run_crew(
             if weather_note:
                 user_context_text = f"{user_context_text}\n{weather_note}".strip()
                 yield _sse("signal", {"name": "weather", "value": weather_note})
+
+        # Live web/news search for current-facts turns. The router answers news and
+        # general questions conversationally (no specialist), so without this the
+        # model replies from stale training data ("Drake's latest album" → a
+        # year-old answer; "World Cup update" → "I don't know"). We search when the
+        # turn is conversational AND either the router flagged needs_search or the
+        # message carries recency markers, then ground the reply in the results.
+        searched = False
+        # Will the artist specialist actually run? It's skipped when no clean name
+        # resolves ("whats Drake's newest album?" → no name), and the turn then
+        # falls back to the conversational reply — which must be search-grounded.
+        artist_will_run = (
+            intent == IntentType.ARTIST_INFO
+            and bool(extract_artist_name(request.message))
+        )
+        # Search-ground current-facts turns. Eligible intents answer
+        # conversationally; music/mood/memory have their own data sources.
+        # ARTIST_INFO is included only when its specialist WON'T run — otherwise the
+        # artist agent (which does its own freshness-filtered search) handles it.
+        search_eligible = (
+            intent in (
+                IntentType.GENERAL, IntentType.GENERAL_CHAT,
+                IntentType.NEWS_QUERY, IntentType.MIXED,
+            )
+            or (intent == IntentType.ARTIST_INFO and not artist_will_run)
+        )
+        do_search = (
+            not now_playing_query
+            and search_eligible
+            and (decision.needs_search or _wants_fresh_search(request.message))
+        )
+        if do_search:
+            search_query = decision.search_query or request.message
+            breaking = _is_breaking_news(request.message)
+            yield _sse("tool_call", {
+                "agent": "search", "tool": "brave_news" if breaking else "brave_web",
+                "input": search_query,
+            })
+            with trace.span("search", search_query) as span:
+                note = await _search_note(brave, search_query, breaking=breaking)
+                span.set_output(f"results={'yes' if note else 'none'}")
+            if note:
+                user_context_text = f"{user_context_text}\n{note}".strip()
+                searched = True
+                yield _sse("signal", {"name": "search", "value": search_query})
 
         # ── 4. Execute the planned agents ─────────────────────────────────────
         reply_parts: list[str] = []
@@ -558,17 +778,53 @@ async def _run_crew(
             # play-vs-queue via start_playback.
             dj_query = decision.search_query or request.message
             yield _sse("agent_start", {"agent": "dj", "input": dj_query})
+
+            # Speak the pre-synthesised warm ack now, before the ~3-5s search, so
+            # the user hears "Say less." while we look. One-shot (non-streaming)
+            # audio → the frontend plays it on the AudioPlayer; the DJ reply
+            # streams progressively after, on the StreamPlayer. The synth started
+            # back in §1d, so this await is effectively instant.
+            if ack_task is not None:
+                try:
+                    ack_audio = await ack_task
+                    if ack_audio:
+                        yield _sse("audio_chunk", {
+                            "data": base64.b64encode(ack_audio).decode(),
+                            "model": tts_provider,
+                            "streaming": False,
+                            "ack": True,
+                        })
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("chat_ack_error", error=str(exc))
+
             with trace.span("dj", dj_query) as span:
                 t0 = time.monotonic()
                 try:
-                    yield _sse("tool_call", {"agent": "dj", "tool": "search_tracks", "input": dj_query})
-                    dj_svc = DJService(spotify=spotify, cfg=cfg)
+                    # Reuse the speculative search started alongside the router when
+                    # the router's resolved query is "in" what the user said (not a
+                    # reference resolved from history) and they didn't name multiple
+                    # specific titles — otherwise the prefetch isn't representative
+                    # and we let recommend() search the resolved query itself.
+                    prefetched: tuple[TrackItem, list[TrackItem]] | None = None
+                    if (
+                        spec_search_task is not None
+                        and len(decision.track_titles) < 2
+                        and _query_tokens_present(decision.search_query or "", request.message)
+                    ):
+                        prefetched = await spec_search_task
+                    yield _sse("tool_call", {
+                        "agent": "dj", "tool": "search_tracks", "input": dj_query,
+                        "prefetched": prefetched is not None,
+                    })
+                    if dj_svc is None:
+                        dj_svc = DJService(spotify=spotify, cfg=cfg)
                     dj_result = await dj_svc.recommend(
                         query=dj_query,
                         user_context_text=user_context_text,
                         start_playback=decision.start_playback,
                         n=4,
                         requested_titles=decision.track_titles,
+                        prefetched=prefetched,
                     )
                     # Push tracks onto Spotify's queue when the user wants them
                     # queued — an explicit MUSIC_QUEUE, or a per-title request that
@@ -669,71 +925,54 @@ async def _run_crew(
         # turn where no specialist produced output — get a persona-grounded reply
         # in Gia's own voice instead of a canned string.
         substantive_parts = [p for p in reply_parts if p.strip()]
-        streamed_inline = False
         full_reply = ""
         if not now_playing_query and (
             intent in _CONVERSATIONAL_INTENTS or not substantive_parts
         ):
-            # When the conversational reply is the *sole* content (no proactive
-            # note to keep verbatim, no specialist part to merge) we stream the
-            # model's tokens straight into per-sentence TTS — so audio for the
-            # first sentence starts while the rest is still being generated,
-            # instead of waiting for the whole reply. Otherwise fall back to a
-            # blocking reply that the unified section-5 streaming handles.
-            can_stream_inline = (
-                cfg.llm_provider in ("openai", "anthropic")
-                and not proactive
-                and not substantive_parts
-            )
+            # Use the speculative reply generated alongside the router when we have
+            # one (the common chit-chat path — it's already done or nearly so, so
+            # the router latency was absorbed). Otherwise generate it now: this
+            # covers turns we declined to speculate on (a specialist looked likely
+            # but produced nothing, or the keyword path flagged a command). The
+            # assembled reply is streamed (text + progressive audio) in section 5.
             yield _sse("agent_start", {"agent": "gia", "input": request.message})
             with trace.span("general", request.message) as span:
                 t0 = time.monotonic()
-                if can_stream_inline:
-                    collected: list[str] = []
-                    sentences = stream_sentences(stream_general(
-                        request.message, user_context_text, cfg=cfg, history=history_text,
-                    ))
-                    async for frame in _stream_reply_frames(
-                        sentences, tts_provider, tts_api_key, tts_voice_id, collected,
-                    ):
-                        yield frame
-                    full_reply = " ".join(collected)
-                    streamed_inline = True
-                    span.set_output(full_reply)
+                # The speculative reply was generated BEFORE the search ran, so on a
+                # search turn it can't see the results — regenerate with the grounded
+                # context. Non-search turns reuse the speculative reply as before.
+                if general_task is not None and not searched:
+                    reply = await general_task
                 else:
-                    reply = await respond_general(
-                        request.message, user_context_text, cfg=cfg, history=history_text
+                    reply = await _collect_general(
+                        request.message, user_context_text, history_text, cfg
                     )
-                    reply_parts.append(reply)
-                    span.set_output(reply)
+                reply_parts.append(reply)
+                span.set_output(reply)
                 yield _sse("agent_done", {
                     "agent": "gia",
                     "latency_ms": round((time.monotonic() - t0) * 1000, 1),
                 })
 
         # ── 5. Synthesise + stream reply + TTS ────────────────────────────────
-        # The inline-streamed conversational reply is already on the wire; only
-        # the parts path (specialists / proactive / blocking fallback) needs
-        # merging + streaming here. When several agents contributed (and synthesis
-        # is enabled), merge them into one coherent reply; otherwise join. A
-        # pending proactive note is kept verbatim at the front so its phrasing is
-        # never reworded.
-        if not streamed_inline:
-            if cfg.synthesis_enabled and len([p for p in reply_parts if p.strip()]) > 1:
-                with trace.span("synthesis", request.message) as span:
-                    synth_input = reply_parts[1:] if proactive else reply_parts
-                    merged = await synthesize_reply(synth_input, request.message, cfg)
-                    full_reply = f"{proactive} {merged}".strip() if proactive else merged
-                    span.set_output(full_reply)
-            else:
-                full_reply = " ".join(reply_parts)
+        # Merge the contributing parts into one reply. When several agents
+        # contributed (and synthesis is enabled), synthesise them into one
+        # coherent reply; otherwise join. A pending proactive note is kept verbatim
+        # at the front so its phrasing is never reworded.
+        if cfg.synthesis_enabled and len([p for p in reply_parts if p.strip()]) > 1:
+            with trace.span("synthesis", request.message) as span:
+                synth_input = reply_parts[1:] if proactive else reply_parts
+                merged = await synthesize_reply(synth_input, request.message, cfg)
+                full_reply = f"{proactive} {merged}".strip() if proactive else merged
+                span.set_output(full_reply)
+        else:
+            full_reply = " ".join(reply_parts)
 
         # Trace-level output for the turn (visible at the top of the Langfuse trace).
         trace.set_output(full_reply)
 
         # Persist this exchange so the next turn has continuity ("play it now",
-        # "that one", "what did you just say"). The ack filler is intentionally
-        # not stored — only the substantive reply.
+        # "that one", "what did you just say").
         await append_turn(redis, session_id, "user", request.message)
         await append_turn(redis, session_id, "gia", full_reply)
 
@@ -757,15 +996,13 @@ async def _run_crew(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("chat_extract_enqueue_error", error=str(exc))
 
-        # Parts path: stream the assembled reply sentence-by-sentence with TTS
-        # pipelined one sentence ahead. (The inline-streamed conversational reply
-        # was already emitted above.)
-        if not streamed_inline:
-            async for frame in _stream_reply_frames(
-                _aiter(split_sentences(full_reply)),
-                tts_provider, tts_api_key, tts_voice_id, [],
-            ):
-                yield frame
+        # Stream the assembled reply: captions sentence-by-sentence, then the
+        # whole-reply audio forwarded progressively as ElevenLabs renders it.
+        async for frame in _stream_reply_frames(
+            _aiter(split_sentences(full_reply)),
+            tts_provider, tts_api_key, tts_voice_id, [],
+        ):
+            yield frame
 
         # Record recent plays for mood patterning — throttled, and only after the
         # reply has streamed so it never adds perceived latency (the db session is
@@ -814,6 +1051,46 @@ async def _run_crew(
                 for s in trace.spans
             ],
         })
+
+
+@router.post("/prewarm", status_code=202, summary="Speculatively warm the router on an eager transcript")
+async def prewarm(
+    request: ChatRequest,
+    redis: Annotated[Redis, Depends(get_redis)],
+    cfg: Annotated[Settings, Depends(get_settings)],
+) -> dict:
+    """Start the router classification early, before the turn is final.
+
+    Called by the streaming-STT client on Deepgram Flux's ``EagerEndOfTurn`` — a
+    medium-confidence turn end whose transcript is guaranteed to match the final
+    one. We kick ``classify_turn`` and stash the in-flight task; the subsequent
+    ``POST /chat`` (with the final transcript) awaits it instead of starting the
+    router cold, so the router latency overlaps the user's last words.
+
+    Read-only and side-effect free — only the *classification* is precomputed;
+    search/playback still happen in ``/chat`` after the final transcript. Returns
+    immediately (202) without waiting for the router.
+
+    Args:
+        request: ``ChatRequest`` — ``message`` is the eager transcript;
+                 ``session_id`` must match the one the client sends to ``/chat``.
+    """
+    session_id = request.session_id
+    if not session_id:
+        return {"prewarmed": False}
+    # If the keyword fast-path will handle this turn without the LLM router,
+    # there's nothing to prewarm — don't spend an LLM call on it.
+    if cfg.router_fast_path_enabled and fast_keyword_decision(request.message) is not None:
+        return {"prewarmed": False}
+    turns = await get_history(redis, session_id)
+    router_history = format_history(turns[-_ROUTER_HISTORY_TURNS:])
+    await router_prewarm.start(
+        redis,
+        session_id,
+        request.message,
+        lambda: classify_turn(request.message, cfg, history=router_history),
+    )
+    return {"prewarmed": True}
 
 
 @router.get("/opening", summary="Gia's opening line — she speaks first")

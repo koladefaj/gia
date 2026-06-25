@@ -24,7 +24,9 @@ from backend.app.schemas.router import EngagementMode, RouterDecision, Tone
 logger = get_logger(__name__)
 
 _TABLE_PATH = Path(__file__).resolve().parent.parent / "data" / "acknowledgements.json"
-_AVOID_LAST = 5
+# With a ~30-line filler pool, avoid the last 8 so a given "okay" doesn't recur
+# for several turns running.
+_AVOID_LAST = 8
 
 
 @lru_cache(maxsize=1)

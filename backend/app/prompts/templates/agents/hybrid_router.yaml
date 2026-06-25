@@ -59,6 +59,11 @@ sections:
       enthusiasm; do NOT auto-play or queue. Only treat it as a music request when
       there is an explicit action: play, put on, put me on, queue, add, skip, save,
       find, recommend, shuffle.
+    - ARTIST_INFO ("tell me about X", "who is X", "what's X's latest album") is
+      INFORMATIONAL — set needs_music=false and start_playback=false. Talking about
+      an artist is not a request to play them. Only set needs_music=true (and
+      intent=MIXED) when the user ALSO explicitly asks to play/queue in the same
+      message ("tell me about Asake and put something on").
     - Opinion/suggestion questions ("what do you suggest", "what would you recommend",
       "drake or asake?", "which is better", "what should I listen to") are GENERAL_CHAT
       with needs_music=false and start_playback=false. Gia answers conversationally
@@ -106,7 +111,9 @@ sections:
     User: "I'm on PARTYNEXTDOOR right now"
     {"intent":"GENERAL_CHAT","tone":"warm","confidence":0.95,"engagement_mode":"direct_execute","needs_search":false,"needs_memory":false,"needs_music":false,"needs_artist_lookup":false,"search_query":null,"track_titles":[],"start_playback":false}
     User: "tell me about Asake"
-    {"intent":"ARTIST_INFO","tone":"curious","confidence":0.93,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":true,"needs_music":true,"needs_artist_lookup":true,"search_query":"Asake","track_titles":[],"start_playback":false}
+    {"intent":"ARTIST_INFO","tone":"curious","confidence":0.93,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":true,"needs_music":false,"needs_artist_lookup":true,"search_query":"Asake","track_titles":[],"start_playback":false}
+    User: "whats Drake's latest album?"
+    {"intent":"ARTIST_INFO","tone":"curious","confidence":0.9,"engagement_mode":"react_then_execute","needs_search":true,"needs_memory":false,"needs_music":false,"needs_artist_lookup":true,"search_query":"Drake latest album","track_titles":[],"start_playback":false}
   user: |
     {% if history %}Recent conversation (oldest first):
     {{ history }}

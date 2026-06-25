@@ -9,6 +9,19 @@
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, '') ?? 'http://localhost:8000';
 
+/** Build a ws(s):// URL for a backend WebSocket path, with optional query. */
+export function wsUrl(
+  path: string,
+  params?: Record<string, string | null | undefined>,
+): string {
+  const base = API_BASE.replace(/^http/, 'ws');
+  const entries = Object.entries(params ?? {}).filter(
+    (e): e is [string, string] => Boolean(e[1]),
+  );
+  const q = entries.length ? `?${new URLSearchParams(entries).toString()}` : '';
+  return `${base}${path}${q}`;
+}
+
 /* -------------------------------------------------------------------------- */
 /* /chat — Server-Sent Events                                                  */
 /* -------------------------------------------------------------------------- */
@@ -19,9 +32,10 @@ export type ChatEventName =
   | 'tool_call'
   | 'plan'
   | 'signal'
-  | 'acknowledgment'
   | 'reply_chunk'
+  | 'audio_start'
   | 'audio_chunk'
+  | 'audio_end'
   | 'error'
   | 'done';
 
@@ -82,6 +96,21 @@ export async function* chatStream(
       }
     }
   }
+}
+
+/**
+ * Fire-and-forget: ask the backend to start the router early on an eager
+ * (medium-confidence) end-of-turn transcript, so the ~2s router overlaps the
+ * user's last words. `session_id` must match the one sent to /chat. Best-effort
+ * — failures are ignored (the turn still works, just without the head start).
+ */
+export function prewarmRouter(body: ChatBody): void {
+  void fetch(`${API_BASE}/chat/prewarm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    keepalive: true,
+  }).catch(() => {});
 }
 
 /* -------------------------------------------------------------------------- */

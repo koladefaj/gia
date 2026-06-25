@@ -77,7 +77,7 @@ def split_sentences(text: str) -> list[str]:
     Preserves audio tags within their sentence.  Empty strings are filtered out.
 
     Args:
-        text: Full reply text (may include ``[warmly]``, ``[pause]``, etc.).
+        text: Full reply text (may include ``[warm]``, ``[pause]``, etc.).
 
     Returns:
         Non-empty sentence fragments in order.

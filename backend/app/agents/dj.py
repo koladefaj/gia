@@ -24,6 +24,7 @@ from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.observability.logging import get_logger
 from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_llm
+from backend.app.providers.tts import has_audio_tag
 from backend.app.schemas.dj import CrossfadeQueue, DJResponse, TrackItem
 
 logger = get_logger(__name__)
@@ -78,6 +79,19 @@ class DJService:
     # Honour at most this many explicitly-named tracks in a per-title request.
     _MAX_NAMED_QUEUE = 10
 
+    async def search_only(
+        self, query: str, n: int = 4
+    ) -> tuple[TrackItem, list[TrackItem]]:
+        """Search *query* and return ``(seed, queue_tracks)`` — nothing else.
+
+        Read-only: no playback, no LLM. Used to run the Spotify search
+        *speculatively* (in parallel with the router) so a music command's
+        lookup is already done by the time the router lands. The result is fed
+        back into :meth:`recommend` via ``prefetched`` to skip the duplicate
+        search. Safe to call without committing to anything.
+        """
+        return await self._search_query(query, n)
+
     async def recommend(
         self,
         query: str,
@@ -85,6 +99,7 @@ class DJService:
         start_playback: bool = False,
         n: int = 4,
         requested_titles: list[str] | None = None,
+        prefetched: tuple[TrackItem, list[TrackItem]] | None = None,
     ) -> DJResponse:
         """Search for tracks, build the queue, and generate a recommendation.
 
@@ -110,6 +125,11 @@ class DJService:
                                user named the tracks — those are honoured in full).
             requested_titles:  Specific titles the user named, in order. The first
                                is the primary "did you mean…?" target.
+            prefetched:        A ``(seed, queue_tracks)`` pair from a speculative
+                               :meth:`search_only` run. When given (and the user did
+                               not name multiple specific titles), it's used instead
+                               of searching again — the latency win. Ignored on the
+                               per-title path, which needs its own per-title search.
 
         Returns:
             A ``DJResponse`` with the recommendation, seed track, and queue.
@@ -125,6 +145,9 @@ class DJService:
             seed, queue_tracks, missing = await self._search_named_titles(titles)
             if seed is None:  # none of the named tracks resolved → plain search
                 seed, queue_tracks = await self._search_query(query, n)
+        elif prefetched is not None:
+            # Reuse the speculative search that ran alongside the router.
+            seed, queue_tracks = prefetched
         else:
             seed, queue_tracks = await self._search_query(query, n)
 
@@ -151,6 +174,15 @@ class DJService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("dj_llm_error", error=str(exc))
             recommendation = f"Here's {seed.name} by {seed.artist} — should fit the vibe."
+
+        recommendation = recommendation.strip()
+        # Music is the product moment, so it must land on the warm eleven_v3 model,
+        # not the flat flash model. The TTS picker routes to v3 only when a line
+        # carries an [audio tag]; a plain "Playing X now..." has none and would go
+        # to flash (the robotic sound). Guarantee a delivery cue when the LLM
+        # didn't add one — v3 renders it as warmth, captions strip it.
+        if not has_audio_tag(recommendation):
+            recommendation = f"[warm] {recommendation}"
 
         # ── 3. Optionally start playback ─────────────────────────────────────
         playback_started = False

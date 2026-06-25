@@ -18,15 +18,46 @@ import time
 
 from pydantic import ValidationError
 
+from backend.app.agents.router import _keyword_classify
 from backend.app.config import Settings
 from backend.app.observability.logging import get_logger
 from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.openai_client import extract_json_object, get_async_openai
-from backend.app.schemas.router import RouterDecision, safe_default_decision
+from backend.app.schemas.chat import IntentType
+from backend.app.schemas.router import (
+    EngagementMode,
+    RouterDecision,
+    Tone,
+    safe_default_decision,
+)
 
 logger = get_logger(__name__)
 
 AGENT_KEY = "agents.hybrid_router"
+
+
+def fast_keyword_decision(message: str) -> RouterDecision | None:
+    """Return a confident ``RouterDecision`` from sub-ms keywords, or ``None``.
+
+    Tier-1 of the router: short-circuits the ~2s LLM call only for the
+    unambiguous-conversation case — the keyword classifier returns ``GENERAL``
+    exclusively when a greeting/small-talk keyword is present and there is *zero*
+    music, artist, mood, or queue signal. Those turns run no specialist and need
+    no pronoun/query resolution, so a warm ``GENERAL_CHAT`` decision is exactly
+    what the LLM would return, minutes faster.
+
+    Everything else — music, artist, mood, news, or any ambiguity — returns
+    ``None`` so the caller falls through to :func:`classify_turn`, which does the
+    reference resolution and ``search_query`` extraction keywords can't.
+    """
+    if _keyword_classify(message) is IntentType.GENERAL:
+        return RouterDecision(
+            intent=IntentType.GENERAL_CHAT,
+            tone=Tone.WARM,
+            confidence=1.0,
+            engagement_mode=EngagementMode.DIRECT_EXECUTE,
+        )
+    return None
 
 
 async def classify_turn(

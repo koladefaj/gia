@@ -89,7 +89,7 @@ class TestVoiceAdapter:
         assert VoiceAdapter().convert_tone_to_tags("nonsense") == ""
 
     def test_apply_prepends_tag(self) -> None:
-        assert VoiceAdapter().apply("warm", "Hey there") == "[warmly] Hey there"
+        assert VoiceAdapter().apply("warm", "Hey there") == "[warm] Hey there"
 
     def test_apply_noop_without_tag(self) -> None:
         assert VoiceAdapter().apply("nonsense", "Hey there") == "Hey there"

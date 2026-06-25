@@ -31,7 +31,17 @@ def _client_for(api_key: str, base_url: str | None) -> Any:
     except ImportError:
         from openai import AsyncOpenAI  # noqa: PLC0415
 
-    return AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+    # Keep connections warm between turns. The default httpx pool lets idle
+    # connections expire quickly, so a conversational gap forces a fresh TCP+TLS
+    # handshake (~300-460ms) on the next router/reply call — a recurring tax on
+    # the critical path. A long keepalive holds the connection open across turns.
+    import httpx  # noqa: PLC0415
+
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=5.0),
+        limits=httpx.Limits(max_keepalive_connections=10, keepalive_expiry=120.0),
+    )
+    return AsyncOpenAI(api_key=api_key, base_url=base_url or None, http_client=http_client)
 
 
 def get_async_openai(cfg: Settings) -> Any:

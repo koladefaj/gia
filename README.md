@@ -1,16 +1,18 @@
 # Gia — a voice music companion
 
-> A voice companion that knows your taste, sounds like a warm human, and notices your mood before you mention it — built to react in **under a second**, not to make you wait for a paragraph.
+> A voice companion that knows your taste, sounds like a warm human, and notices your mood before you mention it — engineered to **start talking while it's still thinking**, streaming audio out as it's generated instead of making you wait for a finished paragraph.
 
 Gia isn't a "play me a song" bot. She's a stateful companion: she remembers what you've told her, synthesises it into a picture of *who you are*, picks one track with a reason instead of dumping ten, and gently notices when your listening drifts from your usual pattern.
 
 > Demo video: _[link]_
 
+**At a glance:** voice in → out in **~4–5s** for chat (down from ~10s), a full reflective memory pipeline, graceful degradation on every external call, 454 tests, and per-turn observability with self-eval scores. The newest chapter: **streaming speech-to-text (Deepgram Flux)** removes the serial transcription wait, and the router now starts *mid-utterance* on the model's eager end-of-turn signal instead of after the user stops. The latency work below is a real, measured engineering story — including a feature I built, measured, and then **deleted** because the data said to.
+
 ---
 
 ## What it feels like
 
-- You speak; she starts reacting in ~1s, then streams a warm, specific reply grounded in what she knows about you.
+- You speak; within a couple of seconds she's talking — and the audio **streams as it's synthesised**, so she's mid-sentence before the full reply even exists.
 - *"his music is fire"* → she **reacts to you**, she doesn't silently queue something. *"play that"* → she plays it.
 - She recalls earlier turns ("did you ever finish that script?"), and over time forms **insights** — not "likes Tems," but *"prefers emotionally expressive Afrobeats, leans to it when winding down."*
 
@@ -20,49 +22,111 @@ Gia isn't a "play me a song" bot. She's a stateful companion: she remembers what
 
 ```mermaid
 flowchart LR
-    U[User · voice/text] -->|SSE| API[FastAPI /chat]
+    U[User · voice] -->|PCM16 · WebSocket| STT[Streaming STT · Deepgram Flux<br/>interim · eager · final]
+    STT -->|eager transcript| PRE[POST /chat/prewarm<br/>router starts mid-utterance]
+    STT -->|final transcript · SSE| API[FastAPI /chat]
 
-    subgraph Turn["Single turn (concurrent)"]
+    subgraph Turn["Single turn — started concurrently"]
         direction TB
         ROUTER[Router · gpt-4o-mini<br/>intent · tone · plan]
         MEM[Memory context<br/>parallel fan-out]
-        ACK[Fast acknowledgment<br/>~1s, no LLM]
+        SPECREPLY[Speculative reply<br/>generated under the router]
+        SPECSEARCH[Speculative Spotify search<br/>for play/queue commands]
         SPEC[Specialists<br/>DJ · Artist · Mood · Chat]
-        REPLY[Token-streamed reply<br/>→ pipelined TTS]
+        TTS[Whole-reply TTS<br/>streamed chunk-by-chunk]
     end
 
-    API --> ROUTER & MEM & ACK --> SPEC --> REPLY -->|audio chunks| U
+    API --> ROUTER & MEM & SPECREPLY & SPECSEARCH
+    PRE -.prewarmed decision.-> ROUTER
+    ROUTER --> SPEC --> TTS -->|audio chunks → MediaSource| U
 
     MEM <--> WV[(Weaviate<br/>semantic memory)]
     MEM <--> PG[(Postgres<br/>profile · history)]
     MEM <--> RD[(Redis<br/>session · cache)]
     SPEC <--> MCP[Spotify MCP]
+    TTS <--> EL[ElevenLabs /stream]
 
     subgraph Background["Workers (Celery) — reflection, off the hot path"]
         EXT[Memory extraction] --> CONS[Consolidation<br/>raw facts → insights]
         ING[Recently-played ingest] --> MOOD[Mood inference<br/>LLM-labeled per time-bucket]
     end
 
-    REPLY -.enqueue.-> EXT & ING
+    TTS -.enqueue.-> EXT & ING
     CONS --> WV
     MOOD --> WV
     API -.scores.-> LF[Langfuse]
 ```
 
-**Stack:** FastAPI (SSE streaming) · CrewAI-style agents · Weaviate (hybrid vector search) · Postgres (SQLAlchemy async) · Redis (session/cache/throttles) · Celery (reflection workers) · Langfuse (tracing + self-eval scores) · OpenAI / Anthropic / Ollama behind one provider abstraction · Kokoro (local TTS) / ElevenLabs (prod) · faster-whisper (STT) · Spotify via an MCP server.
+**Stack:** FastAPI (SSE + WebSocket streaming) · CrewAI-style agents · Weaviate (hybrid vector search) · Postgres (SQLAlchemy async) · Redis (session/cache/throttles) · Celery (reflection workers) · Langfuse (tracing + self-eval scores) · OpenAI / Anthropic / Ollama behind one provider abstraction · ElevenLabs v3/flash streaming TTS (Kokoro for local dev) · **Deepgram Flux** streaming STT over WebSocket, provider-agnostic behind `STT_PROVIDER` (OpenAI Realtime alternate; `whisper-1` / local faster-whisper as batch fallback) · Next.js voice frontend with an AudioWorklet capture + MediaSource progressive playback · Spotify via an MCP server.
 
 ---
 
 ## The thing I obsessed over: time-to-first-audio
 
-A person tolerates two seconds of *thinking* if you start *reacting* in 300–500ms. So the metric isn't total response time — it's **TTFA**. Four design choices, compounding:
+The metric isn't total response time — it's **TTFA**, when the user first hears Gia. I drove it from **~10s p99 to ~4–5s** (chat) by attacking the serial dead time on the critical path, profiling each stage in Langfuse, and removing the biggest blocks one at a time.
 
-1. **Acknowledgment-first.** The two slowest pre-reply steps (building memory context, the router LLM) run **concurrently as background tasks**; a sub-millisecond keyword pass speaks a neutral filler ("One sec.") *while they're still in flight* — so the user hears Gia react before the router has even returned.
-2. **Token-streamed replies.** Conversational turns stream the model's tokens, reassemble them into sentences, and fire TTS on sentence one while sentence two is still generating — instead of waiting for the whole reply.
-3. **Pipelined TTS.** Synthesis for sentence *N+1* starts while sentence *N* is being delivered.
-4. **Small router, big thinker.** `gpt-4o-mini` classifies intent/tone/plan in one structured call; the expensive persona model only runs when the turn actually needs it.
+**1. Stream the TTS instead of waiting for the whole file.** This was the single biggest win. The pipeline had a complete sentence-streaming machine that the chat path *threw away* — it streamed the text, then synthesised the entire reply in one blocking call before sending a single audio byte. That was **~3.3s of dead silence** per turn. The fix sends the full reply text up-front to ElevenLabs' `/stream` endpoint (so `eleven_v3` keeps the ~250-char context it needs for natural prosody and audio-tag rendering) but **forwards the MP3 bytes as they render** — and the Next.js frontend plays them progressively through a `MediaSource` buffer. First audio now lands well before the file is finished.
 
-The neutral filler is deliberate: it's spoken *before* the real intent is known, so it claims nothing specific — it can front a recommendation, a clarifying question, or pure chat without ever contradicting the reply that follows.
+**2. Take the router off the critical path.** A music product still needs the `gpt-4o-mini` router (~2s) to resolve intent, but most turns are chit-chat. So the conversational reply is **generated speculatively, concurrently with the router**, and emitted *only if* the router confirms a conversational intent. Correctness is identical — nothing is spoken before the router lands — but the router latency now overlaps the reply generation instead of preceding it.
+
+**3. Speculative Spotify search for music commands.** When a play/queue command is detected, the Spotify search fires **in parallel with the router** (read-only — no playback). Its result is reused when the router's resolved query is "in" the user's words (token-overlap check); reference commands like *"just play it now"* (resolved from history) safely fall back to a fresh search. Playback side-effects always wait for the router, so nothing ever plays the wrong thing.
+
+**4. Replies are spoken, so they're short.** A prompt that's tuned for *reading* writes paragraphs; spoken, that's slow to generate **and** slow to synthesise. Enforcing 1–2 sentences cut both — observed reply lengths dropped from ~200–530 chars to ~120–200.
+
+**5. Small router, big thinker.** `gpt-4o-mini` classifies intent/tone/plan in one structured JSON call; the expensive persona model only runs when the turn actually needs it. Connection pools (a keep-alive httpx client for ElevenLabs) and a startup prewarm keep per-turn overhead off the hot path.
+
+**6. Streaming STT, and a router that starts before you finish.** The front of the pipe was the last serial block: record → upload → transcribe meant **~1.5–2.8s of dead air** before `/chat` could even begin. The fix is a transport change — the browser captures the mic through an **AudioWorklet** and streams 24 kHz PCM frames over a WebSocket to a provider-agnostic streaming-STT layer (behind the same `STT_PROVIDER` switch as everything else). I chose **Deepgram Flux** (`/v2/listen`), the conversational model that does end-of-turn detection itself — so the client-side silence timer goes away, and the turn fires the instant Flux emits a confirmed `EndOfTurn`.
+
+The same model unlocks **early-intent**: Flux emits an `EagerEndOfTurn` a beat *before* the user actually stops, with a transcript it guarantees will match the final. So the client fires `/chat/prewarm` on that eager text, the `gpt-4o-mini` router starts immediately, and when `/chat` arrives with the final transcript it **reuses the in-flight decision** instead of classifying cold — moving the router's ~2s off the critical path for the music/specialist turns where it was still serial. It's gated exactly like the speculative reply: classification is read-only, the prewarm key is the *exact* normalised transcript, and all search/playback still waits for the final, so a corrected utterance never acts on the wrong words. The prewarm result is cached in Redis, so the head start survives even when prewarm and `/chat` land on different workers. Both the streaming pipe and the prewarm reuse are validated end-to-end against the live Deepgram API; a full browser TTFA re-measure is the next step.
+
+### The feature I built, measured, and deleted
+
+Earlier the headline trick was an **acknowledgment** — a sub-ms keyword pass that spoke a neutral filler ("On it.") before the router returned. It demoed well in theory. In practice the data killed it:
+
+- On fast **chat** turns it filled a gap of only ~0.3s, and on short text it sounded **robotic** — ElevenLabs v3 needs context to sound human, and a two-word filler gives it none.
+- I tried scoping it to **music** turns only (where there's a real ~3–4s wait, and the filler's flash model matched the DJ reply's voice so they'd blend). It was better — but still added a synthetic "Gia talks at you" beat the user didn't want.
+
+So I kept the mechanisms that reduce *real* latency (speculative reply + search) and **removed the one that only masked *perceived* latency.** Knowing the difference — and being willing to delete my own clever feature when it didn't earn its place — is the decision I'd most want a reviewer to see.
+
+---
+
+## Benchmarks
+
+All numbers are end-to-end, measured from Langfuse traces and container-level micro-benchmarks (single dev box, RTX 4060, `gpt-4o`/`gpt-4o-mini`, ElevenLabs v3/flash).
+
+**Time-to-first-audio**
+
+| Turn type | Before | After |
+|---|---:|---:|
+| Chat / conversational | ~10s p99 | **~4–5s** |
+| Music command | ~10s p99 | **~5–7s** |
+
+**Per-stage (where the time goes now)**
+
+| Stage | Latency | Notes |
+|---|---:|---|
+| STT — batch (OpenAI `whisper-1`) | ~1.5–2.8s | the old serial cost, before `/chat`; now the **fallback** path |
+| STT — streaming (Deepgram Flux) | first interim <~0.3s, no serial wait | model does end-of-turn; the turn fires on `EndOfTurn`, the **new default** |
+| Router (`gpt-4o-mini`, JSON) | ~1.6–2.7s | occasional spike to ~6s (model variance); **overlapped via eager prewarm** on streaming turns |
+| Conversational reply (`gpt-4o` stream) | TTFT ~0.7–1.1s | **overlapped under the router** via speculation |
+| DJ specialist | ~2.8–4.5s | Spotify search ~2s + recommendation LLM ~1–2s; search removed from the path when speculation hits |
+| TTS | was ~3.3s blocking → **streamed first byte <1s** | the headline win |
+
+**STT micro-benchmark — why I *didn't* switch to local or `large-v3-turbo`**
+
+I A/B'd the OpenAI Whisper API against local `faster-whisper` on the GPU, then benchmarked the model in isolation to decide whether `large-v3-turbo` was worth baking:
+
+| Measurement (RTX 4060, `large-v3`, `int8_float16`) | Result |
+|---|---:|
+| Warm inference, 7s clip | ~1.1–1.8s |
+| Warm inference, 15s clip | ~1.8–2.0s (barely scales) |
+| webm/opus decode overhead | ~0.03s (negligible) |
+| Idle-downclock penalty | ~0.35s |
+| End-to-end `/voice/transcribe` in practice | ~2.0–3.8s |
+
+The model floor (~1.1–2s) is real, but ~1–2s of production STT is **non-model overhead** that `turbo` can't touch (turbo only shrinks the decoder). So `turbo`'s realistic gain is ~0.5–1s — landing roughly *on par* with the OpenAI API's ~2s, for a 1.6 GB model bake. **Conclusion at the time: stay on `whisper-1`.** The interesting part isn't the answer, it's that the decision was *measured* instead of assumed.
+
+> **Update:** that benchmark is what motivated the move to **streaming STT** (item 6). The real problem wasn't *which* batch model — every batch path pays ~1–2s of serial transcription before `/chat` starts. Streaming dissolves that wait entirely (and its interim results are what enable early-intent), so Deepgram Flux is now the default and the `whisper-1` path above is the graceful fallback.
 
 ---
 
@@ -81,7 +145,7 @@ Everything degrades quietly — a flaky Weaviate or Spotify yields an empty slic
 
 ## Production posture
 
-- **436 tests**, fully mocked external deps — runs offline, in CI, on a laptop.
+- **454 tests**, fully mocked external deps — runs offline, in CI, on a laptop.
 - **Observability** — every turn is a Langfuse trace with nested agent spans and LLM generations, plus **self-evaluation scores** (`context_used`, `retrieval_used`, `router_confidence`, `turn_latency_ms`) so quality and cost are *measured*, not guessed.
 - **Graceful degradation everywhere** — each external call has a fallback; a degraded service downgrades the turn, never breaks it.
 - **Provider-agnostic** — OpenAI, Anthropic, and Ollama all work through one factory; no vendor lock-in.
@@ -108,11 +172,24 @@ Everything degrades quietly — a flaky Weaviate or Spotify yields an empty slic
 A portfolio is as much about scope judgment as features. Things I chose to leave out, with the reason:
 
 - **Episodic memory, user embeddings, predictive recommendations** — these need *real usage data* to be anything but theater. With one seeded demo user I'd be tuning against synthetic data. The right time is after launch, when there's behavior to learn from.
-- **Speculative / streaming tool execution** — real techniques, but for a *music* companion the latency is dominated by TTS and the persona LLM, not tool fan-out. The added complexity and double-spend risk don't pay for themselves here. (For an agent doing heavy parallel tool work, I'd build it.)
 - **Multi-modal memory & a social graph** — different products. Out of scope for a focused voice companion.
-- **Real-time barge-in (WebRTC)** — a genuinely better UX, but it's a transport rewrite; SSE sentence-streaming gets the latency win that matters for a demo.
+- **Full real-time barge-in (WebRTC)** — streaming STT (item 6) already moved capture to a WebSocket and Deepgram Flux exposes the `StartOfTurn` signal barge-in needs, so the groundwork is in; wiring interrupt-while-Gia-speaks is a focused follow-up, not the transport rewrite it was before.
+- **A general speculative-execution framework** — I built *targeted* speculation where it pays (the conversational reply and the Spotify search, both gated so they never affect correctness). A generic "speculate every tool call" engine would add double-spend and reconciliation complexity the rest of the pipeline doesn't need.
 
 The discipline of *not* building these is the point: I'd rather ship a focused system I can stand behind than a sprawling one that's 60% done.
+
+---
+
+## Known limitations
+
+Stated plainly, because honest scope reads better than a flawless pitch:
+
+- **Browser playback is verified by types/tests, not a full cross-browser pass.** The progressive `MediaSource` playback is unit-tested and type-checked end-to-end; a manual smoke test across browsers is still pending. Safari's `MediaSource` support for `audio/mpeg` is limited — Chrome/Edge/Firefox are the supported targets.
+- **Speculation only helps "guessable" music commands.** *"play some Drake"* lets the search run early; *"yeah, that one"* / *"land on something"* resolve from conversation history, so the query can't be pre-guessed and those turns pay the full serial `router → search → phrase`.
+- **The router is the latency wild card — softened, not erased.** `gpt-4o-mini` usually classifies in ~2s but occasionally spikes to ~6s. Early-intent now overlaps it with the user's last words on streaming turns, but the win is largest on longer utterances (more eager lead time) and small on short clipped commands (*"play Drake."*) where eager and final nearly coincide. A local/cached classifier is still the next lever for the tail.
+- **Streaming STT is validated against the live API, not yet browser-measured.** The Deepgram Flux pipe and the prewarm reuse are proven end-to-end server-side; the full in-browser TTFA with the AudioWorklet capture is the pending measurement. If streaming is unavailable, the client falls back to the batch `whisper-1` path automatically.
+- **One seeded demo user.** The memory and mood systems are structurally complete but validated against synthetic history, not real usage at scale — by design (see above).
+- **Dev ergonomics traded for stability.** `uvicorn --reload` is disabled in Docker because the file watcher is unstable on Windows bind mounts; code changes need a container recreate locally.
 
 ---
 
@@ -126,18 +203,24 @@ Gia helps and lets you go — she doesn't fish for engagement. She never auto-pl
 
 ```bash
 cp .env.example .env
-# Set ANTHROPIC_API_KEY (or LLM_PROVIDER=ollama for fully local)
-docker compose up --build
+# Minimum: an LLM provider key — OPENAI_API_KEY (default) or ANTHROPIC_API_KEY,
+#          or LLM_PROVIDER=ollama for a fully local brain.
+# Full voice path also wants: ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID (streaming TTS)
+#          and, for streaming STT, DEEPGRAM_API_KEY with STT_PROVIDER=deepgram (the default).
+#          Set STT_PROVIDER=openai (+ OPENAI_API_KEY) for the batch whisper-1 fallback.
+#          Without any STT, text still streams; audio is silent.
+docker compose up --build           # api :8000 · web :3000 · postgres · redis · weaviate
 # First run — seed the demo user + synthetic history
 python scripts/seed_user.py
-# Health check
 curl localhost:8000/health
 ```
 
 ```bash
-# Tests
+# Tests (454, fully mocked — no network/keys needed)
 pytest -q
 ```
+
+> STT defaults to **streaming Deepgram Flux** (`STT_PROVIDER=deepgram`); set `openai` or `local` for the batch fallback. The GPU passthrough in `docker-compose.yml` is for that local `faster-whisper` fallback; it falls back to CPU automatically.
 
 ---
 
