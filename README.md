@@ -286,7 +286,7 @@ pytest -q
 
 ---
 
-## Roadmap
+## Improvemnts
 
 - Retrain the distilled router on **real** traffic (it's currently bootstrapped on synthetic + teacher labels) and lower the confidence gate as accuracy climbs
 - Memory consolidation → user-state precompute (mood, top artists, weekly trend) as a cached snapshot
