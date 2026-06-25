@@ -26,18 +26,31 @@ by ``dependencies.py`` and replaced in tests via ``dependency_overrides``.
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import redis.asyncio as aioredis
-import weaviate
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
-from backend.app.api import artist, auth, chat, dj, health, memory, voice
+from backend.app.api import (
+    artist,
+    auth,
+    chat,
+    dj,
+    health,
+    memory,
+    onboarding,
+    playlist,
+    voice,
+)
 from backend.app.config import settings
 from backend.app.db.session import engine
 from backend.app.db.weaviate_init import get_weaviate_client, init_weaviate_schema
 from backend.app.observability.langfuse import init_langfuse
 from backend.app.observability.logging import get_logger, setup_logging
+from backend.app.prompts import PromptRegistry
 from backend.app.tools.spotify import SpotifyMCPClient
 
 logger = get_logger(__name__)
@@ -54,6 +67,20 @@ async def _prewarm_postgres() -> None:
         await conn.execute(text("SELECT 1"))
 
 
+async def _prewarm_stt() -> None:
+    """Load the faster-whisper model (into VRAM when a GPU is present) so the
+    first spoken turn doesn't pay the model-load cost mid-conversation.
+
+    Skipped when STT runs through the OpenAI API — there is no local model to
+    warm. Runs in a worker thread; the load is blocking and allocates VRAM.
+    """
+    if settings.stt_provider == "openai":
+        return
+    from backend.app.providers.stt import warmup
+
+    await asyncio.to_thread(warmup, settings.stt_model)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application-scoped resources for the lifetime of the process.
@@ -64,6 +91,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     setup_logging(settings.log_level)
     logger.info("gia_starting", env=settings.app_env, llm=settings.llm_provider)
+
+    # Prompt registry — load and validate all YAML templates once at startup so
+    # a malformed prompt fails here, not mid-conversation.
+    app.state.prompts = PromptRegistry()
 
     if settings.langfuse_enabled:
         init_langfuse(
@@ -99,9 +130,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _prewarm_postgres(),
         app.state.redis.ping(),
         app.state.spotify.prewarm(),
+        _prewarm_stt(),
         return_exceptions=True,
     )
-    for name, result in zip(("postgres", "redis", "spotify"), results):
+    for name, result in zip(("postgres", "redis", "spotify", "stt"), results, strict=True):
         if isinstance(result, Exception):
             logger.warning("prewarm_failed", service=name, error=str(result))
         else:
@@ -125,9 +157,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_FRONTEND = Path(__file__).resolve().parent.parent.parent / "frontend"
+if _FRONTEND.is_dir():
+    app.mount("/ui", StaticFiles(directory=_FRONTEND, html=True), name="frontend")
+
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(memory.router)
+app.include_router(onboarding.router)
+app.include_router(playlist.router)
 app.include_router(dj.router)
 app.include_router(artist.router)
 app.include_router(chat.router)

@@ -8,13 +8,47 @@ from pydantic import BaseModel, Field
 
 
 class IntentType(str, Enum):
-    """Possible intents the Router agent can classify."""
+    """Possible intents the Router can classify.
+
+    ``GENERAL`` is the legacy chit-chat label kept for backward compatibility;
+    the structured router emits ``GENERAL_CHAT`` (the doc's name) and the two are
+    treated identically downstream.
+    """
 
     MUSIC_FIND = "MUSIC_FIND"
     MUSIC_QUEUE = "MUSIC_QUEUE"
     ARTIST_INFO = "ARTIST_INFO"
     MOOD_CHECK = "MOOD_CHECK"
+    MEMORY_QUERY = "MEMORY_QUERY"
+    NEWS_QUERY = "NEWS_QUERY"
+    GENERAL_CHAT = "GENERAL_CHAT"
     MIXED = "MIXED"
+    GENERAL = "GENERAL"
+
+
+class ExecutionPlan(BaseModel):
+    """A plan for a single conversation turn, produced by the planner.
+
+    The planner is the evolution of a flat intent classifier: instead of one
+    label, it emits an ordered list of agents to run plus the extra real-world
+    *signals* worth gathering first (e.g. weather).  This is what turns a set of
+    isolated tools into a companion that reasons across them.
+
+    Attributes:
+        intent:     The primary classified intent (kept for telemetry / the
+                    ``done`` event and backward compatibility).
+        steps:      Ordered agent names to execute (``"dj"``, ``"artist"``,
+                    ``"mood"``).
+        signals:    Extra context signals to gather before/while running steps
+                    (currently ``"weather"``).
+        confidence: Planner confidence in the chosen intent (1.0 heuristic,
+                    0.8 LLM, 0.5 fallback).
+    """
+
+    intent: IntentType
+    steps: list[str] = Field(default_factory=list)
+    signals: list[str] = Field(default_factory=list)
+    confidence: float = 1.0
 
 
 class ChatRequest(BaseModel):

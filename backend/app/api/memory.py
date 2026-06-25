@@ -11,6 +11,8 @@ Spotify client, all injected via FastAPI's ``Depends`` mechanism.
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,14 +62,15 @@ class ExtractionResponse(BaseModel):
     memory_ids: list[str]
 
 
-@router.get("/{user_id}/context", response_model=UserContext)
+@router.get("/{user_id}/context", summary="Get user context", status_code=200, response_model=UserContext)
 async def get_user_context(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    weaviate: Annotated[WeaviateClient, Depends(get_weaviate_client)],
+    redis: Annotated[AsyncRedis, Depends(get_redis)],
+    spotify: Annotated[SpotifyClientProtocol, Depends(get_spotify_client)],
+    cfg: Annotated[Settings, Depends(get_settings)],
     user_id: str,
     query: str = "music preferences",
-    db: AsyncSession = Depends(get_db),
-    weaviate: WeaviateClient = Depends(get_weaviate_client),
-    redis: AsyncRedis = Depends(get_redis),
-    spotify: SpotifyClientProtocol = Depends(get_spotify_client),
 ) -> UserContext:
     """Assemble and return the full ``UserContext`` for *user_id*.
 
@@ -92,7 +95,7 @@ async def get_user_context(
 
         _uuid.UUID(user_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.")
+        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.") from None
 
     store = WeaviateMemoryStore(client=weaviate)
     context = await build_user_context(
@@ -102,18 +105,19 @@ async def get_user_context(
         store=store,
         redis=redis,
         spotify=spotify,
+        cfg=cfg,
     )
     logger.info("context_assembled", user_id=user_id, query=query)
     return context
 
 
-@router.post("/{user_id}/extract", response_model=ExtractionResponse)
+@router.post("/{user_id}/extract", summary="Extract memories from conversation", status_code=200, response_model=ExtractionResponse)
 async def extract_memories_endpoint(
     user_id: str,
     body: ExtractionRequestBody,
-    weaviate: WeaviateClient = Depends(get_weaviate_client),
-    redis: AsyncRedis = Depends(get_redis),
-    cfg: Settings = Depends(get_settings),
+    weaviate: Annotated[WeaviateClient, Depends(get_weaviate_client)],
+    redis: Annotated[AsyncRedis, Depends(get_redis)],
+    cfg: Annotated[Settings, Depends(get_settings)],
 ) -> ExtractionResponse:
     """Run the LLM memory extractor on *body.transcript* and persist results.
 
@@ -136,7 +140,7 @@ async def extract_memories_endpoint(
 
         _uuid.UUID(user_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.")
+        raise HTTPException(status_code=400, detail=f"{user_id!r} is not a valid UUID.") from None
 
     store = WeaviateMemoryStore(client=weaviate)
     service = MemoryService(store=store, redis=redis, cfg=cfg)

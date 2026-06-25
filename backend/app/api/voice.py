@@ -50,7 +50,7 @@ class SpeakRequest(BaseModel):
     provider: str | None = None
 
 
-@router.post("/transcribe", response_model=TranscribeResponse)
+@router.post("/transcribe", summary="Transcribe audio to text", status_code=200, response_model=TranscribeResponse)
 async def transcribe_audio(
     audio: UploadFile = File(..., description="Audio file (WAV, MP3, WebM, OGG)"),
     language: str = Form(default="en"),
@@ -73,13 +73,13 @@ async def transcribe_audio(
         raise HTTPException(status_code=400, detail="Empty audio file")
 
     logger.info("voice_transcribe_request", bytes=len(audio_bytes), language=language)
-    text = await transcribe(audio_bytes, language=language)
+    text = await transcribe(audio_bytes, language=language, cfg=cfg)
     logger.info("voice_transcribe_done", transcript_len=len(text))
 
     return TranscribeResponse(transcript=text, language=language)
 
 
-@router.post("/speak")
+@router.post("/speak", summary="Synthesise text to speech", status_code=200)
 async def speak(
     body: SpeakRequest,
     cfg: Settings = Depends(get_settings),

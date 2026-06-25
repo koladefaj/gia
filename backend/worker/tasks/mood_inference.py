@@ -12,11 +12,12 @@ import uuid
 
 import redis as sync_redis
 import weaviate as weaviate_lib
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from backend.app.config import settings as cfg
 from backend.app.memory.store import WeaviateMemoryStore
-from backend.app.mood.inference import infer_mood_patterns
+from backend.app.mood.inference import get_listening_events, infer_mood_patterns
+from backend.app.mood.labeler import label_mood
 from backend.app.mood.proactive import check_and_draft_proactive
 from backend.app.observability.logging import get_logger, setup_logging
 from backend.worker.celery_app import celery_app
@@ -47,27 +48,21 @@ async def _infer_async(user_id: str) -> dict:
     )
     store = WeaviateMemoryStore(client=wv_client)
 
-    r = sync_redis.from_url(cfg.redis_url, decode_responses=True)
-
     try:
         async with session_factory() as db:
-            stored = await infer_mood_patterns(user_id, db, store)
+            stored = await infer_mood_patterns(user_id, db, store, cfg)
+            # The API ingests recently-played into listening_events, so the most
+            # recent rows are "now" — label them to check for a mood shift.
+            recent = await get_listening_events(user_id, db, limit=8)
 
-        # Also check for a proactive draft based on the newly inferred patterns.
-        # We need current audio features — skip if not available in Redis.
-        session_key = f"session:{user_id}"
-        session_data = r.get(session_key)
-        if session_data:
-            import json as _json
-            data = _json.loads(session_data)
-            energy = float(data.get("energy") or 0.5)
-            valence = float(data.get("valence") or 0.5)
+        if recent:
+            tracks = [{"name": e.track_name, "artist": e.artist_name} for e in recent]
+            current_label = await label_mood(tracks, cfg)
 
-            # Use sync Redis via asyncio.to_thread for the async Redis API
             import redis.asyncio as aioredis
             ar = aioredis.from_url(cfg.redis_url, decode_responses=True)
             try:
-                await check_and_draft_proactive(user_id, energy, valence, store, ar)
+                await check_and_draft_proactive(user_id, current_label, store, ar)
             finally:
                 await ar.aclose()
 
@@ -75,7 +70,6 @@ async def _infer_async(user_id: str) -> dict:
     finally:
         await asyncio.to_thread(wv_client.close)
         await engine.dispose()
-        r.close()
 
 
 @celery_app.task(name="backend.worker.tasks.mood_inference.run_mood_inference")

@@ -1,8 +1,8 @@
-"""Additional ``SpotifyMCPClient`` method coverage tests.
+"""``SpotifyMCPClient`` method-mapping coverage (MCP stdio).
 
-Verifies that every MCP tool method forwards the correct tool name and
-arguments to ``_call``, satisfying the remaining uncovered lines in
-``backend/app/tools/spotify.py``.
+Verifies each Protocol method maps to the correct MCP tool name + arguments via
+the bridge, and that the unsupported operations (save_track, artist info/tracks)
+degrade gracefully without an MCP call.
 """
 
 from __future__ import annotations
@@ -16,123 +16,84 @@ from backend.app.tools.spotify import SpotifyMCPClient
 
 
 @pytest.fixture()
-def client_with_mock_http(test_settings: Settings) -> tuple[SpotifyMCPClient, list[dict]]:
-    """Return a client whose HTTP layer records all ``POST /tools/call`` calls."""
-    captured: list[dict] = []
+def client(test_settings: Settings) -> SpotifyMCPClient:
+    """Client whose MCP bridge records ``(tool, arguments)`` calls."""
+    c = SpotifyMCPClient(cfg=test_settings)
+    c._bridge = MagicMock()
+    c._bridge.call = AsyncMock(return_value="")
+    return c
 
-    async def fake_post(url: str, *, json: dict, **_: object) -> MagicMock:  # noqa: A002
-        captured.append(json)
-        resp = MagicMock()
-        resp.json.return_value = {"status": "ok"}
-        resp.raise_for_status = MagicMock()
-        return resp
 
-    mock_http = AsyncMock()
-    mock_http.post = fake_post
-    mock_http.is_closed = False
-
-    client = SpotifyMCPClient(cfg=test_settings)
-    client._http = mock_http
-    return client, captured
+def _last_call(client: SpotifyMCPClient) -> tuple[str, dict]:
+    args = client._bridge.call.call_args
+    return args[0][0], args[0][1]
 
 
 @pytest.mark.asyncio
-async def test_get_currently_playing_tool_name(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``get_currently_playing`` sends tool name ``get_currently_playing``."""
-    client, captured = client_with_mock_http
+async def test_get_currently_playing_tool_name(client: SpotifyMCPClient) -> None:
     await client.get_currently_playing()
-    assert captured[0]["name"] == "get_currently_playing"
+    tool, _ = _last_call(client)
+    assert tool == "getNowPlaying"
 
 
 @pytest.mark.asyncio
-async def test_get_top_artists_tool_name_and_args(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``get_top_artists`` forwards ``time_range`` and ``limit``."""
-    client, captured = client_with_mock_http
+async def test_get_top_artists_tool_name_and_args(client: SpotifyMCPClient) -> None:
     await client.get_top_artists(time_range="short_term", limit=5)
-    assert captured[0]["name"] == "get_top_artists"
-    assert captured[0]["arguments"]["time_range"] == "short_term"
-    assert captured[0]["arguments"]["limit"] == 5
+    tool, args = _last_call(client)
+    assert tool == "getTopArtists"
+    assert args == {"timeRange": "short_term", "limit": 5}
 
 
 @pytest.mark.asyncio
-async def test_search_tracks_forwards_query(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``search_tracks`` forwards the query string and limit."""
-    client, captured = client_with_mock_http
+async def test_search_tracks_forwards_query(client: SpotifyMCPClient) -> None:
     await client.search_tracks("afrobeats chill", limit=3)
-    assert captured[0]["name"] == "search_tracks"
-    assert captured[0]["arguments"]["query"] == "afrobeats chill"
-    assert captured[0]["arguments"]["limit"] == 3
+    tool, args = _last_call(client)
+    assert tool == "searchSpotify"
+    assert args == {"query": "afrobeats chill", "type": "track", "limit": 3}
 
 
 @pytest.mark.asyncio
-async def test_save_track_forwards_uri(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``save_track`` forwards the track URI."""
-    client, captured = client_with_mock_http
-    await client.save_track("spotify:track:001")
-    assert captured[0]["name"] == "save_track"
-    assert captured[0]["arguments"]["uri"] == "spotify:track:001"
-
-
-@pytest.mark.asyncio
-async def test_add_to_queue_forwards_uri(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``add_to_queue`` forwards the track URI."""
-    client, captured = client_with_mock_http
+async def test_add_to_queue_forwards_uri(client: SpotifyMCPClient) -> None:
     await client.add_to_queue("spotify:track:002")
-    assert captured[0]["name"] == "add_to_queue"
-    assert captured[0]["arguments"]["uri"] == "spotify:track:002"
+    tool, args = _last_call(client)
+    assert tool == "addToQueue"
+    assert args == {"uri": "spotify:track:002"}
 
 
 @pytest.mark.asyncio
-async def test_create_playlist_forwards_name_and_description(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``create_playlist`` forwards both name and description."""
-    client, captured = client_with_mock_http
+async def test_create_playlist_forwards_name_and_description(client: SpotifyMCPClient) -> None:
     await client.create_playlist("Sunday Wind Down", "chill afrobeats")
-    assert captured[0]["name"] == "create_playlist"
-    assert captured[0]["arguments"]["name"] == "Sunday Wind Down"
-    assert captured[0]["arguments"]["description"] == "chill afrobeats"
+    tool, args = _last_call(client)
+    assert tool == "createPlaylist"
+    assert args == {"name": "Sunday Wind Down", "description": "chill afrobeats"}
 
 
 @pytest.mark.asyncio
-async def test_add_tracks_to_playlist_forwards_playlist_id_and_uris(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``add_tracks_to_playlist`` forwards playlist ID and URI list."""
-    client, captured = client_with_mock_http
+async def test_add_tracks_to_playlist_forwards_playlist_id_and_uris(client: SpotifyMCPClient) -> None:
     await client.add_tracks_to_playlist("pl-123", ["spotify:track:001", "spotify:track:002"])
-    assert captured[0]["name"] == "add_tracks_to_playlist"
-    assert captured[0]["arguments"]["playlist_id"] == "pl-123"
-    assert len(captured[0]["arguments"]["uris"]) == 2
+    tool, args = _last_call(client)
+    assert tool == "addTracksToPlaylist"
+    assert args["playlistId"] == "pl-123"
+    assert len(args["trackUris"]) == 2
 
 
 @pytest.mark.asyncio
-async def test_get_artist_info_forwards_artist_id(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``get_artist_info`` forwards the artist ID."""
-    client, captured = client_with_mock_http
-    await client.get_artist_info("artist-abc")
-    assert captured[0]["name"] == "get_artist_info"
-    assert captured[0]["arguments"]["artist_id"] == "artist-abc"
+async def test_save_track_unsupported_no_call(client: SpotifyMCPClient) -> None:
+    """No save-single-track tool exists; returns a status without an MCP call."""
+    res = await client.save_track("spotify:track:001")
+    assert res["status"] == "unsupported"
+    client._bridge.call.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_get_artist_top_tracks_forwards_artist_id(
-    client_with_mock_http: tuple[SpotifyMCPClient, list[dict]],
-) -> None:
-    """``get_artist_top_tracks`` forwards the artist ID."""
-    client, captured = client_with_mock_http
-    await client.get_artist_top_tracks("artist-xyz")
-    assert captured[0]["name"] == "get_artist_top_tracks"
-    assert captured[0]["arguments"]["artist_id"] == "artist-xyz"
+async def test_get_artist_info_placeholder_no_call(client: SpotifyMCPClient) -> None:
+    res = await client.get_artist_info("artist-abc")
+    assert res["id"] == "artist-abc"
+    client._bridge.call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_artist_top_tracks_empty_no_call(client: SpotifyMCPClient) -> None:
+    res = await client.get_artist_top_tracks("artist-xyz")
+    assert res == []
+    client._bridge.call.assert_not_awaited()

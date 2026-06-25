@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@keyframes giaPulse {
+  0%, 100% { opacity: 0.32; }
+  50% { opacity: 0.85; }
+}
+
+@keyframes giaDot {
+  0%, 100% { transform: scaleY(0.35); opacity: 0.4; }
+  50% { transform: scaleY(1); opacity: 1; }
+}
+
+@keyframes giaCaret {
+  0%, 45% { opacity: 1; }
+  50%, 95% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+.gia-caret {
+  display: inline-block;
+  margin-left: 2px;
+  font-weight: 300;
+  color: rgba(58, 63, 71, 0.55);
+  animation: giaCaret 1s step-end infinite;
+}

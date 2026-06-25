@@ -1,44 +1,40 @@
-"""Spotify MCP client — production implementation.
+"""Spotify client backed by the ``marcelmarais/spotify-mcp-server`` over MCP stdio.
 
-Calls the ``marcelmarais/spotify-mcp-server`` over its HTTP/SSE gateway
-(exposed by ``supergateway`` in docker-compose).  Every call is traced via
-Langfuse when tracing is enabled.  Transient failures are retried with
-exponential back-off using ``tenacity``.
+The server is a stdio Model Context Protocol server: we spawn it once
+(``cfg.spotify_mcp_server_path``) and hold a single ``ClientSession`` for the
+app's lifetime, created in ``prewarm`` and closed in ``close``.  Calls are
+serialised through an ``asyncio.Lock`` because one stdio session multiplexes a
+single pipe.
 
-There is **no mock mode in this class**.  For unit tests, inject a
-``FakeSpotifyClient`` that implements ``SpotifyClientProtocol`` via
-``app.dependency_overrides[get_spotify_client]``.
+Two impedance mismatches are handled here so the rest of Gia sees a normal
+``SpotifyClientProtocol``:
 
-Architecture
-------------
-The client is created once at application startup (in ``lifespan``) and
-stored on ``app.state.spotify``.  Route handlers and agents receive it via
-``Depends(get_spotify_client)`` — they never construct it themselves.
+1. **Text, not JSON.** The MCP tools return formatted markdown; the parsers in
+   ``spotify_parse`` turn that back into dicts.
+2. **No audio features / artist endpoints.** The server exposes no
+   ``audio-features`` (Spotify deprecated it) or artist-info tool. The DJ builds
+   its queue from search relevance / the user's stated track order instead, and
+   ``ArtistService`` gets an artist's tracks via ``search_tracks`` — so nothing
+   depends on the missing tools.
 
-Token refresh
--------------
-Spotify access tokens expire after one hour.  The client holds a reference to
-the user's ``Profile`` row and refreshes the token transparently when the MCP
-server returns a 401.  The new token is persisted back to the database so the
-next request picks it up without a round-trip to Spotify.
-
-Tracing
--------
-Every method wraps its MCP call in a Langfuse span named
-``spotify.<method_name>``.  When Langfuse is not configured the wrapper is a
-no-op context manager, so tracing is strictly additive.
+For unit tests, inject a ``FakeSpotifyClient`` via ``dependency_overrides`` — the
+real client is never constructed in tests.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Any, Generator
-
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+import asyncio
+from collections.abc import Generator
+from contextlib import AsyncExitStack, contextmanager
+from typing import Any
 
 from backend.app.config import Settings
 from backend.app.observability.logging import get_logger
+from backend.app.tools.spotify_parse import (
+    parse_artists,
+    parse_now_playing,
+    parse_tracks,
+)
 
 log = get_logger(__name__)
 
@@ -49,7 +45,7 @@ log = get_logger(__name__)
 class _NoopSpan:
     """Silent stand-in when Langfuse is not configured."""
 
-    def __enter__(self) -> "_NoopSpan":
+    def __enter__(self) -> _NoopSpan:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -58,15 +54,10 @@ class _NoopSpan:
 
 @contextmanager
 def _span(cfg: Settings, name: str) -> Generator[Any, None, None]:
-    """Yield a Langfuse span or a no-op context when tracing is disabled.
-
-    Args:
-        cfg:  Application settings used to check ``langfuse_enabled``.
-        name: Span name, conventionally ``spotify.<method>``.
-    """
+    """Yield a Langfuse span or a no-op context when tracing is disabled."""
     if cfg.langfuse_enabled:
         try:
-            from langfuse import Langfuse  # imported lazily to avoid hard dep at startup
+            from langfuse import Langfuse  # noqa: PLC0415
 
             lf = Langfuse(
                 public_key=cfg.langfuse_public_key,
@@ -81,242 +72,245 @@ def _span(cfg: Settings, name: str) -> Generator[Any, None, None]:
     yield _NoopSpan()
 
 
-# ── Client ────────────────────────────────────────────────────────────────────
+# ── MCP stdio bridge ──────────────────────────────────────────────────────────
+
+
+def _content_text(result: Any) -> str:
+    """Concatenate the text content blocks of an MCP tool result.
+
+    No ``type`` filter: across mcp SDK versions the attribute/value varies and
+    filtering on it can silently drop every block (→ empty result).
+    """
+    return "\n".join(
+        text for c in result.content if (text := getattr(c, "text", "")) is not None and text
+    )
+
+
+class _McpBridge:
+    """Owns the MCP ``ClientSession`` via a single long-lived *owner task*.
+
+    Why an owner task rather than a session created in ``lifespan`` and used from
+    request handlers: the stdio session's anyio task group is bound to the task
+    that opened it, so tearing it down (to reconnect) from a different task
+    raises "cancel scope in a different task".  Funnelling every connect / call /
+    teardown through one owner task keeps the lifecycle in a single scope, which
+    makes **auto-reconnect** safe.
+
+    Auto-reconnect matters because ``marcelmarais/spotify-mcp-server`` historically
+    logged to stdout on token refresh (corrupting the JSON-RPC channel); even with
+    that patched, a dropped session or transient error should self-heal rather
+    than wedge Spotify for the rest of the process.
+
+    Calls are submitted to a queue and resolved via futures, so request handlers
+    never touch the session directly.
+
+    The ``session_factory`` seam (default ``None`` → real stdio server) lets
+    tests drive the reconnect logic without spawning a process.
+    """
+
+    def __init__(
+        self,
+        command: str,
+        server_path: str,
+        *,
+        session_factory: Any = None,
+    ) -> None:
+        self._command = command
+        self._server_path = server_path
+        self._session_factory = session_factory
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._owner: asyncio.Task | None = None
+
+    @property
+    def started(self) -> bool:
+        return self._owner is not None
+
+    async def start(self) -> None:
+        """Launch the owner task (the session connects lazily on first call)."""
+        if self._owner is None:
+            self._owner = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        """Signal the owner task to tear down the session and exit."""
+        if self._owner is not None:
+            await self._queue.put(None)  # shutdown sentinel
+            try:
+                await asyncio.wait_for(asyncio.shield(self._owner), timeout=10)
+            except (TimeoutError, asyncio.CancelledError):
+                self._owner.cancel()
+            self._owner = None
+
+    async def call(self, tool: str, arguments: dict) -> str:
+        """Submit *tool* to the owner task and await its text result.
+
+        Raises:
+            RuntimeError: If the bridge was never started.
+            Exception:    Whatever the call ultimately failed with after retries.
+        """
+        if self._owner is None:
+            raise RuntimeError("Spotify MCP session is not started")
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        await self._queue.put((tool, arguments, fut))
+        return await fut
+
+    async def _run(self) -> None:
+        """Owner task: own the session, process the call queue, reconnect on error."""
+        stack: AsyncExitStack | None = None
+        session: Any = None
+
+        async def connect() -> Any:
+            nonlocal stack, session
+            if self._session_factory is not None:
+                session = await self._session_factory()
+                stack = None
+            else:
+                from mcp import ClientSession, StdioServerParameters  # noqa: PLC0415
+                from mcp.client.stdio import stdio_client  # noqa: PLC0415
+
+                params = StdioServerParameters(command=self._command, args=[self._server_path])
+                stack = AsyncExitStack()
+                read, write = await stack.enter_async_context(stdio_client(params))
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+            log.info("spotify_mcp_session_started", server=self._server_path)
+            return session
+
+        async def teardown() -> None:
+            nonlocal stack, session
+            if stack is not None:
+                try:
+                    await stack.aclose()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("spotify_mcp_session_close_error", error=str(exc))
+            stack, session = None, None
+
+        try:
+            while True:
+                item = await self._queue.get()
+                if item is None:  # shutdown
+                    break
+                tool, arguments, fut = item
+                if fut.done():  # caller already gave up
+                    continue
+
+                last_exc: Exception | None = None
+                for attempt in range(2):  # one reconnect-and-retry
+                    try:
+                        if session is None:
+                            await connect()
+                        result = await session.call_tool(tool, arguments)
+                        if not fut.done():
+                            fut.set_result(_content_text(result))
+                        last_exc = None
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        log.warning(
+                            "spotify_mcp_call_failed_reconnecting",
+                            tool=tool, attempt=attempt + 1, error=str(exc),
+                        )
+                        await teardown()  # safe — same (owner) task scope
+                        await asyncio.sleep(0.3)
+                if last_exc is not None and not fut.done():
+                    fut.set_exception(last_exc)
+        finally:
+            await teardown()
 
 
 class SpotifyMCPClient:
-    """HTTP client that forwards tool calls to the Spotify MCP server.
+    """``SpotifyClientProtocol`` implementation over the MCP stdio server.
 
-    The MCP server exposes a ``POST /tools/call`` endpoint (via supergateway)
-    that accepts ``{"name": "<tool>", "arguments": {...}}`` and returns the
-    tool result as JSON.
-
-    Args:
-        cfg: Application settings containing ``spotify_mcp_url`` and Langfuse
-             credentials.
-
-    Example::
-
-        client = SpotifyMCPClient(cfg=settings)
-        track = await client.get_currently_playing()
+    A single client is created at startup (``main.lifespan``) and shared via
+    ``Depends(get_spotify_client)``.  When ``cfg.spotify_mcp_server_path`` is
+    empty the client stays inert: ``prewarm`` is a no-op and every method raises,
+    which callers already handle as a degraded-Spotify path.
     """
 
     def __init__(self, cfg: Settings) -> None:
         self._cfg = cfg
-        self._http: httpx.AsyncClient | None = None
+        self._bridge = _McpBridge(cfg.spotify_mcp_command, cfg.spotify_mcp_server_path)
 
     async def prewarm(self) -> None:
-        """Open the underlying HTTP connection pool during lifespan startup.
-
-        Calling this once at startup means the first real Spotify request
-        does not pay the TCP + TLS handshake cost.  Safe to call multiple
-        times — subsequent calls are a no-op if the client is already open.
-        """
-        await self._get_http()
-
-    async def _get_http(self) -> httpx.AsyncClient:
-        """Return (or lazily create) the shared HTTP client.
-
-        The client reuses a single connection pool for the lifetime of the
-        application, which is more efficient than opening a new connection per
-        call.
-        """
-        if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(
-                base_url=self._cfg.spotify_mcp_url,
-                timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
-            )
-        return self._http
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4))
-    async def _call(self, tool: str, **arguments: Any) -> Any:
-        """Forward *tool* with *arguments* to the MCP server.
-
-        Retries up to three times on transient HTTP errors.  Raises
-        ``httpx.HTTPStatusError`` if all retries are exhausted.
-
-        Args:
-            tool:      MCP tool name (e.g. ``get_currently_playing``).
-            arguments: Keyword arguments forwarded as the tool's ``arguments``
-                       dict.
-
-        Returns:
-            The parsed JSON response from the MCP server.
-
-        Raises:
-            httpx.HTTPStatusError: On non-2xx response after all retries.
-        """
-        http = await self._get_http()
-        response = await http.post("/tools/call", json={"name": tool, "arguments": arguments})
-        response.raise_for_status()
-        return response.json()
-
-    async def get_currently_playing(self) -> dict | None:
-        """Return the track currently playing or ``None`` if nothing is active.
-
-        Returns:
-            Track dict with keys ``uri``, ``name``, ``artist``,
-            ``is_playing``, ``progress_ms``, and audio features if available.
-            ``None`` if no device is active.
-        """
-        with _span(self._cfg, "spotify.get_currently_playing"):
-            return await self._call("get_currently_playing")
-
-    async def get_recently_played(self, limit: int = 10) -> list[dict]:
-        """Return the *limit* most recently played tracks, newest first.
-
-        Args:
-            limit: Number of tracks to return (max 50, Spotify default 20).
-
-        Returns:
-            List of track dicts, each including ``uri``, ``name``,
-            ``artist``, and ``played_at`` (ISO-8601 string).
-        """
-        with _span(self._cfg, "spotify.get_recently_played"):
-            return await self._call("get_recently_played", limit=limit)
-
-    async def get_top_artists(self, time_range: str = "medium_term", limit: int = 10) -> list[dict]:
-        """Return the user's top artists for the given time range.
-
-        Args:
-            time_range: ``short_term`` (≈4 weeks), ``medium_term`` (≈6 months),
-                        or ``long_term`` (all time).
-            limit: Number of artists to return (max 50).
-
-        Returns:
-            List of artist dicts with ``uri``, ``name``, and ``genres``.
-        """
-        with _span(self._cfg, "spotify.get_top_artists"):
-            return await self._call("get_top_artists", time_range=time_range, limit=limit)
-
-    async def get_audio_features(self, uris: list[str]) -> list[dict]:
-        """Return audio features for the given Spotify track URIs.
-
-        Features per track: ``energy``, ``valence``, ``tempo``, ``danceability``,
-        ``key`` (pitch class 0–11), ``mode`` (0=minor, 1=major), ``loudness``,
-        ``speechiness``, ``acousticness``, ``instrumentalness``, ``liveness``.
-
-        Args:
-            uris: List of Spotify track URIs (``spotify:track:<id>``).
-
-        Returns:
-            List of feature dicts in the same order as *uris*.
-        """
-        with _span(self._cfg, "spotify.get_audio_features"):
-            return await self._call("get_audio_features", uris=uris)
-
-    async def search_tracks(self, query: str, limit: int = 10) -> list[dict]:
-        """Search Spotify for tracks matching *query*.
-
-        Args:
-            query: Free-text search query, optionally with Spotify field
-                   filters (e.g. ``artist:Tems genre:afropop``).
-            limit: Maximum number of results (max 50).
-
-        Returns:
-            List of track dicts ordered by Spotify relevance.
-        """
-        with _span(self._cfg, "spotify.search_tracks"):
-            return await self._call("search_tracks", query=query, limit=limit)
-
-    async def start_playback(self, uri: str, device_id: str | None = None) -> dict:
-        """Start or resume playback of *uri* on the specified device.
-
-        Args:
-            uri:       Spotify URI of the track to play
-                       (``spotify:track:<id>``).
-            device_id: Target device ID.  If ``None``, Spotify routes to the
-                       currently active device.
-
-        Returns:
-            Dict confirming playback state: ``{"status": "playing", "uri": ...}``.
-
-        Raises:
-            httpx.HTTPStatusError: 403 if the user does not have Spotify
-                Premium (required for playback control).
-        """
-        with _span(self._cfg, "spotify.start_playback"):
-            return await self._call("start_playback", uri=uri, device_id=device_id)
-
-    async def save_track(self, uri: str) -> dict:
-        """Save *uri* to the user's Liked Songs library.
-
-        Args:
-            uri: Spotify track URI.
-
-        Returns:
-            Confirmation dict ``{"status": "saved", "uri": ...}``.
-        """
-        with _span(self._cfg, "spotify.save_track"):
-            return await self._call("save_track", uri=uri)
-
-    async def add_to_queue(self, uri: str) -> dict:
-        """Add *uri* to the end of the user's active playback queue.
-
-        Args:
-            uri: Spotify track URI.
-
-        Returns:
-            Confirmation dict ``{"status": "queued", "uri": ...}``.
-        """
-        with _span(self._cfg, "spotify.add_to_queue"):
-            return await self._call("add_to_queue", uri=uri)
-
-    async def create_playlist(self, name: str, description: str = "") -> dict:
-        """Create a new playlist in the user's Spotify account.
-
-        Args:
-            name:        Playlist name (max 100 chars).
-            description: Optional playlist description shown in Spotify UI.
-
-        Returns:
-            Playlist metadata: ``{"id": ..., "name": ..., "uri": ...}``.
-        """
-        with _span(self._cfg, "spotify.create_playlist"):
-            return await self._call("create_playlist", name=name, description=description)
-
-    async def add_tracks_to_playlist(self, playlist_id: str, uris: list[str]) -> dict:
-        """Add *uris* to the playlist identified by *playlist_id*.
-
-        Args:
-            playlist_id: Spotify playlist ID (not URI).
-            uris:        List of track URIs to append.
-
-        Returns:
-            Result dict including ``{"added": <count>}``.
-        """
-        with _span(self._cfg, "spotify.add_tracks_to_playlist"):
-            return await self._call("add_tracks_to_playlist", playlist_id=playlist_id, uris=uris)
-
-    async def get_artist_info(self, artist_id: str) -> dict:
-        """Return metadata for the Spotify artist *artist_id*.
-
-        Args:
-            artist_id: Spotify artist ID.
-
-        Returns:
-            Dict with ``name``, ``genres``, ``popularity``, ``followers``,
-            and ``images``.
-        """
-        with _span(self._cfg, "spotify.get_artist_info"):
-            return await self._call("get_artist_info", artist_id=artist_id)
-
-    async def get_artist_top_tracks(self, artist_id: str) -> list[dict]:
-        """Return the artist's top tracks in the user's market.
-
-        Args:
-            artist_id: Spotify artist ID.
-
-        Returns:
-            List of up to 10 track dicts ordered by popularity.
-        """
-        with _span(self._cfg, "spotify.get_artist_top_tracks"):
-            return await self._call("get_artist_top_tracks", artist_id=artist_id)
+        """Start the MCP session at app startup (no-op if unconfigured)."""
+        if not self._cfg.spotify_mcp_server_path:
+            log.info("spotify_mcp_disabled", reason="spotify_mcp_server_path not set")
+            return
+        await self._bridge.start()
 
     async def close(self) -> None:
-        """Close the underlying HTTP connection pool.
+        """Stop the MCP session at app shutdown."""
+        await self._bridge.stop()
 
-        Called automatically by the application lifespan on shutdown.
-        """
-        if self._http and not self._http.is_closed:
-            await self._http.aclose()
+    async def _call(self, tool: str, **arguments: Any) -> str:
+        with _span(self._cfg, f"spotify.{tool}"):
+            return await self._bridge.call(tool, arguments)
+
+    # ── Reads ────────────────────────────────────────────────────────────────
+
+    async def get_currently_playing(self) -> dict | None:
+        return parse_now_playing(await self._call("getNowPlaying"))
+
+    async def get_recently_played(self, limit: int = 10) -> list[dict]:
+        return parse_tracks(await self._call("getRecentlyPlayed", limit=limit))
+
+    async def get_top_artists(self, time_range: str = "medium_term", limit: int = 10) -> list[dict]:
+        return parse_artists(
+            await self._call("getTopArtists", timeRange=time_range, limit=limit)
+        )
+
+    async def get_top_tracks(self, time_range: str = "medium_term", limit: int = 10) -> list[dict]:
+        return parse_tracks(
+            await self._call("getTopTracks", timeRange=time_range, limit=limit)
+        )
+
+    # Spotify caps search ``limit`` at 10 for Development-Mode apps (a >10 value
+    # returns HTTP 400 "Invalid limit"), so we clamp it here defensively.
+    _SEARCH_LIMIT_MAX = 10
+
+    async def search_tracks(self, query: str, limit: int = 10) -> list[dict]:
+        capped = min(limit, self._SEARCH_LIMIT_MAX)
+        return parse_tracks(
+            await self._call("searchSpotify", query=query, type="track", limit=capped)
+        )
+
+    # ── Playback / writes ────────────────────────────────────────────────────
+
+    async def start_playback(self, uri: str, device_id: str | None = None) -> dict:
+        args: dict[str, Any] = {"uri": uri}
+        if device_id:
+            args["deviceId"] = device_id
+        text = await self._call("playMusic", **args)
+        return {"status": "playing", "uri": uri, "detail": text}
+
+    async def save_track(self, uri: str) -> dict:
+        """Saving a single track is not exposed by the MCP server (album-only)."""
+        log.info("spotify_save_track_unsupported", uri=uri)
+        return {"status": "unsupported", "uri": uri}
+
+    async def add_to_queue(self, uri: str) -> dict:
+        text = await self._call("addToQueue", uri=uri)
+        return {"status": "queued", "uri": uri, "detail": text}
+
+    async def create_playlist(self, name: str, description: str = "") -> dict:
+        text = await self._call("createPlaylist", name=name, description=description)
+        from backend.app.tools.spotify_parse import _ID  # noqa: PLC0415
+
+        match = _ID.search(text)
+        playlist_id = match.group("id") if match else ""
+        return {"id": playlist_id, "name": name, "detail": text}
+
+    async def add_tracks_to_playlist(self, playlist_id: str, uris: list[str]) -> dict:
+        text = await self._call(
+            "addTracksToPlaylist", playlistId=playlist_id, trackUris=uris
+        )
+        return {"status": "ok", "added": len(uris), "detail": text}
+
+    # ── Artist helpers (no MCP tool — graceful fallbacks) ────────────────────
+
+    async def get_artist_info(self, artist_id: str) -> dict:
+        """No artist-info tool exists; return a minimal placeholder."""
+        return {"id": artist_id, "name": "", "genres": []}
+
+    async def get_artist_top_tracks(self, artist_id: str) -> list[dict]:
+        """No artist-top-tracks tool exists; ArtistService uses search instead."""
+        return []

@@ -1,0 +1,60 @@
+diff --git a/src/read.ts b/src/read.ts
+index 327dcab..a455c28 100644
+--- a/src/read.ts
++++ b/src/read.ts
+@@ -853,7 +853,7 @@ const getTopArtists: tool<{
+       );
+     });
+ 
+-    if (top.items.length === 0) {
++    if (!top?.items || top.items.length === 0) {
+       return {
+         content: [
+           { type: 'text', text: 'No top artists found for this time range.' },
+@@ -863,11 +863,18 @@ const getTopArtists: tool<{
+ 
+     const formatted = top.items
+       .map((artist, i) => {
++        // Spotify's Feb-2026 API change can omit `genres` (and `popularity`),
++        // so guard against undefined rather than assuming they're present.
++        const genreList = artist.genres ?? [];
+         const genres =
+-          artist.genres.length > 0
+-            ? ` - Genres: ${artist.genres.slice(0, 3).join(', ')}`
++          genreList.length > 0
++            ? ` - Genres: ${genreList.slice(0, 3).join(', ')}`
++            : '';
++        const popularity =
++          typeof artist.popularity === 'number'
++            ? ` - Popularity: ${artist.popularity}`
+             : '';
+-        return `${i + 1}. ${artist.name} - Popularity: ${artist.popularity}${genres} - ID: ${artist.id}`;
++        return `${i + 1}. ${artist.name}${popularity}${genres} - ID: ${artist.id}`;
+       })
+       .join('\n');
+ 
+diff --git a/src/utils.ts b/src/utils.ts
+index 4decdfc..506d594 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -129,7 +129,10 @@ export async function createSpotifyApi(): Promise<SpotifyApi> {
+       !config.expiresAt || config.expiresAt <= now + 5 * 60 * 1000;
+ 
+     if (shouldRefresh) {
+-      console.log(
++      // Use stderr, not stdout: for a stdio MCP server stdout IS the JSON-RPC
++      // channel, and logging to it corrupts the protocol stream (breaks the
++      // client mid-session on token refresh).
++      console.error(
+         'Access token expired or missing expiration time, refreshing...',
+       );
+       try {
+@@ -137,7 +140,7 @@ export async function createSpotifyApi(): Promise<SpotifyApi> {
+         config.accessToken = tokens.access_token;
+         config.expiresAt = now + tokens.expires_in * 1000; // Convert seconds to milliseconds
+         saveSpotifyConfig(config);
+-        console.log('Access token refreshed successfully');
++        console.error('Access token refreshed successfully');
+ 
+         // Clear cached API instance to force recreation with new token
+         cachedSpotifyApi = null;

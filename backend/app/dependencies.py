@@ -30,11 +30,15 @@ from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
-from backend.app.config import Settings, settings as _default_settings
+from backend.app.config import Settings
+from backend.app.config import settings as _default_settings
 from backend.app.db.session import AsyncSessionLocal
-from backend.app.interfaces import SpotifyClientProtocol
+from backend.app.interfaces import SpotifyClientProtocol, WeatherClientProtocol
 from backend.app.observability.logging import get_logger
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.tools.brave import BraveSearchClient
+from backend.app.tools.spotify_web import SpotifyWebClient
+from backend.app.tools.weather import MockWeatherClient, WeatherClient
 
 logger = get_logger(__name__)
 
@@ -133,6 +137,23 @@ def get_weaviate_client(request: Request) -> WeaviateClient:
     return request.app.state.weaviate  # type: ignore[return-value]
 
 
+# ── Prompt registry ───────────────────────────────────────────────────────────
+
+
+def get_prompt_registry(request: Request) -> PromptRegistry:
+    """Return the app-level ``PromptRegistry`` stored on ``app.state``.
+
+    Built once in ``lifespan`` so every request shares the same compiled
+    templates.  Falls back to the process-wide singleton if the app-state
+    instance is missing (e.g. in lightweight tests that don't run lifespan).
+
+    Override in tests via ``app.dependency_overrides[get_prompt_registry]`` to
+    inject a registry pointing at fixture templates.
+    """
+    registry = getattr(request.app.state, "prompts", None)
+    return registry if registry is not None else get_registry()
+
+
 # ── Brave Search client ───────────────────────────────────────────────────────
 
 
@@ -144,3 +165,31 @@ def get_brave_client(cfg: Settings = Depends(get_settings)) -> BraveSearchClient
     ``app.dependency_overrides[get_brave_client]``.
     """
     return BraveSearchClient(api_key=cfg.brave_api_key)
+
+
+# ── Weather client ────────────────────────────────────────────────────────────
+
+
+def get_weather_client(
+    cfg: Settings = Depends(get_settings),
+) -> WeatherClientProtocol:
+    """Return a weather client — live Open-Meteo or a mock when disabled.
+
+    A new instance is created per-request (stateless).  When
+    ``WEATHER_ENABLED=false`` a ``MockWeatherClient`` is returned so the planner
+    still works offline without making network calls.  Override in tests via
+    ``app.dependency_overrides[get_weather_client]``.
+    """
+    return WeatherClient() if cfg.weather_enabled else MockWeatherClient()
+
+
+# ── Spotify Web API client (playlists / profile) ──────────────────────────────
+
+
+def get_spotify_web_client(cfg: Settings = Depends(get_settings)) -> SpotifyWebClient:
+    """Return a direct Spotify Web API client for the gaps the MCP server can't do.
+
+    Used for playlist creation (current ``/v1/me/playlists`` endpoint) and the
+    user profile.  Override in tests via ``dependency_overrides``.
+    """
+    return SpotifyWebClient(cfg)

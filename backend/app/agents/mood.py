@@ -1,37 +1,39 @@
-"""Mood agent — detect mood from listening session, surface proactive insights.
+"""Mood agent — detect mood from recent listening, surface proactive insights.
 
 ``MoodService.analyze()`` is the entry point.  It:
 
 1. Determines the current time bucket (e.g. ``"sunday_evening"``).
-2. Fetches the user's known mood pattern for that bucket from Weaviate.
-3. Compares the currently playing track's audio features to the pattern.
-4. If deviation is significant, generates a proactive observation in Gia's voice.
+2. Labels the mood of the user's *recently played* tracks via the LLM labeler
+   (Spotify no longer exposes audio features — see ``mood.labeler``).
+3. Fetches the user's known mood pattern for that bucket from Weaviate.
+4. If the current label differs from the pattern, drafts a proactive observation.
 5. Returns a ``MoodResult`` for injection into the crew reply.
 
-The mood classifier is intentionally a simple quadrant model (no LLM).  Fast,
-free, and explainable.  The LLM is used only to phrase the observation warmly.
+Mood is a closed-vocabulary label (``mood.classifier.MOOD_LABELS``), so current
+vs. pattern is a clean string comparison; the LLM is used to label and to phrase.
 """
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from crewai import Agent
 
 from backend.app.config import Settings
 from backend.app.interfaces import SpotifyClientProtocol
-from backend.app.memory.embeddings import embed
 from backend.app.memory.store import WeaviateMemoryStore
-from backend.app.mood.classifier import classify_mood, deviates_significantly, time_bucket
+from backend.app.mood.classifier import time_bucket
+from backend.app.mood.labeler import label_mood
 from backend.app.mood.proactive import _parse_pattern, get_pattern_for_now
 from backend.app.observability.logging import get_logger
-from backend.app.persona.prompt import GIA_PERSONA
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_fast_llm
-from backend.app.schemas.memory import MemoryEntry
 
 logger = get_logger(__name__)
+
+AGENT_KEY = "agents.mood"
 
 
 @dataclass
@@ -53,27 +55,22 @@ class MoodResult:
     proactive_draft: str | None = None
 
 
-def build_mood_agent(cfg: Settings) -> Agent:
-    """Construct the CrewAI Mood agent.
+def build_mood_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
+    """Construct the CrewAI Mood agent from the externalised prompt registry.
 
     Args:
-        cfg: Application settings.
+        cfg:      Application settings.
+        registry: Prompt registry for the agent identity; defaults to the
+                  process-wide singleton.
 
     Returns:
         Configured ``crewai.Agent``.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="Mood Analyst",
-        goal=(
-            "Detect what mood the user is in from their listening patterns and "
-            "surface genuine, unprompted observations when something shifts."
-        ),
-        backstory=(
-            "You are Gia's awareness layer. You read audio features like a "
-            "therapist reads body language — quietly, without making it weird. "
-            "When you notice the user drifting out of their usual pattern, you "
-            "mention it once, warmly, and let them decide what to make of it."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_fast_llm(cfg),
         verbose=False,
         allow_delegation=False,
@@ -93,6 +90,7 @@ class MoodService:
     spotify: SpotifyClientProtocol
     store: WeaviateMemoryStore
     cfg: Settings
+    registry: PromptRegistry = field(default_factory=get_registry)
 
     async def analyze(self, user_id: str) -> MoodResult:
         """Run mood analysis for *user_id*.
@@ -107,24 +105,19 @@ class MoodService:
             ``MoodResult`` populated with current label, pattern label, and
             an optional proactive draft.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         bucket = time_bucket(now.hour, now.weekday())
 
-        # ── Get currently playing track features ──────────────────────────────
+        # ── Label the current mood from what they're actually playing ─────────
         try:
-            now_playing = await self.spotify.get_currently_playing()
+            recent = await self.spotify.get_recently_played(limit=10)
         except Exception as exc:  # noqa: BLE001
             logger.warning("mood_spotify_error", error=str(exc))
-            now_playing = None
+            recent = []
 
-        if not now_playing:
-            return MoodResult(current_label="neutral", bucket=bucket)
+        current_label = await label_mood(recent, self.cfg) if recent else "neutral"
 
-        current_energy = float(now_playing.get("energy") or 0.5)
-        current_valence = float(now_playing.get("valence") or 0.5)
-        current_label = classify_mood(current_energy, current_valence)
-
-        # ── Fetch known pattern ───────────────────────────────────────────────
+        # ── Fetch the known pattern for this time bucket ──────────────────────
         try:
             pattern = await get_pattern_for_now(user_id, self.store)
         except Exception as exc:  # noqa: BLE001
@@ -134,11 +127,8 @@ class MoodService:
         if pattern is None:
             return MoodResult(current_label=current_label, bucket=bucket)
 
-        pattern_energy, pattern_valence = _parse_pattern(pattern.text)
-        pattern_label = classify_mood(pattern_energy, pattern_valence)
-        deviation = deviates_significantly(
-            current_energy, current_valence, pattern_energy, pattern_valence
-        )
+        pattern_label = _parse_pattern(pattern.text)
+        deviation = current_label not in ("neutral", pattern_label)
 
         if not deviation:
             return MoodResult(
@@ -148,16 +138,8 @@ class MoodService:
                 deviation=False,
             )
 
-        # ── Draft proactive observation ───────────────────────────────────────
-        track_name = now_playing.get("name", "this track")
-        draft = await self._draft_observation(
-            bucket=bucket,
-            pattern_label=pattern_label,
-            current_label=current_label,
-            track_name=track_name,
-            pattern_energy=pattern_energy,
-            current_energy=current_energy,
-        )
+        # ── Draft a proactive observation about the shift ─────────────────────
+        draft = await self._draft_observation(bucket, pattern_label, current_label)
 
         logger.info(
             "mood_deviation_detected",
@@ -180,40 +162,26 @@ class MoodService:
         bucket: str,
         pattern_label: str,
         current_label: str,
-        track_name: str,
-        pattern_energy: float,
-        current_energy: float,
     ) -> str:
-        """Generate a warm, natural proactive observation using the LLM.
+        """Generate a warm, natural observation about a mood shift via the LLM.
 
         Falls back to a template string if the LLM call fails.
 
         Args:
-            bucket:          Time bucket string (e.g. ``"sunday_evening"``).
-            pattern_label:   User's typical mood for this bucket.
-            current_label:   Current mood label.
-            track_name:      Name of the currently playing track.
-            pattern_energy:  Expected energy level.
-            current_energy:  Actual energy level.
+            bucket:        Time bucket string (e.g. ``"sunday_evening"``).
+            pattern_label: User's typical mood for this bucket.
+            current_label: The mood their current listening reads as.
 
         Returns:
             Proactive observation string in Gia's voice.
         """
         bucket_human = bucket.replace("_", " ")
-        direction = "higher" if current_energy > pattern_energy else "lower"
-
-        prompt = (
-            GIA_PERSONA
-            + f"""
-The user is typically in a "{pattern_label}" mood during {bucket_human}.
-Right now they're listening to "{track_name}" which reads as "{current_label}" — energy is {direction} than usual.
-
-Write a single warm, natural observation that Gia might surface in conversation.
-- Maximum 2 sentences.
-- Use one audio tag sparingly ([thoughtful], [curious], [warmly]).
-- Do NOT say "Your audio features show..." — speak like a friend, not an analyst.
-- End with a gentle open question or leave it open for the user to respond.
-"""
+        prompt = self.registry.get(AGENT_KEY).render(
+            "observation",
+            persona=self.registry.get("persona.gia").render(),
+            pattern_label=pattern_label,
+            bucket_human=bucket_human,
+            current_label=current_label,
         )
 
         llm = get_fast_llm(self.cfg)

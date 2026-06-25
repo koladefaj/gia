@@ -19,10 +19,10 @@ from __future__ import annotations
 import asyncio
 import uuid as uuid_lib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from weaviate import WeaviateClient
-from weaviate.classes.query import Filter, MetadataQuery
+from weaviate.classes.query import Filter, HybridFusion, MetadataQuery
 
 from backend.app.observability.logging import get_logger
 from backend.app.schemas.memory import ExtractedMemory, MemoryEntry
@@ -45,7 +45,7 @@ def _obj_to_entry(obj) -> MemoryEntry:  # type: ignore[return]
     if isinstance(created_at, str):
         created_at = datetime.fromisoformat(created_at)
     if created_at is None:
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(UTC)
 
     score = 0.0
     if obj.metadata is not None:
@@ -111,6 +111,56 @@ class WeaviateMemoryStore:
 
         return await asyncio.to_thread(_run)
 
+    async def hybrid_search(
+        self,
+        user_id: str,
+        query_text: str,
+        query_vector: list[float],
+        memory_type: str,
+        k: int = 5,
+        alpha: float = 0.5,
+    ) -> list[MemoryEntry]:
+        """Return top-*k* memories using hybrid (BM25 + dense) retrieval.
+
+        Pure vector search misses exact tokens — artist names, song titles, IDs
+        — because those carry little semantic signal but matter a lot here
+        ("play that *Tems* song"). Weaviate's ``hybrid`` runs BM25 over the
+        ``text`` property (its inverted index is on by default, so no schema
+        change is required) alongside the dense vector and fuses the two with
+        relative-score ranking.
+
+        Args:
+            user_id:      UUID string identifying the user.
+            query_text:   Raw user utterance — drives the BM25 / keyword leg.
+            query_vector: 768-dim embedding of the same query — drives the
+                          dense leg.
+            memory_type:  One of ``"preference"``, ``"mood_pattern"``, ``"episode"``.
+            k:            Maximum number of results to return.
+            alpha:        Dense vs keyword weight. ``1.0`` = pure vector,
+                          ``0.0`` = pure BM25, ``0.5`` = balanced.
+
+        Returns:
+            List of ``MemoryEntry`` ordered by fused relevance (best first).
+        """
+
+        def _run() -> list[MemoryEntry]:
+            col = self.client.collections.get("UserMemory")
+            results = col.query.hybrid(
+                query=query_text,
+                vector=query_vector,
+                alpha=alpha,
+                limit=k,
+                fusion_type=HybridFusion.RELATIVE_SCORE,
+                filters=(
+                    Filter.by_property("user_id").equal(user_id)
+                    & Filter.by_property("type").equal(memory_type)
+                ),
+                return_metadata=MetadataQuery(score=True),
+            )
+            return [_obj_to_entry(o) for o in results.objects]
+
+        return await asyncio.to_thread(_run)
+
     async def upsert_memory(
         self,
         user_id: str,
@@ -136,7 +186,7 @@ class WeaviateMemoryStore:
                     "type": memory.type,
                     "text": memory.text,
                     "confidence": memory.confidence,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": datetime.now(UTC).isoformat(),
                     "supersedes_id": memory.supersedes_id or "",
                 },
                 vector=vector,
@@ -183,5 +233,37 @@ class WeaviateMemoryStore:
             if obj is None:
                 return None
             return _obj_to_entry(obj)
+
+        return await asyncio.to_thread(_run)
+
+    async def fetch_by_type(
+        self, user_id: str, memory_type: str, limit: int = 50
+    ) -> list[MemoryEntry]:
+        """Fetch a user's memories of *memory_type* without a semantic query.
+
+        Unlike :meth:`search`, this is a filter-only scan (no vector) — used by
+        consolidation, which needs to read the *whole* set of a user's raw
+        memories to synthesise higher-order insights, not the top-k for a query.
+
+        Args:
+            user_id:     UUID string identifying the user.
+            memory_type: Memory class to fetch (e.g. ``"preference"``).
+            limit:       Maximum rows to return.
+
+        Returns:
+            List of ``MemoryEntry`` (newest-first not guaranteed — order is the
+            store's; consolidation doesn't depend on order).
+        """
+
+        def _run() -> list[MemoryEntry]:
+            col = self.client.collections.get("UserMemory")
+            results = col.query.fetch_objects(
+                limit=limit,
+                filters=(
+                    Filter.by_property("user_id").equal(user_id)
+                    & Filter.by_property("type").equal(memory_type)
+                ),
+            )
+            return [_obj_to_entry(o) for o in results.objects]
 
         return await asyncio.to_thread(_run)

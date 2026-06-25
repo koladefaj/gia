@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# Stored pattern in the format inference writes: "... {bucket}: {label}. ..."
+_PATTERN = "Mood pattern for sunday_evening: chill. Often plays Tems, Wizkid. Based on 8 plays."
 
 
 def _mem(text: str) -> MagicMock:
@@ -14,76 +17,57 @@ def _mem(text: str) -> MagicMock:
     return m
 
 
+def test_parse_pattern_extracts_label() -> None:
+    from backend.app.mood.proactive import _parse_pattern
+
+    assert _parse_pattern(_PATTERN) == "chill"
+    assert _parse_pattern("no marker here") == "neutral"
+
+
 @pytest.mark.asyncio
-async def test_check_and_draft_proactive_produces_draft_on_deviation() -> None:
-    """A significant energy deviation produces a draft stored in Redis."""
+async def test_check_and_draft_proactive_produces_draft_on_shift() -> None:
+    """A current mood different from the bucket's pattern drafts a nudge."""
     from backend.app.mood.proactive import check_and_draft_proactive
 
-    pattern_text = (
-        "Mood pattern for sunday_evening: wind-down. "
-        "avg energy=0.31, avg valence=0.72, avg tempo=90 BPM. "
-        "Based on 8 sessions (consistency σ=0.045)."
-    )
-    fake_store = MagicMock()
-    fake_store.search = AsyncMock(return_value=[_mem(pattern_text)])
     fake_redis = AsyncMock()
     fake_redis.setex = AsyncMock()
 
-    with __import__("unittest.mock", fromlist=["patch"]).patch(
-        "backend.app.mood.proactive.embed", new=AsyncMock(return_value=[0.0] * 768)
-    ), __import__("unittest.mock", fromlist=["patch"]).patch(
-        "backend.app.mood.proactive.datetime"
-    ) as mock_dt:
-        from datetime import datetime, timezone
-        mock_dt.now.return_value = datetime(2026, 6, 21, 20, 0, tzinfo=timezone.utc)  # Sunday 20h
-        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
-
-        draft = await check_and_draft_proactive(
-            user_id="user-1",
-            current_energy=0.8,  # High energy — deviates from pattern 0.31
-            current_valence=0.5,
-            store=fake_store,
-            redis=fake_redis,
-        )
+    with patch("backend.app.mood.proactive.get_pattern_for_now",
+               new=AsyncMock(return_value=_mem(_PATTERN))):
+        draft = await check_and_draft_proactive("user-1", "hype", MagicMock(), fake_redis)
 
     assert draft is not None
-    assert "pattern" in draft.lower() or "usually" in draft.lower() or "thoughtful" in draft.lower()
+    assert "chill" in draft and "hype" in draft
     fake_redis.setex.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_check_and_draft_no_deviation_returns_none() -> None:
-    """No draft when current features match the pattern."""
+async def test_check_and_draft_no_shift_returns_none() -> None:
+    """No draft when the current mood matches the pattern."""
     from backend.app.mood.proactive import check_and_draft_proactive
 
-    pattern_text = (
-        "Mood pattern for sunday_evening: wind-down. "
-        "avg energy=0.35, avg valence=0.70, avg tempo=90 BPM. "
-        "Based on 8 sessions."
-    )
-    fake_store = MagicMock()
-    fake_store.search = AsyncMock(return_value=[_mem(pattern_text)])
     fake_redis = AsyncMock()
 
-    with __import__("unittest.mock", fromlist=["patch"]).patch(
-        "backend.app.mood.proactive.embed", new=AsyncMock(return_value=[0.0] * 768)
-    ), __import__("unittest.mock", fromlist=["patch"]).patch(
-        "backend.app.mood.proactive.datetime"
-    ) as mock_dt:
-        from datetime import datetime, timezone
-        mock_dt.now.return_value = datetime(2026, 6, 21, 20, 0, tzinfo=timezone.utc)
-        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
-
-        draft = await check_and_draft_proactive(
-            user_id="user-1",
-            current_energy=0.33,  # Close to pattern 0.35 — no deviation
-            current_valence=0.68,
-            store=fake_store,
-            redis=fake_redis,
-        )
+    with patch("backend.app.mood.proactive.get_pattern_for_now",
+               new=AsyncMock(return_value=_mem(_PATTERN))):
+        draft = await check_and_draft_proactive("user-1", "chill", MagicMock(), fake_redis)
 
     assert draft is None
     fake_redis.setex.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_check_and_draft_neutral_current_returns_none() -> None:
+    """A neutral current label is not a meaningful shift — no draft."""
+    from backend.app.mood.proactive import check_and_draft_proactive
+
+    fake_redis = AsyncMock()
+
+    with patch("backend.app.mood.proactive.get_pattern_for_now",
+               new=AsyncMock(return_value=_mem(_PATTERN))):
+        draft = await check_and_draft_proactive("user-1", "neutral", MagicMock(), fake_redis)
+
+    assert draft is None
 
 
 @pytest.mark.asyncio
@@ -91,20 +75,10 @@ async def test_check_and_draft_no_pattern_returns_none() -> None:
     """No draft when no pattern exists for the current bucket."""
     from backend.app.mood.proactive import check_and_draft_proactive
 
-    fake_store = MagicMock()
-    fake_store.search = AsyncMock(return_value=[])  # No patterns stored
     fake_redis = AsyncMock()
 
-    with __import__("unittest.mock", fromlist=["patch"]).patch(
-        "backend.app.mood.proactive.embed", new=AsyncMock(return_value=[0.0] * 768)
-    ):
-        draft = await check_and_draft_proactive(
-            user_id="user-1",
-            current_energy=0.8,
-            current_valence=0.5,
-            store=fake_store,
-            redis=fake_redis,
-        )
+    with patch("backend.app.mood.proactive.get_pattern_for_now", new=AsyncMock(return_value=None)):
+        draft = await check_and_draft_proactive("user-1", "hype", MagicMock(), fake_redis)
 
     assert draft is None
 

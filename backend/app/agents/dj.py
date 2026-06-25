@@ -9,51 +9,53 @@
 5. Optionally starts Spotify playback immediately.
 
 The CrewAI ``Agent`` (from ``build_dj_agent``) is returned for composition
-into multi-agent crews starting Day 6.  For Days 4-5 the service method
-is called directly from the API layer.
+into multi-agent crews.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from crewai import Agent
 
 from backend.app.config import Settings
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.observability.logging import get_logger
-from backend.app.persona.prompt import GIA_PERSONA
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_llm
 from backend.app.schemas.dj import CrossfadeQueue, DJResponse, TrackItem
-from backend.app.tools.crossfade import build_key_matched_sequence, track_from_dict
 
 logger = get_logger(__name__)
 
+AGENT_KEY = "agents.dj"
 
-def build_dj_agent(cfg: Settings) -> Agent:
-    """Construct the CrewAI DJ agent.
+
+def _to_track(raw: dict) -> TrackItem:
+    """Build a ``TrackItem`` from a Spotify search result (uri / name / artist)."""
+    return TrackItem(
+        uri=str(raw.get("uri", "")),
+        name=str(raw.get("name", "")),
+        artist=str(raw.get("artist", "")),
+    )
+
+
+def build_dj_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
+    """Construct the CrewAI DJ agent from the externalised prompt registry.
 
     Args:
-        cfg: Application settings (LLM provider / model).
+        cfg:      Application settings (LLM provider / model).
+        registry: Prompt registry to read the agent identity from; defaults to
+                  the process-wide singleton.
 
     Returns:
         A configured ``crewai.Agent`` ready to be composed into a crew.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="DJ",
-        goal=(
-            "Discover tracks that match the user's mood and taste, build a "
-            "Camelot-compatible crossfade queue, and recommend with a brief, "
-            "grounded reason."
-        ),
-        backstory=(
-            "You are Gia's DJ brain. You know the user's taste intimately — "
-            "their preferred genres, energy levels, and which artists they "
-            "keep coming back to. You sequence tracks the way a real DJ would: "
-            "smooth energy transitions, harmonically compatible keys, and "
-            "always grounded in what you know about this specific person."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_llm(cfg),
         verbose=False,
         allow_delegation=False,
@@ -71,6 +73,10 @@ class DJService:
 
     spotify: SpotifyClientProtocol
     cfg: Settings
+    registry: PromptRegistry = field(default_factory=get_registry)
+
+    # Honour at most this many explicitly-named tracks in a per-title request.
+    _MAX_NAMED_QUEUE = 10
 
     async def recommend(
         self,
@@ -78,67 +84,63 @@ class DJService:
         user_context_text: str = "",
         start_playback: bool = False,
         n: int = 4,
+        requested_titles: list[str] | None = None,
     ) -> DJResponse:
-        """Search for tracks, build a crossfade queue, and generate a recommendation.
+        """Search for tracks, build the queue, and generate a recommendation.
+
+        Two queue-building modes:
+
+        - **Per-title** — when the user named two or more specific tracks
+          (``requested_titles``), each title is searched on its own and the
+          matches are queued in the order named. "play So Will I and queue
+          Promises next" puts Promises *next*, not whatever a sequencer chose.
+        - **Vibe / single** — the search's top hit is the seed and the next
+          results are the queue, in relevance order.
+
+        Spotify no longer exposes audio features to new apps, so there is no
+        harmonic (Camelot/energy) sequencing to do — the real ordering signal is
+        either the user's stated order or search relevance.
 
         Args:
-            query:             Natural-language request from the user.
-            user_context_text: Rendered ``UserContext.to_prompt_text()`` string
-                               to inject into the LLM prompt for personalisation.
-                               Pass ``""`` when no context is available.
+            query:             Natural-language request (the router's resolved
+                               search string).
+            user_context_text: Rendered user context for the prompt.
             start_playback:    If ``True``, immediately start the seed track.
-            n:                 Queue depth (number of tracks after the seed).
+            n:                 Queue depth for vibe requests (ignored when the
+                               user named the tracks — those are honoured in full).
+            requested_titles:  Specific titles the user named, in order. The first
+                               is the primary "did you mean…?" target.
 
         Returns:
             A ``DJResponse`` with the recommendation, seed track, and queue.
 
         Raises:
-            ValueError: If no tracks are found for *query*.
+            ValueError: If no tracks are found at all.
         """
-        # ── 1. Search for candidate tracks ───────────────────────────────────
-        raw_tracks = await self.spotify.search_tracks(query, limit=20)
-        if not raw_tracks:
-            raise ValueError(f"No tracks found for query: {query!r}")
+        titles = [t.strip() for t in (requested_titles or []) if t and t.strip()]
 
-        # ── 2. Fetch audio features ───────────────────────────────────────────
-        uris = [t["uri"] for t in raw_tracks if t.get("uri")]
-        features = await self.spotify.get_audio_features(uris)
+        # ── 1. Build seed + queue ────────────────────────────────────────────
+        missing: list[str] = []
+        if len(titles) >= 2:
+            seed, queue_tracks, missing = await self._search_named_titles(titles)
+            if seed is None:  # none of the named tracks resolved → plain search
+                seed, queue_tracks = await self._search_query(query, n)
+        else:
+            seed, queue_tracks = await self._search_query(query, n)
 
-        # Merge name/artist from search result into audio feature dict
-        uri_to_meta: dict[str, dict] = {t["uri"]: t for t in raw_tracks if t.get("uri")}
-        candidates: list[TrackItem] = []
-        for feat in features:
-            uri = feat.get("uri", "")
-            meta = uri_to_meta.get(uri, {})
-            merged = {**feat, "name": meta.get("name", ""), "artist": meta.get("artist", "")}
-            candidates.append(track_from_dict(merged))
-
-        if not candidates:
-            raise ValueError(f"No audio features available for query: {query!r}")
-
-        # ── 3. Pick seed (first candidate) and sequence the rest ─────────────
-        seed = candidates[0]
-        rest = [c for c in candidates[1:] if c.uri != seed.uri]
-        queue_tracks = build_key_matched_sequence(seed, rest, n=n)
-
-        # ── 4. Generate natural language recommendation ───────────────────────
-        camelot = seed.camelot_key or "?"
+        # ── 2. Generate natural language recommendation ──────────────────────
         queued_names = ", ".join(f"{t.name} by {t.artist}" for t in queue_tracks[:3]) or "none"
-        context_block = f"\n{user_context_text}\n" if user_context_text else ""
-
-        prompt = (
-            GIA_PERSONA
-            + context_block
-            + f"""
-The user asked: "{query}"
-
-You found: {seed.name} by {seed.artist}
-  energy={seed.energy:.2f}, valence={seed.valence:.2f}, Camelot={camelot}
-
-Crossfade queue after it: {queued_names}
-
-Respond as Gia — recommend the seed track with a brief reason, mention the energy or mood fit, and note the queue is ready. Keep it warm and concise (2-4 sentences max).
-"""
+        prompt = self.registry.get(AGENT_KEY).render(
+            "task",
+            persona=self.registry.get("persona.gia").render(),
+            user_context=user_context_text,
+            query=query,
+            seed_name=seed.name,
+            seed_artist=seed.artist,
+            queued_names=queued_names,
+            start_playback=start_playback,
+            requested_title=titles[0] if titles else None,
+            missing_titles=", ".join(missing) or None,
         )
 
         llm = get_llm(self.cfg)
@@ -150,7 +152,7 @@ Respond as Gia — recommend the seed track with a brief reason, mention the ene
             logger.warning("dj_llm_error", error=str(exc))
             recommendation = f"Here's {seed.name} by {seed.artist} — should fit the vibe."
 
-        # ── 5. Optionally start playback ──────────────────────────────────────
+        # ── 3. Optionally start playback ─────────────────────────────────────
         playback_started = False
         if start_playback:
             await self.spotify.start_playback(seed.uri)
@@ -158,19 +160,44 @@ Respond as Gia — recommend the seed track with a brief reason, mention the ene
             logger.info("dj_playback_started", uri=seed.uri)
 
         logger.info(
-            "dj_recommend_done",
-            query=query,
-            seed=seed.name,
-            queue_depth=len(queue_tracks),
+            "dj_recommend_done", query=query, seed=seed.name, queue_depth=len(queue_tracks)
         )
 
         return DJResponse(
             recommendation=recommendation.strip(),
             primary_track=seed,
-            queue=CrossfadeQueue(
-                seed_uri=seed.uri,
-                tracks=queue_tracks,
-                crossfade_ms=3000,
-            ),
+            queue=CrossfadeQueue(seed_uri=seed.uri, tracks=queue_tracks, crossfade_ms=3000),
             playback_started=playback_started,
         )
+
+    async def _search_query(self, query: str, n: int) -> tuple[TrackItem, list[TrackItem]]:
+        """Search *query*; return its top hit as seed + the next *n* as the queue."""
+        raw_tracks = await self.spotify.search_tracks(query, limit=20)
+        items = [_to_track(t) for t in raw_tracks if t.get("uri")]
+        if not items:
+            raise ValueError(f"No tracks found for query: {query!r}")
+        seed = items[0]
+        queue_tracks = [t for t in items[1:] if t.uri != seed.uri][:n]
+        return seed, queue_tracks
+
+    async def _search_named_titles(
+        self, titles: list[str]
+    ) -> tuple[TrackItem | None, list[TrackItem], list[str]]:
+        """Search each named title and queue the matches in the user's order.
+
+        Returns ``(seed, queue_tracks, missing)``. ``seed`` is ``None`` when no
+        named title resolved at all (the caller then falls back to a plain query
+        search), and *missing* lists the titles Spotify returned nothing for.
+        """
+        found: list[TrackItem] = []
+        missing: list[str] = []
+        for title in titles[: self._MAX_NAMED_QUEUE]:
+            results = await self.spotify.search_tracks(title, limit=5)
+            hit = next((r for r in results if r.get("uri")), None)
+            if hit is not None:
+                found.append(_to_track(hit))
+            else:
+                missing.append(title)
+        if not found:
+            return None, [], missing
+        return found[0], found[1:], missing

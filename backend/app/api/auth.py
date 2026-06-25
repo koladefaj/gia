@@ -23,6 +23,7 @@ Security notes
   or in-process memory, so horizontal scaling is safe.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -30,21 +31,31 @@ import os
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Annotated
 from urllib.parse import urlencode
 
 import httpx
-from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from weaviate import WeaviateClient
 
 from backend.app.config import Settings
-from backend.app.db.models import Profile
-from backend.app.dependencies import get_db, get_redis, get_settings
+from backend.app.db.models import Profile, User
+from backend.app.dependencies import (
+    get_db,
+    get_redis,
+    get_settings,
+    get_spotify_client,
+    get_weaviate_client,
+)
+from backend.app.interfaces import SpotifyClientProtocol
+from backend.app.memory.profiler import bootstrap_taste_profile
+from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
-from backend.app.schemas.auth import SpotifyCallbackResponse, SpotifyStatusResponse
+from backend.app.schemas.auth import SpotifyStatusResponse
 
 router = APIRouter(prefix="/auth/spotify", tags=["auth"])
 logger = get_logger(__name__)
@@ -57,6 +68,8 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 PKCE_STATE_TTL_SECONDS = 600  # 10 minutes
 
 SCOPES = " ".join([
+    "user-read-email",
+    "user-read-private",
     "user-read-currently-playing",
     "user-read-recently-played",
     "user-top-read",
@@ -66,6 +79,8 @@ SCOPES = " ".join([
     "playlist-modify-public",
     "playlist-modify-private",
 ])
+
+SPOTIFY_ME_URL = "https://api.spotify.com/v1/me"
 
 _REDIS_KEY_PREFIX = "pkce:state:"
 
@@ -98,6 +113,155 @@ def _code_challenge(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode()).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
+
+# ==============================================================================
+# Onboarding helpers
+# ==============================================================================
+
+# Strong references to in-flight background tasks so the event loop does not
+# garbage-collect them mid-run (asyncio holds only weak refs to bare tasks).
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+async def _fetch_spotify_identity(access_token: str) -> dict:
+    """Return the authenticated user's Spotify profile (``GET /v1/me``).
+
+    Args:
+        access_token: A freshly minted Spotify access token.
+
+    Returns:
+        The decoded ``/me`` JSON (``id``, ``display_name``, ``email``, …).
+
+    Raises:
+        HTTPException 400: If the profile request fails.
+    """
+    async with httpx.AsyncClient() as http:
+        resp = await http.get(
+            SPOTIFY_ME_URL, headers={"Authorization": f"Bearer {access_token}"}
+        )
+    if resp.status_code != 200:
+        logger.error("spotify_me_failed", status=resp.status_code, body=resp.text)
+        raise HTTPException(status_code=400, detail="Could not read your Spotify profile.")
+    return resp.json()
+
+
+async def _upsert_user_from_spotify(
+    db: AsyncSession,
+    *,
+    requested_user_id: str | None,
+    me: dict,
+    access_token: str,
+    refresh_token: str,
+    expires_at: datetime,
+) -> tuple[uuid.UUID, bool]:
+    """Find-or-create the Gia user behind a Spotify identity and store tokens.
+
+    Resolution order:
+      1. An explicit ``requested_user_id`` (linking flow) — created if absent.
+      2. An existing ``Profile`` matching the Spotify account (returning user).
+      3. A brand-new ``User`` + ``Profile`` (first-time sign-in).
+
+    Args:
+        db:                Request-scoped database session.
+        requested_user_id: Optional existing Gia user ID to link to.
+        me:                The Spotify ``/me`` payload.
+        access_token:      Short-lived Spotify access token.
+        refresh_token:     Long-lived Spotify refresh token (may be empty).
+        expires_at:        UTC expiry of the access token.
+
+    Returns:
+        ``(user_id, created)`` — the resolved user UUID and whether a new
+        account was created this call (drives the one-time taste bootstrap).
+
+    Raises:
+        HTTPException 400: If ``requested_user_id`` is not a valid UUID.
+    """
+    spotify_user_id = me.get("id") or ""
+    display_name = me.get("display_name")
+    email = me.get("email")
+
+    profile: Profile | None = None
+    created = False
+
+    if requested_user_id:
+        try:
+            user_uuid = uuid.UUID(requested_user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"user_id {requested_user_id!r} is not a valid UUID."
+            ) from None
+        profile = (
+            await db.execute(select(Profile).where(Profile.user_id == user_uuid))
+        ).scalar_one_or_none()
+        if profile is None:
+            db.add(User(id=user_uuid, email=email))
+            profile = Profile(user_id=user_uuid)
+            db.add(profile)
+            created = True
+
+    if profile is None and spotify_user_id:
+        profile = (
+            await db.execute(
+                select(Profile).where(Profile.spotify_user_id == spotify_user_id)
+            )
+        ).scalar_one_or_none()
+
+    if profile is None:
+        # Reuse an existing user with this email (returning user who cleared
+        # local state); only match on a real address so null emails never
+        # collapse distinct accounts. Otherwise create a fresh user.
+        user: User | None = None
+        if email:
+            user = (
+                await db.execute(select(User).where(User.email == email))
+            ).scalar_one_or_none()
+        if user is None:
+            user = User(email=email)
+            db.add(user)
+            await db.flush()  # assign user.id before the Profile FK references it
+        profile = Profile(user_id=user.id)
+        db.add(profile)
+        created = True
+
+    profile.spotify_user_id = spotify_user_id or profile.spotify_user_id
+    profile.display_name = display_name or profile.display_name
+    profile.spotify_access_token = access_token
+    profile.spotify_refresh_token = refresh_token or profile.spotify_refresh_token
+    profile.spotify_token_expires_at = expires_at
+    await db.flush()
+    return profile.user_id, created
+
+
+def _schedule_taste_bootstrap(
+    user_id: str,
+    *,
+    spotify: SpotifyClientProtocol,
+    weaviate: WeaviateClient,
+    redis: AsyncRedis,
+    cfg: Settings,
+) -> None:
+    """Kick off the one-time taste-profile bootstrap without blocking the redirect.
+
+    The bootstrap only touches app-level singletons (Weaviate, Redis, the
+    Spotify MCP client), never the request-scoped DB session, so it is safe to
+    run after the response has been sent. Failures are logged, never surfaced.
+    """
+
+    async def _run() -> None:
+        try:
+            store = WeaviateMemoryStore(client=weaviate)
+            stored = await bootstrap_taste_profile(
+                user_id, spotify=spotify, store=store, redis=redis, cfg=cfg
+            )
+            logger.info("spotify_bootstrap_done", user_id=user_id, stored=len(stored))
+        except Exception as exc:  # noqa: BLE001 — best-effort, must not crash
+            logger.warning("spotify_bootstrap_error", user_id=user_id, error=str(exc))
+
+    task = asyncio.create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 # ==============================================================================
 # Route handlers
 # ==============================================================================
@@ -107,17 +271,30 @@ def _code_challenge(verifier: str) -> str:
 async def spotify_login(
     redis: Annotated[AsyncRedis, Depends(get_redis)],
     cfg: Annotated[Settings, Depends(get_settings)],
-    user_id: str = Query(..., description="Internal user ID to associate the Spotify account with"),
+    user_id: str | None = Query(
+        default=None,
+        description=(
+            "Existing Gia user ID to link this Spotify account to. Omit for a "
+            "fresh sign-in — the callback creates the user from the Spotify "
+            "identity."
+        ),
+    ),
 ) -> RedirectResponse:
-    """Initiate the Spotify OAuth 2.0 PKCE flow for a specific user.
+    """Initiate the Spotify OAuth 2.0 PKCE flow.
 
     Generates a code verifier and a cryptographic state token, stores both in
     Redis keyed by state (TTL = 10 min), then redirects the browser to
     Spotify's authorisation endpoint.
 
+    Two modes:
+      * **Fresh sign-in** (``user_id`` omitted) — the callback reads the
+        Spotify identity from ``/me`` and creates a ``User`` + ``Profile`` on
+        the fly, so a first-time visitor is onboarded end to end.
+      * **Link** (``user_id`` supplied) — the resulting tokens are attached to
+        that existing user.
+
     Args:
-        user_id: The internal Gia user ID whose ``Profile`` will receive the
-                 OAuth tokens after the callback succeeds.
+        user_id: Optional existing Gia user ID to link the Spotify account to.
         redis:   App-level Redis pool (injected).
         cfg:     Application settings (injected).
 
@@ -155,23 +332,29 @@ async def spotify_login(
 @router.get(
     "/callback",
     summary="Handle Spotify OAuth 2.0 callback",
-    response_model=SpotifyCallbackResponse,
-    status_code=200,
+    status_code=302,
 )
 async def spotify_callback(
     redis: Annotated[AsyncRedis, Depends(get_redis)],
     db: Annotated[AsyncSession, Depends(get_db)],
     cfg: Annotated[Settings, Depends(get_settings)],
+    spotify: Annotated[SpotifyClientProtocol, Depends(get_spotify_client)],
+    weaviate: Annotated[WeaviateClient, Depends(get_weaviate_client)],
     code: str = Query(default=""),
     state: str = Query(default=""),
     error: str = Query(default=""),
-) -> SpotifyCallbackResponse:
-    """Complete the PKCE exchange and persist tokens.
+) -> RedirectResponse:
+    """Complete the PKCE exchange, onboard the user, and return to the frontend.
 
-    Spotify redirects here after the user grants or denies permission.  This
-    handler retrieves the PKCE state from Redis, exchanges the authorisation
-    code for tokens, and stores the refresh token in the user's ``Profile``
-    row.  The Redis state entry is deleted after a single use.
+    Spotify redirects here after the user grants or denies permission. This
+    handler:
+      1. Validates and consumes the single-use PKCE state from Redis.
+      2. Exchanges the authorisation code for access + refresh tokens.
+      3. Reads the Spotify identity from ``/me`` and find-or-creates the Gia
+         ``User`` + ``Profile`` (so first-time visitors are fully onboarded).
+      4. For a brand-new account, schedules a one-time taste-profile bootstrap.
+      5. Redirects the browser back to the SPA with the resolved ``user_id`` so
+         the frontend can adopt the identity and start talking.
 
     Args:
         code:  The authorisation code returned by Spotify.
@@ -179,14 +362,9 @@ async def spotify_callback(
                up the PKCE verifier and user ID in Redis.
         error: Set by Spotify if the user denied permission or another OAuth
                error occurred.
-        redis: App-level Redis pool (injected).
-        db:    Database session (injected).
-        cfg:   Application settings (injected).
 
     Returns:
-        A JSON body confirming success, including the access token expiry time.
-        The refresh token is **not** included in the response body; it is stored
-        server-side in the ``Profile`` table.
+        A 302 redirect to ``{frontend_url}/?user_id=…&connected=1``.
 
     Raises:
         HTTPException 400: If Spotify returned an error, the state is invalid
@@ -194,6 +372,8 @@ async def spotify_callback(
     """
     if error:
         raise HTTPException(status_code=400, detail=f"Spotify denied authorisation: {error}")
+
+    logger.info("spotify_callback_received", has_code=bool(code), has_state=bool(state))
 
     raw = await redis.get(f"{_REDIS_KEY_PREFIX}{state}")
     if not raw:
@@ -203,50 +383,68 @@ async def spotify_callback(
     await redis.delete(f"{_REDIS_KEY_PREFIX}{state}")
     pkce_data = json.loads(raw)
     verifier: str = pkce_data["verifier"]
-    user_id: str = pkce_data["user_id"]
+    requested_user_id: str | None = pkce_data.get("user_id")
+
     try:
-        user_uuid = uuid.UUID(user_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"user_id {user_id!r} is not a valid UUID.")
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                SPOTIFY_TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": cfg.spotify_redirect_uri,
+                    "client_id": cfg.spotify_client_id,
+                    "code_verifier": verifier,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            if resp.status_code != 200:
+                logger.error("spotify_token_exchange_failed", status=resp.status_code, body=resp.text)
+                raise HTTPException(status_code=400, detail="Token exchange with Spotify failed.")
 
-    async with httpx.AsyncClient() as http:
-        resp = await http.post(
-            SPOTIFY_TOKEN_URL,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": cfg.spotify_redirect_uri,
-                "client_id": cfg.spotify_client_id,
-                "code_verifier": verifier,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        token_data = resp.json()
+        access_token: str = token_data["access_token"]
+        refresh_token: str = token_data.get("refresh_token", "")
+        expires_in: int = token_data.get("expires_in", 3600)
+        expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
+
+        me = await _fetch_spotify_identity(access_token)
+        user_uuid, created = await _upsert_user_from_spotify(
+            db,
+            requested_user_id=requested_user_id,
+            me=me,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_at=expires_at,
         )
-        if resp.status_code != 200:
-            logger.error("spotify_token_exchange_failed", status=resp.status_code, body=resp.text)
-            raise HTTPException(status_code=400, detail="Token exchange with Spotify failed.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Surface the real cause in the logs (message + type, plus traceback)
+        # and return the user to the app with an error flag, not a dead 500.
+        logger.exception(
+            "spotify_onboard_failed", error=str(exc), kind=type(exc).__name__
+        )
+        err = urlencode({"error": "onboarding_failed"})
+        return RedirectResponse(url=f"{cfg.frontend_url}/?{err}", status_code=302)
+    user_id = str(user_uuid)
 
-    token_data = resp.json()
-    access_token: str = token_data["access_token"]
-    refresh_token: str = token_data.get("refresh_token", "")
-    expires_in: int = token_data.get("expires_in", 3600)
-    expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
+    # A fresh account starts cold — warm it from their real listening so the
+    # very first conversation is already personalised. Best-effort, off the
+    # request path so the redirect is instant.
+    if created:
+        _schedule_taste_bootstrap(
+            user_id, spotify=spotify, weaviate=weaviate, redis=redis, cfg=cfg
+        )
 
-    # Persist tokens to Profile
-    result = await db.execute(select(Profile).where(Profile.user_id == user_uuid))
-    profile = result.scalar_one_or_none()
-    if profile:
-        profile.spotify_access_token = access_token
-        profile.spotify_refresh_token = refresh_token
-        profile.spotify_token_expires_at = expires_at
-        await db.flush()
-
-    logger.info("spotify_oauth_complete", user_id=user_id, expires_at=expires_at.isoformat())
-    return SpotifyCallbackResponse(
-        status="ok",
+    logger.info(
+        "spotify_oauth_complete",
         user_id=user_id,
-        expires_at=expires_at,
-        note="Refresh token stored in Profile. Access token valid for 1 hour.",
+        created=created,
+        expires_at=expires_at.isoformat(),
     )
+    query = urlencode({"user_id": user_id, "connected": "1"})
+    return RedirectResponse(url=f"{cfg.frontend_url}/?{query}", status_code=302)
 
 
 @router.get(

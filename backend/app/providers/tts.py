@@ -25,14 +25,27 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 from functools import lru_cache
 
 from backend.app.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
-_EMOTIONAL_TAGS = {"[laughs]", "[light laugh]", "[warmly]", "[thoughtful]",
-                   "[curious]", "[excited]", "[pause]", "[sighs]", "[whispers]"}
+# Matches any ``[audio tag]`` (case-insensitive) — used both to strip tags for
+# non-ElevenLabs TTS and to decide which ElevenLabs model a sentence needs.
+_AUDIO_TAG_RE = re.compile(r"\[[a-z][a-z ]*\]", re.IGNORECASE)
+
+
+def strip_audio_tags(text: str) -> str:
+    """Remove ElevenLabs-style ``[audio tags]`` and tidy the leftover spacing.
+
+    ElevenLabs v3 interprets tags like ``[warmly]`` as delivery cues, but a
+    plain TTS engine (Kokoro) would read the literal word "warmly" aloud. We
+    strip them so local audio stays clean; the production ElevenLabs path keeps
+    the tags untouched.
+    """
+    return re.sub(r"\s{2,}", " ", _AUDIO_TAG_RE.sub("", text)).strip()
 
 
 def is_emotional(sentence: str) -> bool:
@@ -47,8 +60,9 @@ def is_emotional(sentence: str) -> bool:
     Returns:
         ``True`` if the sentence contains an audio tag or is a question.
     """
-    lower = sentence.lower()
-    return any(tag in lower for tag in _EMOTIONAL_TAGS) or sentence.strip().endswith("?")
+    # ANY audio tag must route to eleven_v3 — the faster eleven_flash_v2_5 can't
+    # render tags and would read them aloud (e.g. saying "laughs softly").
+    return bool(_AUDIO_TAG_RE.search(sentence)) or sentence.strip().endswith("?")
 
 
 # ── Kokoro (local) ─────────────────────────────────────────────────────────────
@@ -84,9 +98,15 @@ def _kokoro_synthesize_sync(text: str, voice: str = "af_heart") -> bytes:
     if pipeline is None:
         return b""
 
+    # Kokoro has no notion of delivery tags — strip them so it doesn't read
+    # "[warmly]" aloud. Empty after stripping → nothing to synthesise.
+    text = strip_audio_tags(text)
+    if not text:
+        return b""
+
     try:
-        import soundfile as sf  # type: ignore[import-untyped]
         import numpy as np
+        import soundfile as sf  # type: ignore[import-untyped]
 
         generator = pipeline(text, voice=voice, speed=1.0)
         chunks = [audio for _, _, audio in generator]

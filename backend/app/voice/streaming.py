@@ -16,7 +16,7 @@ import re
 from collections.abc import AsyncIterator
 
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import is_emotional, synthesize
+from backend.app.providers.tts import synthesize
 
 logger = get_logger(__name__)
 
@@ -26,6 +26,49 @@ _SENTENCE_RE = re.compile(
     r"(?<=[.?!])\s+|(?=\[pause\])|(?<=\[pause\])\s*",
     flags=re.IGNORECASE,
 )
+
+
+# Incremental boundary: sentence-ending punctuation (optionally followed by a
+# closing quote/bracket) THEN whitespace — the trailing whitespace is what tells
+# us the sentence is actually finished, so "3.5" or "Dr." mid-token don't flush
+# early. A ``[pause]`` tag is a hard boundary on its own.
+_STREAM_BOUNDARY_RE = re.compile(
+    r"[.?!]+[\"')\]]?(?=\s)|\[pause\]",
+    flags=re.IGNORECASE,
+)
+
+
+async def stream_sentences(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Reassemble a stream of text deltas into complete sentences.
+
+    Buffers incoming token deltas and emits each sentence the moment its closing
+    boundary arrives, so TTS can start on sentence one while the model is still
+    generating sentence two.  Any trailing text with no terminal punctuation is
+    flushed when the source stream ends.
+
+    Args:
+        chunks: Async iterator of text fragments (e.g. from ``stream_general``).
+
+    Yields:
+        Complete, non-empty sentence strings in order.
+    """
+    buffer = ""
+    async for delta in chunks:
+        if not delta:
+            continue
+        buffer += delta
+        while True:
+            match = _STREAM_BOUNDARY_RE.search(buffer)
+            if not match:
+                break
+            end = match.end()
+            sentence = buffer[:end].strip()
+            buffer = buffer[end:].lstrip()
+            if sentence:
+                yield sentence
+    tail = buffer.strip()
+    if tail:
+        yield tail
 
 
 def split_sentences(text: str) -> list[str]:

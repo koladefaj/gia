@@ -14,7 +14,7 @@ using an invalid value that causes a cryptic error deep in business logic.
 
 import logging
 
-from pydantic import field_validator, Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,11 +36,15 @@ class Settings(BaseSettings):
     # =============================================================================
     # Infrastructure
     # =============================================================================
-    
+
     # --- App ---
     app_env: str = Field(default="development")
     log_level: str = Field(default="debug")
     secret_key: str = Field(default="change-me-in-production")
+    # Where the browser is sent back to after a successful Spotify OAuth flow.
+    # The callback appends ``?user_id=…&connected=1`` so the SPA can adopt the
+    # freshly-created identity. Must match the deployed frontend origin.
+    frontend_url: str = Field(default="http://localhost:3000")
 
     # --- Database ---
     database_url: str = Field(default="postgresql+asyncpg://gia:gia@localhost:5432/gia")
@@ -56,25 +60,62 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="")
     openai_api_key: str  = Field(default="")
     ollama_base_url: str = Field(default="http://localhost:11434")
-    ollama_model: str = Field(default="llama3.2")
+    ollama_model: str = Field(default="gemma3:4b")
     # Override the default persona / fast models per-provider.  Leave empty to
     # use the built-in provider defaults defined in ``providers/llm.py``.
     llm_persona_model: str = Field(default="")
     llm_fast_model: str = Field(default="")
+
+    # --- Per-component models (intent-aware voice pipeline) ---
+    # All model names are config so they swap without code changes.  gpt-5.5 is
+    # not generally available yet; planner/conversation default to gpt-4o and log
+    # a fallback if a 5.5 name is set but unreachable (see providers/openai_stream).
+    router_model: str = Field(default="gpt-4o-mini")
+    memory_model: str = Field(default="gpt-4o-mini")
+    # Memory embeddings via the OpenAI API (no local torch/sentence-transformers).
+    # text-embedding-3-small is 1536-dim; change → recreate Weaviate + re-seed.
+    embedding_model: str = Field(default="text-embedding-3-small")
+    artist_model: str = Field(default="gpt-4o")
+    planner_model: str = Field(default="gpt-4o")
+    conversation_model: str = Field(default="gpt-4o")
+    # Below this router confidence, escalate to the Planner instead of dispatching.
+    router_confidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
 
     # --- Spotify ---
     spotify_client_id: str = Field(default="")
     spotify_client_secret: str = Field(default="")
     spotify_redirect_uri: str = Field(default="http://localhost:8000/auth/spotify/callback")
     spotify_mcp_url: str = Field(default="http://localhost:3001")
+    # Path to the built marcelmarais/spotify-mcp-server entrypoint (build/index.js).
+    # When set, SpotifyMCPClient spawns it over stdio (MCP protocol). Empty = the
+    # client stays inert and Spotify-dependent features degrade gracefully.
+    spotify_mcp_server_path: str = Field(default="")
+    spotify_mcp_command: str = Field(default="node")
+    # Path to the MCP server's spotify-config.json (holds the OAuth tokens the
+    # direct Web API client reuses for endpoints the MCP server lacks, e.g.
+    # playlist creation via the new /v1/me/playlists). Empty = derive from
+    # spotify_mcp_server_path's repo root.
+    spotify_config_path: str = Field(default="")
 
     # --- TTS ---
-    tts_provider: str = Field(default="kokoro")
+    # ElevenLabs (HTTP, no local deps) is the default now. Set to "kokoro" only
+    # with the local-tts extra installed for zero-cost local synthesis.
+    tts_provider: str = Field(default="elevenlabs")
     elevenlabs_api_key: str = Field(default="")
     elevenlabs_voice_id: str = Field(default="")
 
     # --- Brave Search ---
     brave_api_key: str = Field(default="")
+
+    # --- Weather (Open-Meteo — no API key required) ---
+    # When enabled, the planner can fetch current weather to make music
+    # recommendations context-aware ("31°C — something for a shorter run?").
+    weather_enabled: bool = Field(default=True)
+    # Default coordinates used when the user has no location on file
+    # (Lagos, Nigeria — matches the seeded demo user).
+    weather_default_lat: float = Field(default=6.5244)
+    weather_default_lon: float = Field(default=3.3792)
+    weather_default_label: str = Field(default="Lagos")
 
     # --- Langfuse ---
     langfuse_public_key: str = Field(default="")
@@ -84,6 +125,65 @@ class Settings(BaseSettings):
     # --- Celery ---
     celery_broker_url: str = Field(default="redis://localhost:6379/1")
     celery_result_backend: str = Field(default="redis://localhost:6379/2")
+
+    # =============================================================================
+    # Retrieval (RAG hardening)
+    # =============================================================================
+
+    # Hybrid search: combine BM25 keyword + dense vector. Disable to fall back to
+    # pure dense (the pre-hardening behaviour).
+    hybrid_enabled: bool = Field(default=True)
+    # alpha weights dense vs keyword in Weaviate hybrid: 1.0 = pure vector,
+    # 0.0 = pure BM25, 0.5 = balanced.
+    retrieval_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Top-k fetched per memory type during context assembly.
+    retrieval_k_preferences: int = Field(default=8, ge=1, le=50)
+    retrieval_k_mood: int = Field(default=3, ge=1, le=50)
+    retrieval_k_episodes: int = Field(default=3, ge=1, le=50)
+    retrieval_k_life_facts: int = Field(default=4, ge=1, le=50)
+    # Synthesised higher-order insights (memory consolidation) — few, high-signal.
+    retrieval_k_insights: int = Field(default=3, ge=1, le=50)
+    # Redis retrieval cache TTL in seconds (0 disables caching).
+    retrieval_cache_ttl: int = Field(default=60, ge=0)
+    # Multi-agent synthesis — when ON, a final LLM pass merges several agents'
+    # outputs into one coherent reply instead of concatenating them. OFF by
+    # default: single-agent turns (the common case) need no merge, and it adds
+    # an LLM call to the voice path.
+    synthesis_enabled: bool = Field(default=False)
+
+    # Cross-encoder reranking — OFF by default to protect the voice latency
+    # budget. Flip on for Celery/eval or to demo the recall gain.
+    rerank_enabled: bool = Field(default=False)
+    rerank_model: str = Field(default="BAAI/bge-reranker-base")
+    # When reranking, fetch this many candidates before trimming to the final k.
+    rerank_candidate_multiplier: int = Field(default=3, ge=1, le=10)
+
+    # CrewAI multi-agent curation (Scout → Curator) — a real collaborative crew.
+    # OFF by default and OFF the live voice path: inter-agent hand-off adds LLM
+    # round-trips, so it belongs in enrichment / "deep pick" flows, not the
+    # sub-second reply. See backend/app/agents/curator_crew.py.
+    crewai_curator_enabled: bool = Field(default=False)
+
+    # Speech-to-text. "local" runs faster-whisper on the GPU (free, fast).
+    # "openai" uses the Whisper API (whisper-1) — a larger multilingual model
+    # that handles accented English (e.g. Nigerian) noticeably better, at a
+    # per-minute cost. Set STT_PROVIDER=openai in .env to switch.
+    stt_provider: str = Field(default="local")  # local | openai
+    # Local faster-whisper model. base.en is fast but English-only and weak on
+    # heavy accents; "large-v3" (multilingual) is far more accurate and fits the
+    # RTX 4060. Changing this re-downloads the model on next start.
+    stt_model: str = Field(default="base.en")
+
+    # =============================================================================
+    # Tool resilience
+    # =============================================================================
+
+    # Per-call timeout (seconds) applied to external tool calls.
+    tool_timeout_s: float = Field(default=8.0, gt=0.0)
+    # Consecutive failures before a tool's circuit breaker opens.
+    tool_circuit_threshold: int = Field(default=5, ge=1)
+    # Seconds the breaker stays open before allowing a probe call.
+    tool_circuit_cooldown_s: float = Field(default=30.0, gt=0.0)
 
     # --- Field validators ---
     @field_validator("llm_provider")

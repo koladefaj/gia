@@ -16,19 +16,47 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.app.config import Settings
 from backend.app.db.base import Base
-from backend.app.dependencies import get_brave_client, get_db, get_redis, get_settings, get_spotify_client, get_weaviate_client
+from backend.app.dependencies import (
+    get_brave_client,
+    get_db,
+    get_redis,
+    get_settings,
+    get_spotify_client,
+    get_weather_client,
+    get_weaviate_client,
+)
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.main import app as _real_app
+
+
+@pytest.fixture(autouse=True)
+def _no_real_openai() -> Any:
+    """Guarantee no test makes a real OpenAI call (embeddings or chat).
+
+    Embeddings now go through the OpenAI SDK, and the cached client is bound to
+    the event loop of whichever test created it — so an un-mocked call both hits
+    the network and corrupts later tests. Patching the shared client factory at
+    the source makes the whole suite hermetic; tests that exercise the OpenAI
+    path directly (test_embeddings, test_hybrid_router) patch above this.
+    """
+    fake = MagicMock()
+    fake.embeddings.create = AsyncMock(
+        return_value=MagicMock(data=[MagicMock(embedding=[0.0] * 1536)])
+    )
+    fake.chat.completions.create = AsyncMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="{}"))])
+    )
+    with patch("backend.app.providers.openai_client._client_for", return_value=fake):
+        yield
 
 
 # ── Test settings ─────────────────────────────────────────────────────────────
@@ -151,10 +179,9 @@ class FakeSpotifyClient:
         """Return up to *limit* fake artists."""
         return self.artists[:limit]
 
-    async def get_audio_features(self, uris: list[str]) -> list[dict]:
-        """Return fake audio features for each URI in *uris*."""
-        by_uri = {t["uri"]: t for t in self.tracks}
-        return [by_uri.get(u, self.tracks[0]) for u in uris]
+    async def get_top_tracks(self, time_range: str = "medium_term", limit: int = 10) -> list[dict]:
+        """Return up to *limit* fake tracks as the user's top tracks."""
+        return self.tracks[:limit]
 
     async def search_tracks(self, query: str, limit: int = 10) -> list[dict]:
         """Return all fake tracks regardless of *query*."""
@@ -253,6 +280,8 @@ async def client(
     fake_weaviate = MagicMock()
     fake_brave = AsyncMock()
     fake_brave.search = AsyncMock(return_value=[])
+    from backend.app.tools.weather import MockWeatherClient
+    fake_weather = MockWeatherClient()
 
     _real_app.dependency_overrides[get_settings] = lambda: test_settings
     _real_app.dependency_overrides[get_db] = lambda: db_session
@@ -260,6 +289,7 @@ async def client(
     _real_app.dependency_overrides[get_spotify_client] = lambda: fake_spotify
     _real_app.dependency_overrides[get_weaviate_client] = lambda: fake_weaviate
     _real_app.dependency_overrides[get_brave_client] = lambda: fake_brave
+    _real_app.dependency_overrides[get_weather_client] = lambda: fake_weather
 
     # Set app state directly so lifespan doesn't try to connect to real services
     _real_app.state.redis = fake_redis

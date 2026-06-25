@@ -6,8 +6,6 @@ Validates loading, defaults, derived properties, and the behaviour of
 
 from __future__ import annotations
 
-import pytest
-
 from backend.app.config import Settings
 
 

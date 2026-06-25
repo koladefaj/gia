@@ -6,8 +6,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from backend.app.providers.tts import is_emotional
-from backend.app.voice.streaming import split_sentences
+from backend.app.providers.tts import is_emotional, strip_audio_tags
+from backend.app.voice.streaming import split_sentences, stream_sentences
+
+
+class TestStripAudioTags:
+    """Audio tags are delivery cues for ElevenLabs — never read aloud by Kokoro."""
+
+    def test_removes_tags_and_tidies_spacing(self) -> None:
+        assert strip_audio_tags("[warmly] Hey there [pause] friend") == "Hey there friend"
+
+    def test_plain_text_unchanged(self) -> None:
+        assert strip_audio_tags("Here's Free Mind by Tems.") == "Here's Free Mind by Tems."
+
+    def test_all_tags_becomes_empty(self) -> None:
+        assert strip_audio_tags("[laughs] [excited]") == ""
 
 
 class TestIsEmotional:
@@ -53,6 +66,43 @@ class TestSplitSentences:
     def test_filters_empty_parts(self) -> None:
         parts = split_sentences("Hello.   ")
         assert all(p.strip() for p in parts)
+
+
+class TestStreamSentences:
+    """Incremental reassembly of a token stream into whole sentences."""
+
+    async def _collect(self, deltas: list[str]) -> list[str]:
+        async def _src():
+            for d in deltas:
+                yield d
+        return [s async for s in stream_sentences(_src())]
+
+    @pytest.mark.asyncio
+    async def test_emits_sentence_on_boundary(self) -> None:
+        # Tokens split mid-word; a sentence flushes only once "." + space arrives.
+        out = await self._collect(["Hey", " the", "re.", " How", " are you?", " Good."])
+        assert out == ["Hey there.", "How are you?", "Good."]
+
+    @pytest.mark.asyncio
+    async def test_flushes_tail_without_terminal_punctuation(self) -> None:
+        out = await self._collect(["Here's ", "Free Mind by Tems"])
+        assert out == ["Here's Free Mind by Tems"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_split_decimal_midstream(self) -> None:
+        # "3.5" has no trailing space after the dot, so it must not flush early.
+        out = await self._collect(["It's ", "3.5", " stars.", " Nice."])
+        assert out == ["It's 3.5 stars.", "Nice."]
+
+    @pytest.mark.asyncio
+    async def test_pause_tag_is_a_boundary(self) -> None:
+        out = await self._collect(["Hold on", "[pause]", "okay go."])
+        assert out[0].endswith("[pause]")
+        assert "okay go." in out[-1]
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_yields_nothing(self) -> None:
+        assert await self._collect([]) == []
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@
 4. Synthesises all three into a warm, personalised response via the persona LLM.
 
 The response is designed to feel like a knowledgeable friend who has done
-their homework — not a Wikipedia article.
+their homework done, not a Wikipedia article.
 
 Section 5 prompt injection (from the spec)::
 
@@ -24,6 +24,7 @@ Section 5 prompt injection (from the spec)::
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 
 from crewai import Agent
@@ -33,37 +34,118 @@ from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.memory.embeddings import embed
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
-from backend.app.persona.prompt import GIA_PERSONA
+from backend.app.prompts import PromptRegistry, get_registry
 from backend.app.providers.llm import get_llm
 from backend.app.schemas.artist import ArtistInfoResponse, BraveResult
 from backend.app.tools.brave import BraveSearchClient
 
 logger = get_logger(__name__)
 
+AGENT_KEY = "agents.artist"
 
-def build_artist_agent(cfg: Settings) -> Agent:
-    """Construct the CrewAI Artist agent.
+
+# Phrases that introduce an artist name ("tell me about <name>"). Matched on a
+# lower-cased copy; the name is sliced from the *original* text to keep its case.
+_ARTIST_TRIGGERS = [
+    r"\btell me about\s+",
+    r"\btalk (?:to me )?about\s+",
+    r"\bwhat do you know about\s+",
+    r"\bwho(?:'s| is| are)\s+",
+    r"\bwhat(?:'s| has| did)?\s+(?=.+\b(?:been up to|up to|done|released|dropped|new)\b)",
+    r"\bwhat about\s+",
+    r"\bhow about\s+",
+    r"\banything (?:new )?(?:from|on|about)\s+",
+]
+
+# Trailing clauses to drop from a captured name ("Tems lately" → "Tems").
+_NAME_TAIL = re.compile(
+    r"\b(been up to|up to|lately|these days|right now|please|for me|recently|"
+    r"new|doing|releasing|dropping|up)\b.*$",
+    re.IGNORECASE,
+)
+
+# Words that disqualify a *bare* message from being read as an artist name, so
+# small talk ("whats the weather like") is never looked up as an artist.
+_NOT_ARTIST = {
+    "weather", "mood", "moods", "pattern", "patterns", "you", "your", "yourself",
+    "gia", "help", "what", "whats", "what's", "how", "why", "when", "where",
+    "hey", "hi", "hello", "yo", "sup", "thanks", "thank", "please", "music",
+    "song", "songs", "play", "find", "recommend", "something", "vibe", "vibes",
+    "chill", "hype", "tired", "bored", "happy", "sad", "okay", "ok", "yes", "no",
+    "the", "a", "an", "is", "are", "do", "can", "could", "would", "i", "im",
+    "i'm", "me", "we", "they", "this", "that", "today", "now",
+    # Conversational affirmations / fillers — "yeah sure", "nah", "cool" are
+    # replies, never artist names. Without these, a bare "yeah sure" answer to
+    # "want me to play him?" gets looked up as an artist and hallucinates.
+    "yeah", "yea", "yep", "yup", "nah", "nope", "maybe", "cool", "nice", "wow",
+    "lol", "haha", "hmm", "fine", "alright", "aight", "right", "whatever",
+    "dunno", "idk", "huh", "sure", "really", "totally", "exactly", "absolutely",
+    "good", "great", "awesome", "perfect", "sorry", "wait", "stop",
+}
+
+# A plausible artist name: letters/digits/spaces and a few name punctuation marks.
+_NAME_SHAPE = re.compile(r"^[A-Za-z0-9 '&.\-]+$")
+
+
+def extract_artist_name(message: str) -> str:
+    """Pull the artist name out of an artist-info message, or return ``""``.
+
+    Two strategies, in order:
+
+    1. **Trigger phrase** — "tell me about <name>", "who is <name>", "what has
+       <name> been up to" → the text after the trigger, with trailing filler
+       ("lately", "been up to") stripped.
+    2. **Bare name** — a short message (≤ 4 words) that is *only* a name, with no
+       small-talk / question words → the message itself.
+
+    Anything else (greetings, weather, generic chatter) yields ``""`` so the
+    caller skips the artist agent instead of looking up a nonsense "artist" like
+    *"whats the weather like"*.
 
     Args:
-        cfg: Application settings.
+        message: The user's raw message.
+
+    Returns:
+        The extracted artist name, or ``""`` when none is present.
+    """
+    text = message.strip().strip("\"'").rstrip("?.!").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+
+    for trigger in _ARTIST_TRIGGERS:
+        m = re.search(trigger, lower)
+        if m:
+            name = text[m.end():].strip().strip("\"'")
+            name = _NAME_TAIL.sub("", name).strip().rstrip(",")
+            return name if name and _NAME_SHAPE.match(name) else ""
+
+    words = text.split()
+    if (
+        1 <= len(words) <= 4
+        and _NAME_SHAPE.match(text)
+        and not any(w.lower().strip(",'") in _NOT_ARTIST for w in words)
+    ):
+        return text
+    return ""
+
+
+def build_artist_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
+    """Construct the CrewAI Artist agent from the externalised prompt registry.
+
+    Args:
+        cfg:      Application settings.
+        registry: Prompt registry for the agent identity; defaults to the
+                  process-wide singleton.
 
     Returns:
         A configured ``crewai.Agent`` for artist-focused conversation.
     """
+    prompt = (registry or get_registry()).get(AGENT_KEY)
     return Agent(
-        role="Artist Specialist",
-        goal=(
-            "Give the user a warm, personalised take on an artist — combining "
-            "what Gia knows about the user's history with that artist, recent "
-            "news from the web, and the artist's top tracks."
-        ),
-        backstory=(
-            "You are Gia's culture lens. When a user asks about an artist you "
-            "don't look up a bio — you think about what you know of this user's "
-            "relationship with that artist, what the artist has been up to "
-            "lately, and you respond like a friend who actually follows music. "
-            "If something is funny or surprising, you react to it naturally."
-        ),
+        role=prompt.render("role"),
+        goal=prompt.render("goal"),
+        backstory=prompt.render("backstory"),
         llm=get_llm(cfg),
         verbose=False,
         allow_delegation=False,
@@ -85,6 +167,7 @@ class ArtistService:
     brave: BraveSearchClient
     cfg: Settings
     store: WeaviateMemoryStore | None = field(default=None)
+    registry: PromptRegistry = field(default_factory=get_registry)
 
     async def get_info(
         self,
@@ -151,23 +234,13 @@ class ArtistService:
             for r in brave_results[:3]
         ) or "No recent news found."
 
-        prompt = (
-            GIA_PERSONA
-            + f"""
-User's history with {artist_name}:
-{user_artist_memory}
-
-{artist_name}'s recent activity (from web):
-{brave_text}
-
-{artist_name}'s top tracks:
-{tracks_text}
-
-Respond as Gia would: as a knowledgeable friend, not a Wikipedia article.
-Reference the user's personal history with this artist.
-If the recent news is interesting or funny, react to it genuinely.
-Keep the response to 3-5 sentences.
-"""
+        prompt = self.registry.get(AGENT_KEY).render(
+            "task",
+            persona=self.registry.get("persona.gia").render(),
+            artist_name=artist_name,
+            user_artist_memory=user_artist_memory,
+            brave_text=brave_text,
+            tracks_text=tracks_text,
         )
 
         llm = get_llm(self.cfg)

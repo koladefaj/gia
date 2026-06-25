@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends
+from redis import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from weaviate import WeaviateClient
 
@@ -26,14 +29,14 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/dj", tags=["dj"])
 
 
-@router.post("/recommend", response_model=DJResponse)
+@router.post("/recommend", summary="Get personalised DJ recommendations", status_code=200, response_model=DJResponse)
 async def recommend(
     body: DJRequest,
-    spotify: SpotifyClientProtocol = Depends(get_spotify_client),
-    weaviate: WeaviateClient = Depends(get_weaviate_client),
-    db: AsyncSession = Depends(get_db),
-    redis=Depends(get_redis),
-    cfg: Settings = Depends(get_settings),
+    spotify: Annotated[SpotifyClientProtocol, Depends(get_spotify_client)],
+    weaviate: Annotated[WeaviateClient, Depends(get_weaviate_client)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[Redis, Depends(get_redis)],
+    cfg: Annotated[Settings, Depends(get_settings)],
 ) -> DJResponse:
     """Find tracks matching the query, build a Camelot crossfade queue, and recommend.
 
@@ -58,6 +61,7 @@ async def recommend(
                 store=store,
                 redis=redis,
                 spotify=spotify,
+                cfg=cfg,
             )
             user_context_text = ctx.to_prompt_text()
         except Exception as exc:  # noqa: BLE001

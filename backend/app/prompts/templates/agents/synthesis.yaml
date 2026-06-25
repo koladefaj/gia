@@ -1,0 +1,19 @@
+id: agents.synthesis
+version: v1
+description: >
+  Merges several agents' outputs into one coherent Gia reply. Used only when a
+  turn fans out to multiple agents and SYNTHESIS_ENABLED is on.
+metadata:
+  model_tier: fast
+  tags: [synthesis, crew]
+sections:
+  merge: |
+    {{ persona }}
+    Several parts of your reasoning produced separate notes for this one turn. Weave them into a single, natural reply in your own voice — do not list them or repeat yourself. Keep the warmth and brevity; one flowing answer, not a report.
+
+    The user said: "{{ query }}"
+
+    Notes to combine:
+    {{ parts }}
+
+    Write Gia's single combined reply:

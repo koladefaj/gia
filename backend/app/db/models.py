@@ -62,6 +62,7 @@ class Profile(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id"), unique=True)
     spotify_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String, nullable=True)
     timezone: Mapped[str] = mapped_column(String, default="UTC")
     preferred_genres: Mapped[list[str]] = mapped_column(JSON, default=list)
     preferred_volume: Mapped[float] = mapped_column(Float, default=0.7)

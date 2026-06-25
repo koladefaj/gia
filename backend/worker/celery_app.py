@@ -8,8 +8,10 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "backend.worker.tasks.memory_extraction",
+        "backend.worker.tasks.memory_consolidation",
         "backend.worker.tasks.mood_inference",
         "backend.worker.tasks.proactive_check",
+        "backend.worker.tasks.session_flush",
     ],
 )
 
@@ -26,6 +28,18 @@ celery_app.conf.update(
         "mood-inference-periodic": {
             "task": "backend.worker.tasks.mood_inference.run_mood_inference_all",
             "schedule": 1800.0,
+        },
+        # Flush tail-end memories from sessions that went idle before the
+        # 45-minute per-session extraction throttle fired.
+        "session-flush-periodic": {
+            "task": "backend.worker.tasks.session_flush.flush_idle_sessions",
+            "schedule": 2700.0,
+        },
+        # Reflection loop: re-synthesise insights from raw memories. Slow beat —
+        # a backstop; extraction also enqueues consolidation inline.
+        "memory-consolidation-periodic": {
+            "task": "backend.worker.tasks.memory_consolidation.run_consolidation_all",
+            "schedule": 21600.0,  # every 6 hours
         },
     },
 )

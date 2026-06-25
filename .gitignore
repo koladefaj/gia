@@ -40,3 +40,12 @@ node_modules/
 # Separate projects / reference material — not part of this repo
 engram/
 project_scope.md
+
+# Local Claude Code config + scratch artifacts
+.claude/
+*.wav
+
+# Frontend runtime artifacts (not source)
+frontend/uploads/
+frontend/.thumbnail
+frontend/nextjs/tsconfig.tsbuildinfo

@@ -29,18 +29,37 @@ from crewai import LLM
 
 from backend.app.config import Settings
 
-# Default model per provider — update here to change all agents at once
+# Default model per provider — update here to change all agents at once.
+# Ollama is intentionally absent: locally a single model serves both tiers, so
+# its default comes from ``cfg.ollama_model`` (env ``OLLAMA_MODEL``) instead of
+# a hardcoded value — see ``_persona_default`` / ``_fast_default``.
 _PERSONA_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-4o",
-    "ollama": "llama3.2",
 }
 
 _FAST_MODELS: dict[str, str] = {
     "anthropic": "claude-haiku-4-5-20251001",
     "openai": "gpt-4o-mini",
-    "ollama": "llama3.2",
 }
+
+
+def _persona_default(cfg: Settings) -> str:
+    """Built-in persona-tier model for the configured provider."""
+    if cfg.llm_provider == "ollama":
+        return cfg.ollama_model
+    return _PERSONA_MODELS.get(cfg.llm_provider, "")
+
+
+def _fast_default(cfg: Settings) -> str:
+    """Built-in fast-tier model for the configured provider.
+
+    For Ollama, a single local model (``cfg.ollama_model``) serves both tiers —
+    running two separate local models just for routing/extraction is wasteful.
+    """
+    if cfg.llm_provider == "ollama":
+        return cfg.ollama_model
+    return _FAST_MODELS.get(cfg.llm_provider, "")
 
 
 def get_llm(cfg: Settings, model: str | None = None) -> LLM:
@@ -62,7 +81,7 @@ def get_llm(cfg: Settings, model: str | None = None) -> LLM:
     Raises:
         ValueError: If ``cfg.llm_provider`` is not one of the supported values.
     """
-    resolved = model or cfg.llm_persona_model or _PERSONA_MODELS.get(cfg.llm_provider, "")
+    resolved = model or cfg.llm_persona_model or _persona_default(cfg)
     return _build_llm(cfg, resolved)
 
 
@@ -84,7 +103,7 @@ def get_fast_llm(cfg: Settings, model: str | None = None) -> LLM:
     Raises:
         ValueError: If ``cfg.llm_provider`` is not recognised.
     """
-    resolved = model or cfg.llm_fast_model or _FAST_MODELS.get(cfg.llm_provider, "")
+    resolved = model or cfg.llm_fast_model or _fast_default(cfg)
     return _build_llm(cfg, resolved)
 
 
@@ -107,14 +126,20 @@ def _build_llm(cfg: Settings, model: str) -> LLM:
     """
     provider = cfg.llm_provider
 
+    # CrewAI/litellm resolve the backend from a ``provider/model`` prefix. Add it
+    # when the configured model id isn't already qualified, so an explicit
+    # override like ``openai/gpt-4o`` is never double-prefixed.
+    def _qualified(prefix: str) -> str:
+        return model if "/" in model else f"{prefix}/{model}"
+
     if provider == "anthropic":
-        return LLM(model=model, api_key=cfg.anthropic_api_key)
+        return LLM(model=_qualified("anthropic"), api_key=cfg.anthropic_api_key)
 
     if provider == "openai":
-        return LLM(model=model, api_key=cfg.openai_api_key)
+        return LLM(model=_qualified("openai"), api_key=cfg.openai_api_key)
 
     if provider == "ollama":
-        return LLM(model=f"ollama/{model}", base_url=cfg.ollama_base_url)
+        return LLM(model=_qualified("ollama"), base_url=cfg.ollama_base_url)
 
     raise ValueError(
         f"Unknown LLM provider: {provider!r}. "
