@@ -23,10 +23,11 @@ import asyncio
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import weaviate
 import weaviate.classes as wvc
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.app.config import settings
@@ -37,6 +38,48 @@ from backend.app.memory.embeddings import embed
 from backend.app.observability.logging import get_logger, setup_logging
 
 setup_logging("info")
+
+
+def _alembic_head() -> str:
+    """Head revision id, read from the migration files (no DB, no cwd dependency)."""
+    from alembic.config import Config  # noqa: PLC0415
+    from alembic.script import ScriptDirectory  # noqa: PLC0415
+
+    cfg = Config()
+    cfg.set_main_option(
+        "script_location", str(Path(__file__).resolve().parent.parent / "alembic")
+    )
+    return ScriptDirectory.from_config(cfg).get_current_head() or ""
+
+
+async def _stamp_alembic(conn) -> None:
+    """Stamp alembic to head after ``create_all``.
+
+    The seed builds the schema with ``Base.metadata.create_all``; without this,
+    the app container's startup ``alembic upgrade head`` then tries to re-create
+    the tables and crash-loops with "relation users already exists" on a fresh
+    DB. Stamping makes that upgrade a no-op. Only writes when ``alembic_version``
+    is empty, so it never clobbers a real migration state.
+    """
+    head = _alembic_head()
+    if not head:
+        return
+    await conn.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS alembic_version ("
+            "version_num VARCHAR(32) NOT NULL "
+            "CONSTRAINT alembic_version_pkc PRIMARY KEY)"
+        )
+    )
+    existing = (
+        await conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
+    ).first()
+    if existing is None:
+        await conn.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:v)"), {"v": head}
+        )
+
+
 log = get_logger(__name__)
 
 # Stable, deterministic UUID so the demo user is the same across re-seeds and the
@@ -49,45 +92,43 @@ PROFILE_ID = str(PROFILE_UUID)
 DISPLAY_NAME = "Kolade"  # change here if the demo user's name differs
 
 # ── Listening history ─────────────────────────────────────────────────────────
-# (uri, track, artist, energy, valence, tempo). URIs are placeholders — listening
-# history is mood/taste signal; live recommendations come from Spotify search, not
-# these ids. Energy/valence are coarse vibe hints (Spotify removed audio features
-# for new apps; mood is now LLM-labeled from titles/artists, these are belt-and-braces).
+# (uri, track, artist). URIs are placeholders — listening history is mood/taste
+# signal; live recommendations come from Spotify search, not these ids.
 
 # Morning runs — Central Cee, "Can't Rush Greatness" (UK rap, high energy)
 _MORNING = [
-    ("spotify:track:cc01", "Sprinter", "Central Cee", 0.82, 0.62, 141.0),
-    ("spotify:track:cc02", "Limitless", "Central Cee", 0.80, 0.58, 144.0),
-    ("spotify:track:cc03", "GenZ Luv", "Central Cee", 0.78, 0.60, 138.0),
-    ("spotify:track:cc04", "Commitment Issues", "Central Cee", 0.79, 0.55, 140.0),
-    ("spotify:track:cc05", "CRG", "Central Cee", 0.84, 0.57, 143.0),
-    ("spotify:track:cc06", "Truth in the Lies", "Central Cee", 0.77, 0.59, 139.0),
+    ("spotify:track:cc01", "Sprinter", "Central Cee"),
+    ("spotify:track:cc02", "Limitless", "Central Cee"),
+    ("spotify:track:cc03", "GenZ Luv", "Central Cee"),
+    ("spotify:track:cc04", "Commitment Issues", "Central Cee"),
+    ("spotify:track:cc05", "CRG", "Central Cee"),
+    ("spotify:track:cc06", "Truth in the Lies", "Central Cee"),
 ]
 
-# Late nights — Drake (R&B leaning, lower energy)
+# Late nights — Drake (R&B leaning)
 _NIGHT = [
-    ("spotify:track:dk01", "Marvins Room", "Drake", 0.38, 0.42, 90.0),
-    ("spotify:track:dk02", "Jaded", "Drake", 0.42, 0.48, 92.0),
-    ("spotify:track:dk03", "Teenage Fever", "Drake", 0.45, 0.50, 95.0),
-    ("spotify:track:dk04", "Whisper My Name", "Drake", 0.40, 0.46, 88.0),
-    ("spotify:track:dk05", "Dust", "Drake", 0.44, 0.45, 91.0),
-    ("spotify:track:dk06", "Shabang", "Drake", 0.55, 0.52, 102.0),
-    ("spotify:track:dk07", "Somebody Loves Me", "Drake, PARTYNEXTDOOR", 0.50, 0.49, 98.0),
-    ("spotify:track:dk08", "Fortworth", "Drake, PARTYNEXTDOOR", 0.52, 0.51, 100.0),
+    ("spotify:track:dk01", "Marvins Room", "Drake"),
+    ("spotify:track:dk02", "Jaded", "Drake"),
+    ("spotify:track:dk03", "Teenage Fever", "Drake"),
+    ("spotify:track:dk04", "Whisper My Name", "Drake"),
+    ("spotify:track:dk05", "Dust", "Drake"),
+    ("spotify:track:dk06", "Shabang", "Drake"),
+    ("spotify:track:dk07", "Somebody Loves Me", "Drake, PARTYNEXTDOOR"),
+    ("spotify:track:dk08", "Fortworth", "Drake, PARTYNEXTDOOR"),
 ]
 
 # Just vibing — Afrobeats / new-wave "burti" + upcoming artists
 _VIBE = [
-    ("spotify:track:mv01", "Mofe", "Mavo", 0.62, 0.74, 106.0),
-    ("spotify:track:mv02", "Aura Salad", "Mavo", 0.60, 0.78, 104.0),
-    ("spotify:track:mv03", "Guapanese", "Mavo", 0.64, 0.76, 108.0),
-    ("spotify:track:mv04", "Money Constant", "Mavo", 0.61, 0.72, 105.0),
-    ("spotify:track:ss01", "Super Power", "Suono Sai", 0.58, 0.75, 102.0),
-    ("spotify:track:ss02", "Igbo Boy", "Suono Sai", 0.59, 0.73, 103.0),
-    ("spotify:track:zl01", "Chose Me", "Zaylevelten", 0.57, 0.77, 101.0),
-    ("spotify:track:zl02", "Go Again", "Zaylevelten", 0.60, 0.74, 104.0),
-    ("spotify:track:mc01", "We 2 Fly", "Monochrome", 0.63, 0.76, 107.0),
-    ("spotify:track:mc02", "LV 444", "Monochrome", 0.61, 0.75, 105.0),
+    ("spotify:track:mv01", "Mofe", "Mavo"),
+    ("spotify:track:mv02", "Aura Salad", "Mavo"),
+    ("spotify:track:mv03", "Guapanese", "Mavo"),
+    ("spotify:track:mv04", "Money Constant", "Mavo"),
+    ("spotify:track:ss01", "Super Power", "Suono Sai"),
+    ("spotify:track:ss02", "Igbo Boy", "Suono Sai"),
+    ("spotify:track:zl01", "Chose Me", "Zaylevelten"),
+    ("spotify:track:zl02", "Go Again", "Zaylevelten"),
+    ("spotify:track:mc01", "We 2 Fly", "Monochrome"),
+    ("spotify:track:mc02", "LV 444", "Monochrome"),
 ]
 
 
@@ -99,16 +140,13 @@ def _make_listening_events(user_id: uuid.UUID) -> list[ListeningEvent]:
     events: list[ListeningEvent] = []
 
     def _event(track: tuple, played_at: datetime) -> ListeningEvent:
-        uri, name, artist, energy, valence, tempo = track
+        uri, name, artist = track
         return ListeningEvent(
             id=uuid.uuid4(),
             user_id=user_id,
             track_uri=uri,
             track_name=name,
             artist_name=artist,
-            energy=energy + random.uniform(-0.04, 0.04),
-            valence=valence + random.uniform(-0.04, 0.04),
-            tempo=tempo + random.uniform(-3, 3),
             played_at=played_at,
         )
 
@@ -203,6 +241,7 @@ async def reset_user() -> None:
     engine = create_async_engine(settings.database_url, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _stamp_alembic(conn)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as session:
         session: AsyncSession
@@ -259,6 +298,7 @@ async def seed_postgres() -> None:
     engine = create_async_engine(settings.database_url, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _stamp_alembic(conn)
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as session:

@@ -1,0 +1,40 @@
+rows=1440  encoder=all-MiniLM-L6-v2  train=1152  test=288
+
+intent           accuracy: 0.781
+
+intent classification report (held-out):
+
+              precision    recall  f1-score   support
+
+ ARTIST_INFO       0.67      0.76      0.71        29
+GENERAL_CHAT       0.81      0.66      0.73        59
+MEMORY_QUERY       0.76      0.79      0.78        33
+       MIXED       0.83      0.92      0.87        37
+  MOOD_CHECK       0.91      0.88      0.89        33
+  MUSIC_FIND       0.75      0.73      0.74        33
+ MUSIC_QUEUE       0.75      0.87      0.81        31
+  NEWS_QUERY       0.75      0.73      0.74        33
+
+    accuracy                           0.78       288
+   macro avg       0.78      0.79      0.78       288
+weighted avg       0.78      0.78      0.78       288
+
+confusion matrix (rows=true, cols=pred):
+labels: ARTIST_INFO, GENERAL_CHAT, MEMORY_QUERY, MIXED, MOOD_CHECK, MUSIC_FIND, MUSIC_QUEUE, NEWS_QUERY
+[[22  0  0  2  0  0  0  5]
+ [ 3 39  6  3  1  2  3  2]
+ [ 0  0 26  1  2  4  0  0]
+ [ 1  0  0 34  0  1  1  0]
+ [ 0  1  1  0 29  0  1  1]
+ [ 1  5  0  0  0 24  3  0]
+ [ 0  1  1  1  0  1 27  0]
+ [ 6  2  0  0  0  0  1 24]]
+
+tone             accuracy: 0.719
+engagement_mode  accuracy: 0.677
+
+needs_* (binary) accuracy:
+  needs_search           accuracy: 0.892
+  needs_memory           accuracy: 0.812
+  needs_music            accuracy: 0.885
+  needs_artist_lookup    accuracy: 0.920

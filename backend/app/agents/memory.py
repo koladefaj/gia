@@ -1,18 +1,13 @@
-"""CrewAI Memory agent — extraction and storage orchestrator.
+"""Memory agent — extraction and storage orchestrator.
 
-``MemoryAgent`` ties together embedding, extraction, dedup, and supersede
+``MemoryService`` ties together embedding, extraction, dedup, and supersede
 into a single ``run_extraction`` method that can be called from a FastAPI
-route, a Celery task, or composed into a larger CrewAI crew.
-
-The agent itself is deliberately thin: all business logic lives in the
-``memory.*`` modules so it can be tested independently of CrewAI.
+route or a Celery task.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
-from crewai import Agent
+from dataclasses import dataclass
 
 from backend.app.config import Settings
 from backend.app.memory.cache import invalidate_user
@@ -21,39 +16,9 @@ from backend.app.memory.embeddings import embed_many, text_hash
 from backend.app.memory.extractor import extract_memories
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
-from backend.app.prompts import PromptRegistry, get_registry
-from backend.app.providers.llm import get_fast_llm
 from backend.app.schemas.memory import ExtractedMemory, MemoryEntry
 
 logger = get_logger(__name__)
-
-AGENT_KEY = "agents.memory"
-
-
-def build_memory_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
-    """Construct the CrewAI ``Agent`` instance for memory curation.
-
-    The agent's role is injected into other agents' system prompts so they
-    know who surfaced the user context they received.
-
-    Args:
-        cfg:      Application settings (provides LLM provider / model).
-        registry: Prompt registry for the agent identity; defaults to the
-                  process-wide singleton.
-
-    Returns:
-        A configured ``crewai.Agent`` ready to be added to a ``Crew``.
-    """
-    prompt = (registry or get_registry()).get(AGENT_KEY)
-    return Agent(
-        role=prompt.render("role"),
-        goal=prompt.render("goal"),
-        backstory=prompt.render("backstory"),
-        llm=get_fast_llm(cfg),
-        verbose=False,
-        allow_delegation=False,
-    )
-
 
 @dataclass
 class MemoryService:
@@ -68,15 +33,6 @@ class MemoryService:
     store: WeaviateMemoryStore
     redis: object  # AsyncRedis — typed as object to avoid heavy import at module level
     cfg: Settings
-    _agent: Agent = field(init=False)
-
-    def __post_init__(self) -> None:
-        self._agent = build_memory_agent(self.cfg)
-
-    @property
-    def crewai_agent(self) -> Agent:
-        """The underlying ``crewai.Agent`` for use in multi-agent crews."""
-        return self._agent
 
     async def run_extraction(
         self,

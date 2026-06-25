@@ -24,8 +24,6 @@ from __future__ import annotations
 import asyncio
 import re
 
-from crewai import Agent
-
 from backend.app.config import Settings
 from backend.app.observability.logging import get_logger
 from backend.app.prompts import PromptRegistry, get_registry
@@ -175,26 +173,3 @@ async def classify_intent(
         ) from exc
 
 
-def build_router_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
-    """Construct the CrewAI Router agent from the externalised prompt registry.
-
-    The Router is used for multi-agent crew composition starting Day 6.
-    For direct intent classification, prefer ``classify_intent`` directly.
-
-    Args:
-        cfg:      Application settings.
-        registry: Prompt registry for the agent identity; defaults to the
-                  process-wide singleton.
-
-    Returns:
-        Configured ``crewai.Agent``.
-    """
-    prompt = (registry or get_registry()).get(AGENT_KEY)
-    return Agent(
-        role=prompt.render("role"),
-        goal=prompt.render("goal"),
-        backstory=prompt.render("backstory"),
-        llm=get_fast_llm(cfg),
-        verbose=False,
-        allow_delegation=False,
-    )

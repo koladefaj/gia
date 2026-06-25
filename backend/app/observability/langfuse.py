@@ -1,4 +1,4 @@
-"""Langfuse AI tracing utilities (Langfuse SDK v3/v4, OpenTelemetry-based).
+"""Langfuse AI tracing utilities (Langfuse SDK v4, OpenTelemetry-based).
 
 Provides a lightweight context manager for tracing a chat turn with per-agent
 spans.  When Langfuse is not configured (keys absent) every call is a no-op so

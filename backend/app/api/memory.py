@@ -1,7 +1,5 @@
 """Memory API — context retrieval and extraction endpoints.
 
-Used for debugging and the Day 3 done-criterion demo:
-
   ``GET  /memory/{user_id}/context``   — assemble and return ``UserContext``
   ``POST /memory/{user_id}/extract``   — run extraction on a transcript
 
@@ -31,35 +29,12 @@ from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.memory.retrieval import build_user_context
 from backend.app.memory.store import WeaviateMemoryStore
 from backend.app.observability.logging import get_logger
-from backend.app.schemas.memory import UserContext
+from backend.app.schemas.memory import UserContext, ExtractionRequestBody, ExtractionResponse
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/memory", tags=["memory"])
 
-
-class ExtractionRequest:
-    """Request body for the extract endpoint."""
-
-    def __init__(self, transcript: str) -> None:
-        self.transcript = transcript
-
-
-from pydantic import BaseModel  # noqa: E402
-
-
-class ExtractionRequestBody(BaseModel):
-    """Body for ``POST /memory/{user_id}/extract``."""
-
-    transcript: str
-
-
-class ExtractionResponse(BaseModel):
-    """Response from ``POST /memory/{user_id}/extract``."""
-
-    user_id: str
-    stored: int
-    memory_ids: list[str]
 
 
 @router.get("/{user_id}/context", summary="Get user context", status_code=200, response_model=UserContext)
@@ -81,7 +56,7 @@ async def get_user_context(
     Args:
         user_id: UUID string of the user.
         query:   Semantic search query for Weaviate (defaults to a generic
-                 music preferences query for debugging).
+                 music preferences query).
 
     Returns:
         ``UserContext`` with profile, preferences, mood patterns, episodes,
@@ -120,10 +95,6 @@ async def extract_memories_endpoint(
     cfg: Annotated[Settings, Depends(get_settings)],
 ) -> ExtractionResponse:
     """Run the LLM memory extractor on *body.transcript* and persist results.
-
-    This is the Day 3 done-criterion endpoint: feed a scripted exchange here,
-    then call ``GET /memory/{user_id}/context`` to confirm the preference was
-    stored and retrieved.
 
     Args:
         user_id: UUID string of the user.

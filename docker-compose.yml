@@ -57,21 +57,17 @@ services:
         # ElevenLabs is HTTP-only (no package). Flip back to "true" only if you
         # want zero-cost local TTS while iterating.
         INSTALL_LOCAL_TTS: "false"
-        # Keep faster-whisper for local STT (voice input from the browser).
-        # NOTE: to bake the faster `large-v3-turbo` model, add `STT_MODEL: "large-v3-turbo"`
-        # here and rebuild — but only on a fast connection (the model is ~1.6GB and
-        # the bake pulls apt packages too). On a slow link the build is impractical.
-        INSTALL_LOCAL_STT: "true"
-    # Pass the host GPU (RTX 4060) through so faster-whisper transcribes on CUDA
-    # instead of CPU — several times faster, lower per-turn latency. Falls back
-    # to CPU automatically if the GPU isn't available (see stt._pick_device).
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+        # STT is Deepgram Flux streaming (STT_PROVIDER=deepgram), so skip local
+        # faster-whisper entirely — it would otherwise pull ctranslate2 + the
+        # ~1.3GB nvidia CUDA wheels and bake the ~3GB large-v3 model for nothing.
+        # Flip back to "true" only to run the local/batch whisper fallback on GPU.
+        INSTALL_LOCAL_STT: "false"
+        # Distilled local router classifier (CPU torch + MiniLM, ~200MB). Adds the
+        # ~10ms local-routing tier; requires a rebuild to take effect.
+        INSTALL_ROUTER_CLASSIFIER: "true"
+    # No GPU reservation: STT is Deepgram (cloud), TTS is ElevenLabs (cloud), and
+    # the router classifier runs on CPU torch. Re-add a `deploy.resources` nvidia
+    # device reservation only if you flip INSTALL_LOCAL_STT back on for GPU whisper.
     ports:
       - "8000:8000"
     env_file: .env
@@ -84,10 +80,6 @@ services:
       # Real TTS via ElevenLabs (v3 for emotional lines, flash for logistics).
       # ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID come from .env.
       TTS_PROVIDER: elevenlabs
-      # STT model for the local path. large-v3 is baked into the image. STT_PROVIDER
-      # (in .env) selects local-GPU vs the OpenAI Whisper API; on local large-v3 and
-      # the OpenAI API measured ~the same latency (~2s), so .env currently uses openai.
-      STT_MODEL: large-v3
       # Never write .pyc — Windows bind-mount mtimes are unreliable, so cached
       # bytecode goes stale and the reloader keeps running old code.
       PYTHONDONTWRITEBYTECODE: "1"
@@ -102,6 +94,10 @@ services:
       SPOTIFY_MCP_COMMAND: node
       SPOTIFY_MCP_SERVER_PATH: /opt/spotify-mcp-server/build/index.js
       SPOTIFY_CONFIG_PATH: /opt/spotify-mcp-server/spotify-config.json
+      # Enable the distilled local router tier (needs the image built with
+      # INSTALL_ROUTER_CLASSIFIER=true). Override in .env. No-ops to the LLM path
+      # if the deps/model are missing, so it's safe even on an un-rebuilt image.
+      ROUTER_LOCAL_ENABLED: "${ROUTER_LOCAL_ENABLED:-true}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -115,6 +111,9 @@ services:
       - ./backend:/app/backend
       - ./frontend:/app/frontend
       - ./scripts:/app/scripts
+      # The trained classifier heads live here; mount so a retrain on the host is
+      # picked up without an image rebuild.
+      - ./ml:/app/ml
       # The patched Spotify MCP server (sibling clone). node_modules + build are
       # shadowed by named volumes so they are (re)built Linux-native in-container.
       - ../spotify-mcp-server:/opt/spotify-mcp-server

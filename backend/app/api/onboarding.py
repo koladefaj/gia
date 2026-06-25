@@ -8,6 +8,7 @@ user connects Spotify so cold-start conversations feel personalised immediately.
 
 from __future__ import annotations
 
+from typing import Annotated
 import uuid as _uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -34,10 +35,10 @@ router = APIRouter(prefix="/memory", tags=["memory"])
 @router.post("/{user_id}/bootstrap")
 async def bootstrap_profile(
     user_id: str,
-    spotify: SpotifyClientProtocol = Depends(get_spotify_client),
-    weaviate: WeaviateClient = Depends(get_weaviate_client),
-    redis: AsyncRedis = Depends(get_redis),
-    cfg: Settings = Depends(get_settings),
+    spotify: Annotated[SpotifyClientProtocol, Depends(get_spotify_client)],
+    weaviate: Annotated[WeaviateClient, Depends(get_weaviate_client)],
+    redis: Annotated[AsyncRedis, Depends(get_redis)],
+    cfg: Annotated[Settings, Depends(get_settings)],
 ) -> dict:
     """Bootstrap taste-preference memories from the user's Spotify listening.
 

@@ -19,8 +19,6 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from crewai import Agent
-
 from backend.app.config import Settings
 from backend.app.interfaces import SpotifyClientProtocol
 from backend.app.memory.store import WeaviateMemoryStore
@@ -28,13 +26,8 @@ from backend.app.mood.classifier import time_bucket
 from backend.app.mood.labeler import label_mood
 from backend.app.mood.proactive import _parse_pattern, get_pattern_for_now
 from backend.app.observability.logging import get_logger
-from backend.app.prompts import PromptRegistry, get_registry
-from backend.app.providers.llm import get_fast_llm
 
 logger = get_logger(__name__)
-
-AGENT_KEY = "agents.mood"
-
 
 @dataclass
 class MoodResult:
@@ -53,28 +46,6 @@ class MoodResult:
     bucket: str = ""
     deviation: bool = False
     proactive_draft: str | None = None
-
-
-def build_mood_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
-    """Construct the CrewAI Mood agent from the externalised prompt registry.
-
-    Args:
-        cfg:      Application settings.
-        registry: Prompt registry for the agent identity; defaults to the
-                  process-wide singleton.
-
-    Returns:
-        Configured ``crewai.Agent``.
-    """
-    prompt = (registry or get_registry()).get(AGENT_KEY)
-    return Agent(
-        role=prompt.render("role"),
-        goal=prompt.render("goal"),
-        backstory=prompt.render("backstory"),
-        llm=get_fast_llm(cfg),
-        verbose=False,
-        allow_delegation=False,
-    )
 
 
 @dataclass

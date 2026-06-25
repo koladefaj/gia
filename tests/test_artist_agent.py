@@ -191,14 +191,3 @@ async def test_artist_service_includes_user_memory(
     assert any("aggressive flow" in p for p in captured_prompt)
 
 
-def test_build_artist_agent_returns_crewai_agent(test_settings) -> None:
-    """``build_artist_agent`` returns a properly configured CrewAI ``Agent``."""
-    from crewai import Agent
-
-    from backend.app.agents.artist import build_artist_agent
-
-    with patch("backend.app.agents.artist.get_llm", return_value="gpt-4o-mini"):
-        agent = build_artist_agent(test_settings)
-
-    assert isinstance(agent, Agent)
-    assert "Artist" in agent.role

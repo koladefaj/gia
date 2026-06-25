@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     # Conservative — only the unambiguous-chat case short-circuits; anything that
     # might need query resolution still goes to the LLM. Flip off to force the LLM.
     router_fast_path_enabled: bool = Field(default=True)
+    # Tier-2: the distilled local classifier (frozen MiniLM + linear heads, see
+    # ml/router). Predicts the categorical decision in ~20-40ms on CPU for the
+    # confident no-query-resolution turns, skipping the ~1.4s LLM router. OFF by
+    # default: needs sentence-transformers (torch) + the trained model present, so
+    # it's opt-in for environments that have them. Degrades to the LLM if absent.
+    router_local_enabled: bool = Field(default=False)
 
     # --- Spotify ---
     spotify_client_id: str = Field(default="")
@@ -109,6 +115,11 @@ class Settings(BaseSettings):
     tts_provider: str = Field(default="elevenlabs")
     elevenlabs_api_key: str = Field(default="")
     elevenlabs_voice_id: str = Field(default="")
+    # Force eleven_v3 (warm, expressive) for EVERY line instead of the hybrid that
+    # drops plain logistics sentences to the faster-but-flatter eleven_flash_v2_5.
+    # ON for a consistently warm voice (the voice is the product); flash is ~1.1s
+    # faster per turn, so flip OFF to trade warmth for latency.
+    tts_force_v3: bool = Field(default=True)
 
     # --- Brave Search ---
     brave_api_key: str = Field(default="")
@@ -195,10 +206,16 @@ class Settings(BaseSettings):
     deepgram_model: str = Field(default="flux-general-en")
     # End-of-turn detection knobs (passed straight to Flux). eot_threshold gates
     # the high-confidence EndOfTurn (final); eager_eot_threshold gates the early
-    # EagerEndOfTurn used for speculative replies. Lower eager = earlier but more
-    # false starts; higher eot = more reliable but slightly later.
-    deepgram_eot_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # EagerEndOfTurn used for speculative replies. Higher eot = Flux waits for more
+    # confidence you're actually done, so it stops cutting you off mid-sentence
+    # (the tradeoff is the turn ends slightly later). 0.8 holds through natural
+    # pauses; eot_timeout_ms caps how long it will wait so a real pause still ends
+    # the turn. Lower eager = earlier prewarm but more false starts.
+    deepgram_eot_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     deepgram_eager_eot_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Max ms of trailing silence before Flux forces the turn end (so a high
+    # eot_threshold never leaves the turn hanging).
+    deepgram_eot_timeout_ms: int = Field(default=4000, ge=500, le=15000)
 
     # =============================================================================
     # Tool resilience

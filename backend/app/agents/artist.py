@@ -10,7 +10,10 @@
 The response is designed to feel like a knowledgeable friend who has done
 their homework done, not a Wikipedia article.
 
-Section 5 prompt injection (from the spec)::
+Prompt injection is mitigated by sanitising the artist name and embedding it into a fixed prompt template.  
+The LLM sees only the sanitized name, the user's history,
+the Brave results, and the top tracks, and is instructed to respond as Gia would.  
+The prompt looks like this:
 
     User's history with {artist_name}: {user_artist_memory}
     Artist's recent activity (from web): {brave_results}
@@ -27,8 +30,6 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-
-from crewai import Agent
 
 from backend.app.config import Settings
 from backend.app.interfaces import SpotifyClientProtocol
@@ -129,28 +130,6 @@ def extract_artist_name(message: str) -> str:
     ):
         return text
     return ""
-
-
-def build_artist_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
-    """Construct the CrewAI Artist agent from the externalised prompt registry.
-
-    Args:
-        cfg:      Application settings.
-        registry: Prompt registry for the agent identity; defaults to the
-                  process-wide singleton.
-
-    Returns:
-        A configured ``crewai.Agent`` for artist-focused conversation.
-    """
-    prompt = (registry or get_registry()).get(AGENT_KEY)
-    return Agent(
-        role=prompt.render("role"),
-        goal=prompt.render("goal"),
-        backstory=prompt.render("backstory"),
-        llm=get_llm(cfg),
-        verbose=False,
-        allow_delegation=False,
-    )
 
 
 @dataclass

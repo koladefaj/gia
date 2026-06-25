@@ -75,6 +75,18 @@ def is_emotional(sentence: str) -> bool:
     return bool(_AUDIO_TAG_RE.search(sentence)) or sentence.strip().endswith("?")
 
 
+def should_use_v3(text: str) -> bool:
+    """Whether to render *text* on ``eleven_v3`` (warm) vs ``eleven_flash_v2_5``.
+
+    ``TTS_FORCE_V3`` forces v3 on every line for a consistently warm voice;
+    otherwise only inherently expressive lines (a tag or a question) get v3. This
+    is the single model-pick used across the one-shot and streaming paths.
+    """
+    from backend.app.config import settings  # noqa: PLC0415 — lazy, avoids a cycle
+
+    return settings.tts_force_v3 or is_emotional(text)
+
+
 # ── Kokoro (local) ─────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
@@ -285,7 +297,7 @@ async def synthesize(
         when the provider is unavailable.
     """
     if provider == "elevenlabs":
-        emotional = is_emotional(text)
+        emotional = should_use_v3(text)
         return await _elevenlabs_synthesize(text, api_key, voice_id, emotional)
 
     return await asyncio.to_thread(_kokoro_synthesize_sync, text, voice)
@@ -318,7 +330,7 @@ async def synthesize_stream(
         Raw audio byte chunks (MP3 for ElevenLabs, one WAV blob for Kokoro).
     """
     if provider == "elevenlabs":
-        async for chunk in _elevenlabs_stream(text, api_key, voice_id, is_emotional(text)):
+        async for chunk in _elevenlabs_stream(text, api_key, voice_id, should_use_v3(text)):
             yield chunk
         return
 
