@@ -39,8 +39,8 @@ https://github.com/user-attachments/assets/558b58b3-d6c9-456f-a4eb-2135598b3d09
 
 <table>
   <tr>
-    <td><img src="assets/screenshots/frontend-voice.png" alt="Voice interface — mid-conversation" width="480"/></td>
-    <td><img src="assets/screenshots/frontend-playlist.png" alt="Playlist / queue view" width="480"/></td>
+    <td><img src="assets/screenshots/frontend-landing.png" alt="Landing — connect with Spotify" width="480"/></td>
+    <td><img src="assets/screenshots/frontend-voice.png" alt="Voice interface — idle, tap to talk" width="480"/></td>
   </tr>
 </table>
 
