@@ -1,23 +1,16 @@
-"""DJ agent — track discovery, audio-feature-aware recommendation, crossfade queuing.
+"""DJ agent — track discovery and recommendation.
 
 ``DJService.recommend()`` is the single entry point.  It:
 
 1. Searches Spotify for tracks matching the user's query.
-2. Fetches audio features for all candidates.
-3. Builds a Camelot-compatible crossfade queue from the best seed track.
-4. Generates a warm, grounded recommendation via the persona LLM.
-5. Optionally starts Spotify playback immediately.
-
-The CrewAI ``Agent`` (from ``build_dj_agent``) is returned for composition
-into multi-agent crews.
+2. Generates a warm, grounded recommendation via the persona LLM.
+3. Optionally starts Spotify playback immediately.
 """
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-
-from crewai import Agent
 
 from backend.app.config import Settings
 from backend.app.interfaces import SpotifyClientProtocol
@@ -38,28 +31,6 @@ def _to_track(raw: dict) -> TrackItem:
         uri=str(raw.get("uri", "")),
         name=str(raw.get("name", "")),
         artist=str(raw.get("artist", "")),
-    )
-
-
-def build_dj_agent(cfg: Settings, registry: PromptRegistry | None = None) -> Agent:
-    """Construct the CrewAI DJ agent from the externalised prompt registry.
-
-    Args:
-        cfg:      Application settings (LLM provider / model).
-        registry: Prompt registry to read the agent identity from; defaults to
-                  the process-wide singleton.
-
-    Returns:
-        A configured ``crewai.Agent`` ready to be composed into a crew.
-    """
-    prompt = (registry or get_registry()).get(AGENT_KEY)
-    return Agent(
-        role=prompt.render("role"),
-        goal=prompt.render("goal"),
-        backstory=prompt.render("backstory"),
-        llm=get_llm(cfg),
-        verbose=False,
-        allow_delegation=False,
     )
 
 

@@ -10,8 +10,8 @@ Collections
     listening habits) as OpenAI ``text-embedding-3-small`` (1536-dim) vectors.
 
 ``MoodPattern``
-    Stores aggregated time-bucket mood statistics (energy, valence, tempo) used
-    by the DJ agent to infer context-appropriate recommendations.
+    Stores aggregated time-bucket mood statistics used by the DJ agent to infer
+    context-appropriate recommendations.
 
 Both collections use HNSW with COSINE distance and ``vectorizer=none`` so the
 application controls exactly what vectors are stored.
@@ -109,9 +109,6 @@ def init_weaviate_schema_sync() -> None:
             [
                 wvc.config.Property(name="user_id", data_type=wvc.config.DataType.TEXT),
                 wvc.config.Property(name="bucket", data_type=wvc.config.DataType.TEXT),
-                wvc.config.Property(name="energy", data_type=wvc.config.DataType.NUMBER),
-                wvc.config.Property(name="valence", data_type=wvc.config.DataType.NUMBER),
-                wvc.config.Property(name="tempo", data_type=wvc.config.DataType.NUMBER),
                 wvc.config.Property(name="label", data_type=wvc.config.DataType.TEXT),
                 wvc.config.Property(name="sample_size", data_type=wvc.config.DataType.INT),
                 wvc.config.Property(name="created_at", data_type=wvc.config.DataType.DATE),

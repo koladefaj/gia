@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -52,9 +53,9 @@ def _frame(ev) -> dict:  # ev: TranscriptEvent
 @router.websocket("/stream")
 async def stream(
     ws: WebSocket,
+    cfg: Annotated[Settings, Depends(get_settings)],
     provider: str | None = None,
     language: str = "en",
-    cfg: Settings = Depends(get_settings),
 ) -> None:
     """Proxy a live transcription session for one turn.
 

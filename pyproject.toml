@@ -16,7 +16,7 @@ dependencies = [
     "weaviate-client>=4.10.0",
     "redis[asyncio]>=5.2.0",
     "celery[redis]>=5.4.0",
-    "crewai>=0.80.0",
+    "litellm>=1.50.0",
     "anthropic>=0.43.0",
     "openai>=1.60.0",
     "structlog>=24.4.0",
@@ -112,6 +112,7 @@ module = [
     "weaviate.*",
     "faster_whisper.*",
     "sentence_transformers.*",
+    "litellm.*",
     "yaml",
 ]
 ignore_missing_imports = true

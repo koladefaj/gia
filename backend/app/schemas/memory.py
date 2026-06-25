@@ -35,6 +35,20 @@ def _ago(dt: datetime) -> str:
     return f" (mentioned ~{weeks} week{'s' if weeks > 1 else ''} ago)"
 
 
+class ExtractionRequestBody(BaseModel):
+    """Body for ``POST /memory/{user_id}/extract``."""
+
+    transcript: str
+
+
+class ExtractionResponse(BaseModel):
+    """Response from ``POST /memory/{user_id}/extract``."""
+
+    user_id: str
+    stored: int
+    memory_ids: list[str]
+
+
 class ExtractedMemory(BaseModel):
     """A preference or episode identified by the LLM extractor.
 

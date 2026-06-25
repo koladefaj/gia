@@ -3,7 +3,7 @@
 Sentence-level streaming achieves sub-second first-word latency: the first
 sentence is synthesised and starts playing before the full reply is ready.
 
-Design (from Section 7):
+Design:
   1. Split Gia's reply into sentences at ``. ? !`` and natural pause points.
   2. For each sentence: choose TTS model (v3 for emotional, Flash otherwise).
   3. Synthesise and enqueue the audio chunk.

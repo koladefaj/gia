@@ -107,14 +107,3 @@ async def test_classify_intent_llm_error_raises(test_settings) -> None:
         await classify_intent("you decide", test_settings)
 
 
-def test_build_router_agent_returns_crewai_agent(test_settings) -> None:
-    """``build_router_agent`` returns a configured CrewAI Agent."""
-    from crewai import Agent
-
-    from backend.app.agents.router import build_router_agent
-
-    with patch("backend.app.agents.router.get_fast_llm", return_value="gpt-4o-mini"):
-        agent = build_router_agent(test_settings)
-
-    assert isinstance(agent, Agent)
-    assert agent.role == "Router"

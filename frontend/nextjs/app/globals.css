@@ -2,26 +2,153 @@
 @tailwind components;
 @tailwind utilities;
 
+/* -------------------------------------------------------------------------- */
+/* Design tokens — one source of truth, flipped by [data-theme] on <html>.     */
+/* Colors are space-separated RGB channels so Tailwind's `<alpha-value>` works. */
+/* -------------------------------------------------------------------------- */
+:root,
+[data-theme='light'] {
+  --field: 246 243 238; /* warm ivory */
+  --ink: 24 23 27;
+  --ink-soft: 74 70 66;
+  --ink-faint: 142 136 130;
+  --accent: 61 59 66; /* graphite — monochrome accent, no colour */
+  --hairline: 30 26 22;
+
+  /* The page field — warm ivory with a soft lift toward the center. Inviting,
+     not blank; distinct from both pure white and the beige/brass cliche. */
+  --field-gradient: radial-gradient(
+    circle at 50% 36%,
+    #faf8f4 0%,
+    #f6f3ee 54%,
+    #efeae2 100%
+  );
+
+  /* Glass surfaces for the voice HUD. */
+  --glass-bg: rgba(252, 250, 246, 0.62);
+  --glass-border: rgba(30, 26, 22, 0.08);
+  --glass-shadow: 0 16px 40px rgba(40, 34, 28, 0.1);
+
+  /* Voice waveform stroke (read in JS). Warm-neutral dark on the ivory field;
+     low glow, since glow reads weak on a light surface. */
+  --ring-color: #25232a;
+  --ring-bloom: 0.16;
+
+  /* Ambient hero halo — barely-there lift on the ivory, never a grey smudge. */
+  --hero-glow: rgba(40, 36, 30, 0.05);
+}
+
+[data-theme='dark'] {
+  --field: 9 9 11;
+  --ink: 244 241 238;
+  --ink-soft: 186 182 177;
+  --ink-faint: 118 114 110;
+  --accent: 236 232 227; /* warm white — monochrome accent, no colour */
+  --hairline: 255 255 255;
+
+  /* Near-black, faintly warmed by an ember glow behind the ring. */
+  --field-gradient: radial-gradient(
+    circle at 50% 40%,
+    #16120f 0%,
+    #0c0b0d 46%,
+    #090909 100%
+  );
+
+  --glass-bg: rgba(255, 255, 255, 0.05);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+
+  /* Warm off-white so the waveform glows like a voice in the dark. */
+  --ring-color: #ffe7da;
+  --ring-bloom: 0.7;
+
+  /* Ambient hero halo — a soft warm-white light behind the words. */
+  --hero-glow: rgba(255, 240, 230, 0.1);
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  background: var(--field-gradient);
+  background-attachment: fixed;
+  color: rgb(var(--ink));
+  font-family: var(--font-body), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Themed selection. */
+::selection {
+  background: rgb(var(--accent) / 0.22);
+  color: rgb(var(--ink));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Voice keyframes                                                             */
+/* -------------------------------------------------------------------------- */
 @keyframes giaPulse {
-  0%, 100% { opacity: 0.32; }
-  50% { opacity: 0.85; }
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.9;
+  }
 }
 
 @keyframes giaDot {
-  0%, 100% { transform: scaleY(0.35); opacity: 0.4; }
-  50% { transform: scaleY(1); opacity: 1; }
+  0%,
+  100% {
+    transform: scaleY(0.35);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
 }
 
 @keyframes giaCaret {
-  0%, 45% { opacity: 1; }
-  50%, 95% { opacity: 0; }
-  100% { opacity: 1; }
+  0%,
+  45% {
+    opacity: 1;
+  }
+  50%,
+  95% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
 }
 
 .gia-caret {
   display: inline-block;
   margin-left: 2px;
   font-weight: 300;
-  color: rgba(58, 63, 71, 0.55);
+  color: rgb(var(--accent));
   animation: giaCaret 1s step-end infinite;
+}
+
+/* Fixed grain overlay — never on a scrolling container (GPU repaint cost). */
+.gia-grain {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+  opacity: 0.04;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

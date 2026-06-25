@@ -195,14 +195,3 @@ async def test_dj_prompt_has_no_mismatch_block_for_vibe(fake_spotify_dj, test_se
     assert "couldn't find" not in prompt
 
 
-def test_build_dj_agent_returns_crewai_agent(test_settings) -> None:
-    """``build_dj_agent`` returns a properly configured CrewAI ``Agent``."""
-    from crewai import Agent
-
-    from backend.app.agents.dj import build_dj_agent
-
-    with patch("backend.app.agents.dj.get_llm", return_value="gpt-4o-mini"):
-        agent = build_dj_agent(test_settings)
-
-    assert isinstance(agent, Agent)
-    assert "DJ" in agent.role

@@ -81,22 +81,12 @@ class Profile(Base):
 class ListeningEvent(Base):
     """One row per track played — the raw signal for mood inference.
 
-    Audio feature columns (energy, valence, tempo, danceability, key, mode) are
-    nullable because they are enriched asynchronously by the Celery worker after
-    the event is first recorded.
-
     Attributes:
         id:           UUID primary key.
         user_id:      FK → ``users.id``.
         track_uri:    Spotify track URI (e.g. ``spotify:track:4cOdK2wGLETKBW3PvgPWqT``).
         track_name:   Human-readable track title.
         artist_name:  Primary artist name.
-        energy:       Spotify audio feature: energy (0.0 – 1.0).
-        valence:      Spotify audio feature: musical positivity (0.0 – 1.0).
-        tempo:        Estimated BPM.
-        danceability: Spotify audio feature (0.0 – 1.0).
-        key:          Musical key (0 = C, 1 = C♯/D♭, …, 11 = B).
-        mode:         Modality: 1 = major, 0 = minor.
         played_at:    Timestamp when the track was played (from Spotify).
     """
 
@@ -107,12 +97,6 @@ class ListeningEvent(Base):
     track_uri: Mapped[str] = mapped_column(String)
     track_name: Mapped[str | None] = mapped_column(String, nullable=True)
     artist_name: Mapped[str | None] = mapped_column(String, nullable=True)
-    energy: Mapped[float | None] = mapped_column(Float, nullable=True)
-    valence: Mapped[float | None] = mapped_column(Float, nullable=True)
-    tempo: Mapped[float | None] = mapped_column(Float, nullable=True)
-    danceability: Mapped[float | None] = mapped_column(Float, nullable=True)
-    key: Mapped[int | None] = mapped_column(nullable=True)
-    mode: Mapped[int | None] = mapped_column(nullable=True)
     played_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     user: Mapped[User] = relationship("User", back_populates="listening_events")

@@ -41,19 +41,6 @@ def fake_redis() -> MagicMock:
     return r
 
 
-def test_build_memory_agent_returns_crewai_agent(test_settings) -> None:
-    """``build_memory_agent`` returns a properly configured CrewAI ``Agent``."""
-    from crewai import Agent
-
-    from backend.app.agents.memory import build_memory_agent
-
-    # CrewAI's Agent validates ``llm`` — it must be a model-name string or BaseLLM.
-    with patch("backend.app.agents.memory.get_fast_llm", return_value="gpt-4o-mini"):
-        agent = build_memory_agent(test_settings)
-
-    assert isinstance(agent, Agent)
-    assert "Memory Curator" in agent.role
-    assert agent.allow_delegation is False
 
 
 @pytest.mark.asyncio

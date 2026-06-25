@@ -93,8 +93,8 @@ async def test_profile_preferred_genres_defaults_to_empty_list(db_session: Async
 
 
 @pytest.mark.asyncio
-async def test_listening_event_stores_audio_features(db_session: AsyncSession) -> None:
-    """``ListeningEvent`` correctly stores and retrieves audio feature floats."""
+async def test_listening_event_stores_track_info(db_session: AsyncSession) -> None:
+    """``ListeningEvent`` correctly stores and retrieves track name and artist."""
     uid = _u(6)
     db_session.add(User(id=uid))
     await db_session.flush()
@@ -105,12 +105,6 @@ async def test_listening_event_stores_audio_features(db_session: AsyncSession) -
         track_uri="spotify:track:001",
         track_name="Free Mind",
         artist_name="Tems",
-        energy=0.38,
-        valence=0.71,
-        tempo=92.0,
-        danceability=0.62,
-        key=5,
-        mode=0,
         played_at=datetime.now(UTC),
     )
     db_session.add(event)
@@ -120,33 +114,8 @@ async def test_listening_event_stores_audio_features(db_session: AsyncSession) -
         select(ListeningEvent).where(ListeningEvent.user_id == uid)
     )
     fetched = result.scalar_one()
-    assert abs(fetched.energy - 0.38) < 0.001
     assert fetched.track_name == "Free Mind"
-    assert fetched.key == 5
-
-
-@pytest.mark.asyncio
-async def test_listening_event_audio_features_nullable(db_session: AsyncSession) -> None:
-    """Audio feature columns are nullable — events without features are valid."""
-    uid = _u(7)
-    db_session.add(User(id=uid))
-    await db_session.flush()
-
-    event = ListeningEvent(
-        id=uuid.uuid4(),
-        user_id=uid,
-        track_uri="spotify:track:002",
-        played_at=datetime.now(UTC),
-    )
-    db_session.add(event)
-    await db_session.flush()
-
-    result = await db_session.execute(
-        select(ListeningEvent).where(ListeningEvent.user_id == uid)
-    )
-    fetched = result.scalar_one()
-    assert fetched.energy is None
-    assert fetched.valence is None
+    assert fetched.artist_name == "Tems"
 
 
 # ── ConversationSession ───────────────────────────────────────────────────────

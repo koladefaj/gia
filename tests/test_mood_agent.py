@@ -85,14 +85,3 @@ async def test_mood_service_handles_spotify_error(test_settings) -> None:
     assert result.current_label == "neutral"
 
 
-def test_build_mood_agent_returns_crewai_agent(test_settings) -> None:
-    """``build_mood_agent`` returns a configured CrewAI Agent."""
-    from crewai import Agent
-
-    from backend.app.agents.mood import build_mood_agent
-
-    with patch("backend.app.agents.mood.get_fast_llm", return_value="gpt-4o-mini"):
-        agent = build_mood_agent(test_settings)
-
-    assert isinstance(agent, Agent)
-    assert "Mood" in agent.role

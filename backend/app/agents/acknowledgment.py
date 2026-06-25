@@ -1,8 +1,8 @@
 """Acknowledgment selection — the instant, LLM-free reaction layer.
 
 While retrieval and the conversation model run, Gia needs to *say something*
-within ~1s so the user never hears silence.  That something is a pre-written
-acknowledgment chosen by intent+tone — no model call, just a dictionary lookup
+within so the user never hears silence.  That something is a pre-written
+acknowledgment chosen by intent+tone, no model call, just a dictionary lookup
 and a random pick that avoids the last few used so she never repeats herself.
 
 Templates carry NO provider voice tags; the ``VoiceAdapter`` prepends the tone
@@ -43,7 +43,7 @@ class AcknowledgmentSelector:
 
     Keeps a per-session ring of the last ``_AVOID_LAST`` lines used so the same
     reaction never lands twice in a row.  State is in-process (a turn is cheap;
-    there is no need to round-trip Redis on the <10ms hot path).
+    there is no need to round-trip Redis on the hot path).
     """
 
     def __init__(self, table: dict[str, dict[str, list[str]]] | None = None) -> None:
@@ -62,7 +62,7 @@ class AcknowledgmentSelector:
     def select_filler(self, session_id: str) -> str:
         """Return a neutral, intent-agnostic filler line, avoiding recent repeats.
 
-        Spoken on the *fast* path — before the router's real decision exists — so
+        Spoken on the *fast* path before the router's real decision exists — so
         it must claim nothing specific. "One sec." can front a recommendation, a
         clarifying question, or pure chat without ever contradicting the reply,
         whereas an intent-specific line ("Let me organize the tracks") promises

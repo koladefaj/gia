@@ -1,58 +1,54 @@
-# Gia — Voice AI Core
+# Gia — Voice Music Companion (frontend)
 
-Ultra-premium, light-mode conversational voice AI landing core: glassmorphic
-floating nav, a glowing audio-reactive 3D ring, and an Idle ⇄ Streaming toggle.
+A voice-first music companion. Pre-auth is an editorial landing that leads to
+Spotify OAuth; post-auth is a hands-free voice session with a live, layered
+sine-wave visualizer. Dual light (warm ivory) / dark (near-black) theme.
 
-## Install
+## Stack
+
+- **Next.js 14** App Router, React 18, TypeScript
+- **Tailwind v3** with CSS-variable design tokens (`app/globals.css`), flipped by
+  `data-theme` on `<html>`
+- **Motion** (`motion/react`) for scroll reveals, the magnetic CTA, and the theme
+  toggle
+- **@phosphor-icons/react** for UI glyphs
+- **Canvas 2D** for the voice visualizer (no WebGL / Three.js)
+- Fonts via `next/font`: Bricolage Grotesque (display) + Manrope (body)
+
+## Run
 
 ```bash
-npm i three @react-three/fiber @react-three/drei @react-three/postprocessing lucide-react
+npm install
+npm run dev   # http://localhost:3000
 ```
 
-> React 19 / Next.js App Router compatible. `@react-three/fiber` v9+ and
-> `@react-three/postprocessing` v3+ support React 19.
+Point the client at the backend with `NEXT_PUBLIC_API_URL` (see `.env.example`).
 
-## Use
+## Architecture
 
-```tsx
-// app/page.tsx
-import GiaVoiceCore from '@/components/GiaVoiceCore';
-export default function Page() {
-  return <GiaVoiceCore />;
-}
+```
+app/                layout (fonts + pre-hydration theme init), globals (tokens)
+components/
+  GiaVoiceCore.tsx  routes on identity → Landing or VoiceScreen
+  landing/          editorial landing: hero, how-it-works, utterances, bento, cta
+  VoiceScreen.tsx   post-auth hands-free session + glass HUD
+  VoiceWaves.tsx    layered sine-wave visualizer (amplitude rides levelRef)
+  ThemeToggle, MagneticButton, Icons
+lib/
+  useVoiceSession   the voice engine — mic VAD, STT, /chat stream, TTS playback
+  audio             Web Audio players + shared analyser feeding the visualizer
+  api               typed client (/chat SSE, /voice, /chat/opening, Spotify auth)
+  identity          user id (Spotify OAuth) + per-load session id
+  theme             light/dark state, persistence, cross-instance sync
 ```
 
-`components/GiaVoiceCore.tsx` is a single self-contained `'use client'` component.
-Click anywhere on the canvas (or wire up the mic pill) to flip `streaming`.
+The visualizer reads a live audio level (`levelRef`, 0..1) every frame — mic
+energy while listening, Gia's TTS output while speaking — and reads its colour
+and glow from the theme tokens (`--ring-color`, `--accent`, `--ring-bloom`).
 
-## How it works
+## Theme
 
-- **Ring** — a very thin `TorusGeometry` viewed head-on reads as a brilliant
-  filament. Per-vertex base position / radial direction / angle are cached once.
-- **Liquid ripple** — in `useFrame`, each vertex is displaced radially by a sum
-  of ring-periodic harmonics, each harmonic tied to a different mock frequency
-  band, so the edge ripples organically instead of uniformly scaling.
-- **Bloom** — `@react-three/postprocessing` `<Bloom mipmapBlur>` with a high
-  `luminanceThreshold` so only the HDR-white ring (`color={[1.5,1.5,1.5]}`,
-  `toneMapped={false}`) glows; the radial-gradient backdrop stays calm.
-- **Reactivity** — ripple amplitude and bloom intensity lerp toward an `energy`
-  value each frame; Idle falls back to a serene breathing pulse.
-
-## Swap in real audio
-
-Replace `useMockAudio` with a Web Audio `AnalyserNode`:
-
-```ts
-const data = new Uint8Array(analyser.frequencyBinCount);
-analyser.getByteFrequencyData(data);
-// bucket `data` into 3 bands, normalise to 0..1, feed the same `bands` array.
-```
-
-Everything downstream (ripple + bloom) already consumes the band array, so no
-other changes are needed.
-
-## Note on transparency
-
-This build uses a transparent `<Canvas alpha>` over a Tailwind radial gradient.
-If you see dark bloom fringing on some GPUs, render an in-scene gradient quad
-instead (see the raw-three reference build) and keep the canvas opaque.
+One `data-theme` attribute on `<html>` drives every surface through CSS
+variables. The value is set before first paint by an inline script in
+`layout.tsx` (no flash), persisted to `localStorage`, and respects
+`prefers-color-scheme`. All animation honors `prefers-reduced-motion`.

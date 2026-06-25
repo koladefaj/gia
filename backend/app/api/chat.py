@@ -11,7 +11,7 @@
   ``done``          — stream end (intent, proactive, session summary)
   ``error``         — something went wrong (non-fatal; stream continues if possible)
 
-The event shape is designed for the Day 10 frontend.  Keep it stable.
+Keep the event shape stable — the frontend depends on it.
 
 Crew execution order:
   1. Build user context (Memory agent)
