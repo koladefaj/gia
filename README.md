@@ -1,10 +1,14 @@
-# Gia — a voice music companion
+# Gia: a voice music companion
 
-> A voice companion that knows your taste, sounds like a human, and notices your mood before you mention it — engineered to **start talking while it's still thinking**, streaming audio out as it's generated instead of making you wait for a finished paragraph.
+> A voice companion that knows your taste, sounds like a human, and notices your mood before you mention it, engineered to **start talking while it's still thinking**, streaming audio out as it's generated instead of making you wait for a finished paragraph.
 
 Gia isn't a "play me a song" bot. She's a stateful companion: she remembers what you've told her, synthesises it into a picture of *who you are*, picks one track with a reason instead of dumping ten, and gently notices when your listening drifts from your usual pattern.
 
-> Demo video: _[link]_
+> Demo video: 
+
+https://github.com/user-attachments/assets/558b58b3-d6c9-456f-a4eb-2135598b3d09
+
+
 
 **At a glance:** voice in → first audio in **~4–6s** for chat (down from ~10s), a full reflective memory pipeline, graceful degradation on every external call, 454 tests, and per-turn observability with self-eval scores. Streaming STT (Deepgram Flux) removes the serial transcription wait, and the router now starts *mid-utterance* on the model's eager end-of-turn signal instead of after the user stops. The latency work below is a real, measured engineering story, including a feature I built, measured, and then **deleted** because the data said to.
 
@@ -15,7 +19,7 @@ Gia isn't a "play me a song" bot. She's a stateful companion: she remembers what
 - [What it feels like](#what-it-feels-like)
 - [Architecture](#architecture)
 - [The thing I obsessed over: time-to-first-audio](#the-thing-i-obsessed-over-time-to-first-audio)
-  - [The feature I built, measured, and deleted](#the-feature-i-built-measured-and-deleted)
+- [The feature I built, measured, and deleted](#the-feature-i-built-measured-and-deleted)
 - [Benchmarks](#benchmarks)
 - [The memory system](#the-memory-system-why-she-feels-like-she-knows-you)
 - [Production posture](#production-posture)
@@ -97,7 +101,7 @@ flowchart LR
 
 ## The thing I obsessed over: time-to-first-audio
 
-The metric isn't total response time — it's **TTFA**, when the user first hears Gia. I drove it from **~10s p99 to ~4–5s** (chat) by attacking the serial dead time on the critical path, profiling each stage in Langfuse, and removing the biggest blocks one at a time.
+The metric isn't total response time, it's **TTFA**, when the user first hears Gia. I drove it from **~10s p99 to ~4–5s** (chat) by attacking the serial dead time on the critical path, profiling each stage in Langfuse, and removing the biggest blocks one at a time.
 
 **1. Stream the TTS instead of waiting for the whole file.** This was the single biggest win. The pipeline had a complete sentence-streaming machine that the chat path *threw away* — it streamed the text, then synthesised the entire reply in one blocking call before sending a single audio byte. That was **~3.3s of dead silence** per turn. The fix sends the full reply text up-front to ElevenLabs' `/stream` endpoint (so `eleven_v3` keeps the ~250-char context it needs for natural prosody and audio-tag rendering) but **forwards the MP3 bytes as they render** — and the Next.js frontend plays them progressively through a `MediaSource` buffer. First audio now lands well before the file is finished.
 
