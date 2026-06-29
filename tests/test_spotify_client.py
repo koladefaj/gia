@@ -91,12 +91,15 @@ def mcp_client(test_settings: Settings) -> SpotifyMCPClient:
     client._bridge = MagicMock()
     client._bridge.call = AsyncMock(return_value="")
     client._bridge.stop = AsyncMock()
+    # Force the MCP path for these bridge-mapping tests — the direct Web API fast
+    # path is covered separately below.
+    client._web_client = lambda: None  # type: ignore[method-assign]
     return client
 
 
 @pytest.mark.asyncio
 async def test_search_tracks_maps_tool_and_parses(mcp_client: SpotifyMCPClient) -> None:
-    """``search_tracks`` calls ``searchSpotify`` and parses the text into dicts."""
+    """``search_tracks`` (MCP fallback) calls ``searchSpotify`` and parses the text."""
     mcp_client._bridge.call = AsyncMock(return_value=(
         '# Search results for "tems" (type: track)\n\n'
         '1. "Free Mind" by Tems (4:08) - ID: 2mzM4Y0Rnx2BDZqRnhQ5Q6\n'
@@ -109,6 +112,41 @@ async def test_search_tracks_maps_tool_and_parses(mcp_client: SpotifyMCPClient) 
         "uri": "spotify:track:2mzM4Y0Rnx2BDZqRnhQ5Q6",
         "id": "2mzM4Y0Rnx2BDZqRnhQ5Q6", "name": "Free Mind", "artist": "Tems",
     }]
+
+
+@pytest.mark.asyncio
+async def test_search_tracks_prefers_direct_web_api(test_settings: Settings) -> None:
+    """When the Web client returns results, search skips the MCP bridge entirely."""
+    client = SpotifyMCPClient(cfg=test_settings)
+    client._bridge = MagicMock()
+    client._bridge.call = AsyncMock(return_value="")  # MCP — must NOT be called
+    web = MagicMock()
+    web.search_tracks = AsyncMock(return_value=[{"uri": "w1", "name": "Fast", "artist": "A"}])
+    client._web_client = lambda: web  # type: ignore[method-assign]
+
+    out = await client.search_tracks("tems", limit=5)
+
+    web.search_tracks.assert_awaited_once_with("tems", limit=5)
+    client._bridge.call.assert_not_called()
+    assert out == [{"uri": "w1", "name": "Fast", "artist": "A"}]
+
+
+@pytest.mark.asyncio
+async def test_search_tracks_falls_back_to_mcp_on_web_error(test_settings: Settings) -> None:
+    """A failing Web search falls back to the MCP bridge rather than erroring."""
+    client = SpotifyMCPClient(cfg=test_settings)
+    client._bridge = MagicMock()
+    client._bridge.call = AsyncMock(return_value=(
+        '1. "Free Mind" by Tems (4:08) - ID: 2mzM4Y0Rnx2BDZqRnhQ5Q6\n'
+    ))
+    web = MagicMock()
+    web.search_tracks = AsyncMock(side_effect=RuntimeError("web 500"))
+    client._web_client = lambda: web  # type: ignore[method-assign]
+
+    out = await client.search_tracks("tems", limit=5)
+
+    client._bridge.call.assert_awaited_once()
+    assert out and out[0]["name"] == "Free Mind"
 
 
 @pytest.mark.asyncio

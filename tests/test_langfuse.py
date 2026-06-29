@@ -80,6 +80,43 @@ async def test_crew_trace_context_manager() -> None:
     assert len(trace.spans) == 1
 
 
+@pytest.mark.asyncio
+async def test_crew_trace_custom_name_and_tags(monkeypatch) -> None:
+    """``crew_trace`` forwards a custom trace_name + tags (the realtime path)."""
+    from contextlib import contextmanager
+
+    import backend.app.observability.langfuse as lf
+    import langfuse as langfuse_pkg
+
+    names: list[str] = []
+    propagate_calls: list[dict] = []
+
+    @contextmanager
+    def _obs(*, as_type, name, input=None, output=None):  # noqa: A002
+        names.append(name)
+        yield MagicMock()
+
+    @contextmanager
+    def _propagate(**kwargs):
+        propagate_calls.append(kwargs)
+        yield
+
+    monkeypatch.setattr(langfuse_pkg, "propagate_attributes", _propagate, raising=False)
+    client = MagicMock()
+    client.start_as_current_observation.side_effect = _obs
+    monkeypatch.setattr(lf, "_client", client)
+
+    async with lf.crew_trace(
+        "s", "u", user_input="hi",
+        trace_name="gia-realtime-turn", tags=["realtime", "voice"],
+    ):
+        pass
+
+    assert names[0] == "gia-realtime-turn"
+    assert propagate_calls[0]["trace_name"] == "gia-realtime-turn"
+    assert propagate_calls[0]["tags"] == ["realtime", "voice"]
+
+
 def test_init_langfuse_noop_without_langfuse_installed() -> None:
     """``init_langfuse`` does not raise when the langfuse package is absent."""
     from unittest.mock import patch

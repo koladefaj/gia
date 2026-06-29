@@ -26,8 +26,12 @@ from backend.app.mood.classifier import time_bucket
 from backend.app.mood.labeler import label_mood
 from backend.app.mood.proactive import _parse_pattern, get_pattern_for_now
 from backend.app.observability.logging import get_logger
+from backend.app.prompts import PromptRegistry, get_registry
+from backend.app.providers.llm import get_fast_llm
 
 logger = get_logger(__name__)
+
+AGENT_KEY = "agents.mood"
 
 @dataclass
 class MoodResult:

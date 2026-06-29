@@ -205,10 +205,13 @@ async def crew_trace(
     session_id: str,
     user_id: str | None = None,
     user_input: str | None = None,
+    *,
+    trace_name: str = "gia-chat-turn",
+    tags: list[str] | None = None,
 ):
-    """Async context manager that opens a Langfuse trace for one chat turn.
+    """Async context manager that opens a Langfuse trace for one turn.
 
-    Opens a root ``gia-chat-turn`` observation and applies ``session_id`` /
+    Opens a root observation (named *trace_name*) and applies ``session_id`` /
     ``user_id`` / trace name / tags via ``propagate_attributes`` so every nested
     agent span and LLM generation inherits them.  On exit, buffered events are
     flushed.
@@ -217,11 +220,15 @@ async def crew_trace(
         session_id: Conversation session identifier (groups turns into a Session).
         user_id:    Optional user UUID string (enables per-user filtering).
         user_input: Optional raw user message — becomes the trace-level input.
+        trace_name: Observation/trace name (default ``gia-chat-turn``; the
+                    realtime path passes ``gia-realtime-turn``).
+        tags:       Trace tags (default ``["chat"]``).
 
     Yields:
         A ``CrewTrace`` instance.
     """
     trace = CrewTrace(session_id=session_id, user_id=user_id)
+    trace_tags = tags if tags is not None else ["chat"]
 
     if _client is None:
         # Tracing disabled — yield a local-only trace.
@@ -236,13 +243,13 @@ async def crew_trace(
 
         with _client.start_as_current_observation(
             as_type="span",
-            name="gia-chat-turn",
+            name=trace_name,
             input=user_input[:1000] if user_input else None,
         ) as root, propagate_attributes(
             session_id=session_id,
             user_id=user_id or None,
-            trace_name="gia-chat-turn",
-            tags=["chat"],
+            trace_name=trace_name,
+            tags=trace_tags,
         ):
             trace._active = True
             trace._root = root

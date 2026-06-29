@@ -164,6 +164,9 @@ services:
     environment:
       # Browser makes API calls directly to the exposed host port.
       NEXT_PUBLIC_API_URL: "http://localhost:8000"
+      # Use the speech-to-speech path (/voice/realtime). Pair with VOICE_MODE=
+      # realtime on the api. Read by `next dev` at startup.
+      NEXT_PUBLIC_VOICE_MODE: "realtime"
     command: sh -c "npm install && npm run dev"
 
 volumes:

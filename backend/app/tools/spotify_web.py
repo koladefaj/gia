@@ -29,6 +29,34 @@ logger = get_logger(__name__)
 _API = "https://api.spotify.com/v1"
 _TOKEN_URL = "https://accounts.spotify.com/api/token"
 
+# Spotify caps search ``limit`` at 10 for Development-Mode apps (>10 → HTTP 400).
+_SEARCH_LIMIT_MAX = 10
+
+# Pooled client for the hot path (track search). A fresh AsyncClient per call
+# pays a TLS handshake every time (~100–200 ms); one keep-alive pool reuses the
+# connection, the same trick the TTS provider uses. Direct search this way is
+# ~400–600 ms warm vs ~1.9 s through the MCP stdio server.
+_search_client = None  # type: ignore[var-annotated]
+
+
+def _get_search_client():
+    """Return the process-wide pooled httpx client (built on first use)."""
+    global _search_client
+    if _search_client is None:
+        _search_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=60.0),
+        )
+    return _search_client
+
+
+async def aclose_search_client() -> None:
+    """Close the pooled search client on app shutdown (idempotent)."""
+    global _search_client
+    if _search_client is not None:
+        await _search_client.aclose()
+        _search_client = None
+
 
 def _config_path(cfg: Settings) -> Path:
     """Locate the MCP server's ``spotify-config.json`` (token store)."""
@@ -77,6 +105,58 @@ class SpotifyWebClient:
             "Authorization": f"Bearer {await self._access_token()}",
             "Content-Type": "application/json",
         }
+
+    async def prewarm(self) -> None:
+        """Warm the access token at startup so the first music turn doesn't refresh.
+
+        The token is cached in ``spotify-config.json`` with an ``expiresAt``; if it's
+        expired the first real search pays a ~450 ms refresh. Calling this in the
+        app lifespan moves that off the hot path. Best-effort — a missing config or
+        a refresh failure just logs and leaves the first search to handle it.
+        """
+        try:
+            await self._access_token()
+            logger.info("spotify_web_token_prewarmed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("spotify_web_prewarm_failed", error=str(exc))
+
+    async def search_tracks(self, query: str, limit: int = 10) -> list[dict]:
+        """Search tracks via the direct Web API — the fast path for music turns.
+
+        Hits ``GET /v1/search`` over the pooled keep-alive connection with the
+        cached bearer token, skipping the MCP stdio subprocess entirely (~400–600 ms
+        warm vs ~1.9 s through MCP). Returns the same ``{uri, name, artist}`` shape
+        the DJ/realtime tools expect, so it's a drop-in for the MCP search.
+
+        Args:
+            query: Search string (artist / track / vibe).
+            limit: Max results (clamped to Spotify's Development-Mode cap of 10).
+
+        Returns:
+            A list of ``{"uri", "name", "artist"}`` dicts (empty on no query).
+
+        Raises:
+            httpx.HTTPStatusError: On a non-2xx Spotify response (callers fall
+                back to the MCP search).
+        """
+        if not query.strip():
+            return []
+        resp = await _get_search_client().get(
+            f"{_API}/search",
+            headers={"Authorization": f"Bearer {await self._access_token()}"},
+            params={"q": query, "type": "track", "limit": min(limit, _SEARCH_LIMIT_MAX)},
+        )
+        resp.raise_for_status()
+        items = resp.json().get("tracks", {}).get("items", []) or []
+        out: list[dict] = []
+        for it in items:
+            artists = it.get("artists") or []
+            out.append({
+                "uri": it.get("uri", ""),
+                "name": it.get("name", ""),
+                "artist": artists[0].get("name", "") if artists else "",
+            })
+        return out
 
     async def get_me(self) -> dict:
         """Return the current user's profile (``display_name``, ``id``, ``product``)."""

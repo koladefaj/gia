@@ -120,6 +120,14 @@ class Settings(BaseSettings):
     # ON for a consistently warm voice (the voice is the product); flash is ~1.1s
     # faster per turn, so flip OFF to trade warmth for latency.
     tts_force_v3: bool = Field(default=True)
+    # Sentence-streaming TTS — synthesise the reply sentence by sentence as the
+    # text becomes available (the server splits on punctuation boundaries) instead
+    # of waiting for the whole reply, so the first sentence's audio plays while the
+    # rest is still being generated/synthesised. Masks latency on both the
+    # decomposed pipeline and the realtime path. The tradeoff is per-sentence v3
+    # prosody (less surrounding context than a whole-reply call); flip OFF to
+    # restore single-pass whole-reply synthesis (warmer prosody, slower first audio).
+    tts_stream_sentences: bool = Field(default=True)
 
     # --- Brave Search ---
     brave_api_key: str = Field(default="")
@@ -218,6 +226,51 @@ class Settings(BaseSettings):
     deepgram_eot_timeout_ms: int = Field(default=4000, ge=500, le=15000)
 
     # =============================================================================
+    # Voice mode — decomposed pipeline vs. speech-to-speech (realtime)
+    # =============================================================================
+
+    # How a voice turn is run end-to-end. Two families behind one switch, mirroring
+    # the stt_provider / tts_provider pattern:
+    #   "pipeline" — the decomposed path: streaming STT → router cascade →
+    #                specialist agents → streaming TTS. Every stage is observable
+    #                and individually optimised (this is the default and the
+    #                primary, fully-measured path).
+    #   "realtime" — speech-to-speech: the browser streams PCM16 to the backend,
+    #                which bridges to OpenAI's Realtime model (gpt-realtime). The
+    #                model owns the turn end to end (native barge-in, turn-taking,
+    #                prosody) and calls the SAME memory / DJ / artist / weather code
+    #                as tools. No STT→text→TTS serialisation on the hot path.
+    # The two modes share memory, Spotify, Brave, and Langfuse; they differ only in
+    # who orchestrates the turn. See backend/app/providers/realtime.py.
+    voice_mode: str = Field(default="pipeline")  # pipeline | realtime
+
+    # OpenAI Realtime model used as the ears + brain (audio in, TEXT out — the
+    # voice itself comes from ElevenLabs v3, see tts_provider). Config so it swaps
+    # without code changes (the "all model names are config" rule): "gpt-realtime"
+    # is the GA voice-agent model; set "gpt-realtime-2" once it's enabled on the
+    # account for the reasoning-capable variant. Reuses ``openai_api_key``.
+    realtime_model: str = Field(default="gpt-realtime")
+    # Where the realtime reply's VOICE comes from:
+    #   "elevenlabs" — gpt-realtime emits text, ElevenLabs v3 speaks it (the warm,
+    #                  tagged brand voice; needs a working ElevenLabs key).
+    #   "model"      — gpt-realtime speaks directly (pure speech-to-speech, lowest
+    #                  latency, billed under OpenAI). Graceful fallback when
+    #                  ElevenLabs is unavailable, at the cost of the brand voice.
+    realtime_voice_source: str = Field(default="elevenlabs")  # elevenlabs | model
+    # Output voice when realtime_voice_source == "model" (ignored for elevenlabs).
+    # One of OpenAI's realtime voices (marin/cedar are the warmest GA additions).
+    realtime_voice: str = Field(default="marin")
+    # Turn detection. "semantic_vad" lets the model decide turn-ends from meaning
+    # (best for natural barge-in / back-channel); "server_vad" is plain silence
+    # detection. null is not exposed — the realtime path needs server-side turns.
+    realtime_vad: str = Field(default="semantic_vad")  # semantic_vad | server_vad
+    # Transcription model for the *user's* audio. Enabling input transcription
+    # keeps the observability + memory pipeline alive in realtime mode: the user
+    # text feeds Langfuse traces and the Celery memory extractor exactly as the
+    # final transcript does in pipeline mode.
+    realtime_transcription_model: str = Field(default="gpt-4o-mini-transcribe")
+
+    # =============================================================================
     # Tool resilience
     # =============================================================================
 
@@ -247,6 +300,72 @@ class Settings(BaseSettings):
         if v not in allowed:
             raise ValueError(
                 f"LLM_PROVIDER must be one of {sorted(allowed)!r}; got {v!r}"
+            )
+        return v
+
+    @field_validator("voice_mode")
+    @classmethod
+    def _validate_voice_mode(cls, v: str) -> str:
+        """Reject unknown voice modes before the endpoint branches on them.
+
+        Args:
+            v: Raw value from the environment.
+
+        Returns:
+            The lower-cased, validated voice mode.
+
+        Raises:
+            ValueError: If *v* is not ``pipeline`` or ``realtime``.
+        """
+        allowed = {"pipeline", "realtime"}
+        v = v.lower()
+        if v not in allowed:
+            raise ValueError(
+                f"VOICE_MODE must be one of {sorted(allowed)!r}; got {v!r}"
+            )
+        return v
+
+    @field_validator("realtime_voice_source")
+    @classmethod
+    def _validate_realtime_voice_source(cls, v: str) -> str:
+        """Ensure ``REALTIME_VOICE_SOURCE`` is ``elevenlabs`` or ``model``.
+
+        Args:
+            v: Raw value from the environment.
+
+        Returns:
+            The lower-cased, validated voice source.
+
+        Raises:
+            ValueError: If *v* is not one of the allowed sources.
+        """
+        allowed = {"elevenlabs", "model"}
+        v = v.lower()
+        if v not in allowed:
+            raise ValueError(
+                f"REALTIME_VOICE_SOURCE must be one of {sorted(allowed)!r}; got {v!r}"
+            )
+        return v
+
+    @field_validator("realtime_vad")
+    @classmethod
+    def _validate_realtime_vad(cls, v: str) -> str:
+        """Ensure ``REALTIME_VAD`` names a supported turn-detection strategy.
+
+        Args:
+            v: Raw value from the environment.
+
+        Returns:
+            The lower-cased, validated VAD strategy.
+
+        Raises:
+            ValueError: If *v* is not ``semantic_vad`` or ``server_vad``.
+        """
+        allowed = {"semantic_vad", "server_vad"}
+        v = v.lower()
+        if v not in allowed:
+            raise ValueError(
+                f"REALTIME_VAD must be one of {sorted(allowed)!r}; got {v!r}"
             )
         return v
 

@@ -12,11 +12,12 @@ Design:
 
 from __future__ import annotations
 
+import base64
 import re
 from collections.abc import AsyncIterator
 
 from backend.app.observability.logging import get_logger
-from backend.app.providers.tts import synthesize
+from backend.app.providers.tts import should_use_v3, synthesize, synthesize_stream
 
 logger = get_logger(__name__)
 
@@ -69,6 +70,73 @@ async def stream_sentences(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
     tail = buffer.strip()
     if tail:
         yield tail
+
+
+async def synthesize_sentence_stream(
+    sentences: AsyncIterator[str],
+    *,
+    provider: str,
+    api_key: str = "",
+    voice_id: str = "",
+) -> AsyncIterator[tuple[str, dict]]:
+    """Synthesise sentences as they arrive, yielding ordered audio frames.
+
+    Each sentence is sent to the TTS ``/stream`` endpoint the moment it lands, so
+    the first sentence's audio starts while later sentences are still being
+    generated or synthesised — masking latency. The bytes from each sentence are
+    forwarded in order with a single ``audio_start`` before the first byte, a
+    monotonic ``seq`` across *all* sentences, and one ``audio_end`` at the end, so
+    to the client it's one continuous reply (the frontend's streaming player needs
+    no changes).
+
+    The whole sentence is sent per call (v3 keeps sentence-level prosody context;
+    a tag like ``[warm]`` stays attached to its sentence), so this is the
+    latency-vs-prosody tradeoff gated by ``tts_stream_sentences``.
+
+    Args:
+        sentences: Async iterator of complete sentence strings, in order
+                   (e.g. from :func:`stream_sentences` on a delta stream, or
+                   :func:`split_sentences` on a finished reply).
+        provider:  TTS provider (``"elevenlabs"`` / ``"kokoro"``).
+        api_key:   ElevenLabs key (ignored for Kokoro).
+        voice_id:  ElevenLabs voice id (ignored for Kokoro).
+
+    Yields:
+        ``(frame_kind, payload)`` tuples — ``frame_kind`` is ``"audio_start"``,
+        ``"audio_chunk"``, or ``"audio_end"``. The caller formats them for its
+        transport (SSE in ``/chat``; WS JSON in ``/voice/realtime``).
+    """
+    started = False
+    seq = 0
+    async for sentence in sentences:
+        text = sentence.strip()
+        if not text:
+            continue
+        emotional = should_use_v3(text)
+        try:
+            async for chunk in synthesize_stream(
+                text, provider=provider, api_key=api_key, voice_id=voice_id
+            ):
+                if not chunk:
+                    continue
+                if not started:
+                    started = True
+                    yield ("audio_start", {"model": provider, "emotional": emotional})
+                yield (
+                    "audio_chunk",
+                    {
+                        "data": base64.b64encode(chunk).decode(),
+                        "model": provider,
+                        "emotional": emotional,
+                        "seq": seq,
+                        "streaming": True,
+                    },
+                )
+                seq += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tts_sentence_error", sentence=text[:50], error=str(exc))
+    if started:
+        yield ("audio_end", {"chunks": seq})
 
 
 def split_sentences(text: str) -> list[str]:

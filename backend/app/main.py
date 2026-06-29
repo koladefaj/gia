@@ -44,6 +44,7 @@ from backend.app.api import (
     onboarding,
     playlist,
     voice,
+    voice_realtime,
     voice_stream,
 )
 from backend.app.config import settings
@@ -53,6 +54,7 @@ from backend.app.observability.langfuse import init_langfuse
 from backend.app.observability.logging import get_logger, setup_logging
 from backend.app.prompts import PromptRegistry
 from backend.app.tools.spotify import SpotifyMCPClient
+from backend.app.tools.spotify_web import SpotifyWebClient
 
 logger = get_logger(__name__)
 
@@ -157,13 +159,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _prewarm_postgres(),
         app.state.redis.ping(),
         app.state.spotify.prewarm(),
+        SpotifyWebClient(settings).prewarm(),
         _prewarm_stt(),
         _prewarm_openai(),
         _prewarm_router_local(),
         return_exceptions=True,
     )
     for name, result in zip(
-        ("postgres", "redis", "spotify", "stt", "openai", "router_local"),
+        ("postgres", "redis", "spotify", "spotify_web", "stt", "openai", "router_local"),
         results, strict=True,
     ):
         if isinstance(result, Exception):
@@ -176,11 +179,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     from backend.app.providers.tts import aclose_http_client
+    from backend.app.tools.spotify_web import aclose_search_client
 
     await app.state.spotify.close()
     await app.state.redis.aclose()
     await asyncio.to_thread(app.state.weaviate.close)
     await aclose_http_client()
+    await aclose_search_client()
     await engine.dispose()
     logger.info("gia_shutdown")
 
@@ -213,3 +218,4 @@ app.include_router(artist.router)
 app.include_router(chat.router)
 app.include_router(voice.router)
 app.include_router(voice_stream.router)
+app.include_router(voice_realtime.router)

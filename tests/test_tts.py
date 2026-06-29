@@ -229,3 +229,96 @@ async def test_stream_tts_chunks_yields_per_sentence() -> None:
 
     assert len(chunks) >= 1
     assert all(c.startswith(b"audio-") for c in chunks)
+
+
+# ── synthesize_sentence_stream (latency-masking per-sentence TTS) ─────────────
+
+
+def _fake_synthesize_stream_factory(per_sentence_chunks: int = 2):
+    """Return a stand-in for ``synthesize_stream`` yielding N bytes per call."""
+
+    def fake(text, **_kwargs):
+        async def gen():
+            for i in range(per_sentence_chunks):
+                yield f"{text[:6]}-{i}".encode()
+        return gen()
+
+    return fake
+
+
+async def _aiter(items):
+    for item in items:
+        yield item
+
+
+@pytest.mark.asyncio
+async def test_sentence_stream_orders_chunks_with_one_start_and_end() -> None:
+    """Frames: one audio_start, monotonic seq across sentences, one audio_end."""
+    from backend.app.voice import streaming
+
+    with (
+        patch.object(streaming, "synthesize_stream", new=_fake_synthesize_stream_factory(2)),
+        patch.object(streaming, "should_use_v3", return_value=True),
+    ):
+        frames = [
+            f async for f in streaming.synthesize_sentence_stream(
+                _aiter(["[warm] Hey there.", "How's the day?"]),
+                provider="elevenlabs", api_key="k", voice_id="v",
+            )
+        ]
+
+    kinds = [k for k, _ in frames]
+    assert kinds[0] == "audio_start"
+    assert kinds[-1] == "audio_end"
+    assert kinds.count("audio_start") == 1
+    assert kinds.count("audio_end") == 1
+    # 2 sentences × 2 chunks each = 4 audio_chunks, seq 0..3.
+    chunk_seqs = [p["seq"] for k, p in frames if k == "audio_chunk"]
+    assert chunk_seqs == [0, 1, 2, 3]
+    assert frames[-1][1]["chunks"] == 4
+    assert all(p["emotional"] is True for k, p in frames if k == "audio_chunk")
+
+
+@pytest.mark.asyncio
+async def test_sentence_stream_empty_input_yields_nothing() -> None:
+    from backend.app.voice import streaming
+
+    frames = [
+        f async for f in streaming.synthesize_sentence_stream(
+            _aiter([]), provider="elevenlabs", api_key="k", voice_id="v"
+        )
+    ]
+    assert frames == []
+
+
+@pytest.mark.asyncio
+async def test_sentence_stream_from_deltas_synthesises_per_sentence() -> None:
+    """Deltas → stream_sentences → one synthesize_stream call per completed sentence.
+
+    The whole point: a sentence is sent to TTS as soon as its boundary lands, so
+    audio for sentence one starts before later sentences finish generating.
+    """
+    from backend.app.voice import streaming
+
+    calls: list[str] = []
+
+    def fake(text, **_kwargs):
+        calls.append(text)
+        async def gen():
+            yield b"x"
+        return gen()
+
+    # Token-ish deltas that form two sentences then a tail.
+    deltas = ["[warm] ", "Hey ", "there. ", "How's ", "the day? ", "Talk soon"]
+    with (
+        patch.object(streaming, "synthesize_stream", new=fake),
+        patch.object(streaming, "should_use_v3", return_value=False),
+    ):
+        _ = [
+            f async for f in streaming.synthesize_sentence_stream(
+                streaming.stream_sentences(_aiter(deltas)),
+                provider="elevenlabs", api_key="k", voice_id="v",
+            )
+        ]
+
+    assert calls == ["[warm] Hey there.", "How's the day?", "Talk soon"]
