@@ -75,7 +75,7 @@ from backend.app.schemas.chat import ChatRequest, IntentType
 from backend.app.schemas.dj import TrackItem
 from backend.app.schemas.router import RouterDecision
 from backend.app.tools.brave import BraveSearchClient
-from backend.app.voice.streaming import split_sentences
+from backend.app.voice.streaming import split_sentences, synthesize_sentence_stream
 
 logger = get_logger(__name__)
 
@@ -274,23 +274,25 @@ async def _stream_reply_frames(
     api_key: str,
     voice_id: str,
     collected: list[str],
+    *,
+    stream_sentences: bool = True,
 ) -> AsyncIterator[str]:
-    """Stream the reply text sentence-by-sentence, then STREAM the WHOLE reply's
-    audio progressively as ElevenLabs renders it.
+    """Stream the reply captions, then the reply's audio progressively.
 
-    The whole reply is synthesised in ONE pass (the full text is sent up-front),
-    so prosody and v3 tag rendering stay consistent and there's no mid-reply
-    flash↔v3 hop — v3 needs ~250+ chars of context to sound right, which a
-    per-sentence call can't give it. But the audio is pulled from ElevenLabs'
-    ``/stream`` endpoint and forwarded chunk-by-chunk, so the first audio bytes
-    reach the client well before the complete file is rendered — that's the
-    latency win that replaces the old fast acknowledgment. Text still streams
-    live so captions appear as Gia "types"; every sentence is appended to
-    *collected* so the caller can persist the full reply.
+    Captions stream first (each sentence as a ``reply_chunk``) so they appear as
+    Gia "types"; every sentence is appended to *collected* so the caller can
+    persist the full reply. Then the audio is streamed one of two ways:
 
-    Frames: ``audio_start`` (once, before the first byte) → N ``audio_chunk``
-    (each ``streaming: true`` with a monotonic ``seq``) → ``audio_end``. The
-    frontend appends the chunks to a MediaSource buffer and plays progressively.
+    - **Sentence-streaming** (``stream_sentences``, the default): each sentence is
+      synthesised the moment it's ready, so the first sentence's audio plays while
+      the rest is still synthesising — lowest first-audio latency.
+    - **Whole-reply** (``stream_sentences=False``): the full text is sent to the
+      TTS ``/stream`` endpoint in one pass (v3 keeps maximum prosody context, no
+      mid-reply model hop) and the bytes are forwarded as they render.
+
+    Either way the wire contract is identical — ``audio_start`` (once) → N
+    ``audio_chunk`` (``streaming: true``, monotonic ``seq``) → ``audio_end`` — so
+    the frontend's MediaSource player is unchanged.
     """
     async for sentence in sentences:
         collected.append(sentence)
@@ -300,8 +302,17 @@ async def _stream_reply_frames(
     if not full:
         return
 
-    # should_use_v3(full) picks ONE model for the whole reply (no mid-reply
-    # flash↔v3 hop): TTS_FORCE_V3 forces eleven_v3, else any tag/question → v3.
+    if stream_sentences:
+        # Synthesise sentence by sentence (collected is already split) — first
+        # audio out as soon as sentence one renders.
+        async for kind, payload in synthesize_sentence_stream(
+            _aiter(collected), provider=provider, api_key=api_key, voice_id=voice_id
+        ):
+            yield _sse(kind, payload)
+        return
+
+    # Whole-reply: one pass keeps v3's full-context prosody. should_use_v3(full)
+    # picks ONE model: TTS_FORCE_V3 forces eleven_v3, else any tag/question → v3.
     emotional = should_use_v3(full)
     started = False
     seq = 0
@@ -1013,6 +1024,7 @@ async def _run_crew(
         async for frame in _stream_reply_frames(
             _aiter(split_sentences(full_reply)),
             tts_provider, tts_api_key, tts_voice_id, [],
+            stream_sentences=cfg.tts_stream_sentences,
         ):
             yield frame
 

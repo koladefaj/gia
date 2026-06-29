@@ -28,7 +28,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { chatStream, prewarmRouter, speak as speakApi, transcribe } from './api';
 import { AudioPlayer, StreamPlayer, createAnalyser, stripTags } from './audio';
 import { PcmCapture } from './pcm';
+import { RealtimeClient } from './realtimeSession';
 import { FluxStream } from './sttStream';
+
+// Speech-to-speech mode: the whole turn runs over one /voice/realtime socket
+// (mic PCM up, assistant PCM down, native barge-in) instead of the decomposed
+// streaming-STT → /chat → streaming-TTS path. Set NEXT_PUBLIC_VOICE_MODE=realtime
+// to opt in; anything else keeps the default pipeline.
+const REALTIME = process.env.NEXT_PUBLIC_VOICE_MODE === 'realtime';
 
 export type VoicePhase = 'idle' | 'listening' | 'thinking' | 'speaking' | 'error';
 
@@ -120,6 +127,10 @@ export function useVoiceSession(
   const pcmRef = useRef<PcmCapture | null>(null);
   const streamActiveRef = useRef(false); // Flux socket is up; skip the recorder VAD
   const lastPrewarmRef = useRef(''); // last eager text we prewarmed (dedupe)
+
+  // Speech-to-speech path (one socket owns the whole turn).
+  const realtimeRef = useRef<RealtimeClient | null>(null);
+  const rtGiaIdxRef = useRef(-1); // current Gia caption turn being appended to
 
   const setPhaseBoth = useCallback((p: VoicePhase) => {
     phaseRef.current = p;
@@ -307,11 +318,44 @@ export function useVoiceSession(
 
   /* ---- VAD / level loop ------------------------------------------------- */
 
+  const micLevel = useCallback((analyser: AnalyserNode, buf: Uint8Array<ArrayBuffer>): number => {
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const v = (buf[i] - 128) / 128;
+      sum += v * v;
+    }
+    return Math.min(1, Math.sqrt(sum / buf.length) * 4);
+  }, []);
+
   const loop = useCallback(() => {
     if (!activeRef.current) return;
     const analyser = analyserRef.current;
     const player = playerRef.current;
     const buf = timeData.current;
+
+    // Realtime: the server VAD segments turns and barge-in is handled by the
+    // `flush`/`speech_started` frames, so there's no recorder/VAD/auto-close here
+    // — just drive the ring and phase from whichever side is sounding. The
+    // ElevenLabs reply plays through the shared StreamPlayer (same as /chat).
+    if (REALTIME) {
+      // Voice plays through the ElevenLabs StreamPlayer (text mode) or the
+      // model-voice PcmPlayer (model mode) — read whichever is sounding.
+      const sp = streamPlayerRef.current;
+      const pp = realtimeRef.current?.player;
+      if (pp?.isActive) {
+        if (phaseRef.current !== 'speaking') setPhaseBoth('speaking');
+        levelRef.current = pp.sampleLevel();
+      } else if (sp?.isActive) {
+        if (phaseRef.current !== 'speaking') setPhaseBoth('speaking');
+        levelRef.current = sp.sampleLevel();
+      } else {
+        if (phaseRef.current === 'speaking') setPhaseBoth('listening');
+        levelRef.current = analyser && buf ? micLevel(analyser, buf) : 0;
+      }
+      rafRef.current = requestAnimationFrame(loop);
+      return;
+    }
 
     if (phaseRef.current === 'speaking' && player) {
       // Drive the ring from Gia's actual output.
@@ -356,7 +400,7 @@ export function useVoiceSession(
     }
 
     rafRef.current = requestAnimationFrame(loop);
-  }, [startRecorder, stopRecorder]);
+  }, [startRecorder, stopRecorder, micLevel, setPhaseBoth]);
 
   function resumeListening() {
     if (!activeRef.current) return;
@@ -470,9 +514,93 @@ export function useVoiceSession(
     if (ctxRef.current.state === 'suspended') await ctxRef.current.resume();
   }, []);
 
+  // Speech-to-speech startup: one socket owns capture + playback + the turn.
+  const startRealtime = useCallback(async () => {
+    await ensureAudio(); // resume an AudioContext inside the tap gesture
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    streamRef.current = stream;
+    // A mic analyser for the ring while listening (playback level comes from the
+    // realtime player). Separate from the capture context PcmCapture opens.
+    const ctx = ctxRef.current!;
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    src.connect(analyser); // analyser only — never to destination (no echo)
+    analyserRef.current = analyser;
+    timeData.current = new Uint8Array(analyser.fftSize);
+
+    activeRef.current = true;
+    rafRef.current = requestAnimationFrame(loop);
+
+    // Append a reply-text delta to the running Gia caption turn (a new turn is
+    // started after each user turn / completed response).
+    const appendGia = (chunk: string) =>
+      setTranscript((t) => {
+        const next = [...t];
+        const cur = next[rtGiaIdxRef.current];
+        if (rtGiaIdxRef.current < 0 || !cur || cur.role !== 'gia') {
+          rtGiaIdxRef.current = next.length;
+          next.push({ role: 'gia', text: chunk });
+        } else {
+          next[rtGiaIdxRef.current] = { role: 'gia', text: cur.text + chunk };
+        }
+        return next;
+      });
+
+    const client = new RealtimeClient({
+      onReady: () => {
+        setPhaseBoth('listening');
+        setStatus('Listening…');
+      },
+      onUserTranscript: (t) => {
+        const clean = stripTags(t).trim();
+        if (clean) setTranscript((x) => [...x, { role: 'user', text: clean }]);
+        rtGiaIdxRef.current = -1; // next reply opens a fresh Gia turn
+      },
+      onReplyChunk: (t) => {
+        const clean = stripTags(t);
+        if (clean) appendGia(clean);
+      },
+      // ElevenLabs MP3 plays through the shared StreamPlayer, exactly like /chat.
+      onAudioStart: () => {
+        streamPlayerRef.current?.begin();
+        setPhaseBoth('speaking');
+      },
+      onAudioChunk: (b64) => {
+        if (streamPlayerRef.current) streamPlayerRef.current.pushBase64(b64);
+        else playerRef.current?.enqueueBase64(b64);
+        setPhaseBoth('speaking');
+      },
+      onAudioEnd: () => streamPlayerRef.current?.end(),
+      onFlush: () => streamPlayerRef.current?.clear(), // barge-in: drop playback
+      onSpeechStarted: () => setPhaseBoth('listening'),
+      onTool: (name) => setStatus(`${name}…`),
+      onResponseDone: () => {
+        setStatus('');
+        rtGiaIdxRef.current = -1;
+      },
+      onError: (e) => setError(e),
+    });
+    realtimeRef.current = client;
+    await client.start(stream, { user_id: userId, session_id: sessionId });
+  }, [ensureAudio, loop, setPhaseBoth, userId, sessionId]);
+
   const start = useCallback(async (greeting?: string) => {
     if (activeRef.current) return;
     setError(null);
+    if (REALTIME) {
+      try {
+        await startRealtime();
+      } catch (err) {
+        setError(
+          err instanceof DOMException
+            ? 'Microphone access denied. Use text instead.'
+            : 'Could not start the realtime session.',
+        );
+        setPhaseBoth('error');
+      }
+      return;
+    }
     try {
       await ensureAudio();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -514,7 +642,7 @@ export function useVoiceSession(
       );
       setPhaseBoth('error');
     }
-  }, [ensureAudio, loop, setupStreaming, setPhaseBoth]);
+  }, [ensureAudio, loop, setupStreaming, setPhaseBoth, startRealtime]);
 
   const stop = useCallback(() => {
     activeRef.current = false;
@@ -526,6 +654,8 @@ export function useVoiceSession(
     fluxRef.current = null;
     void pcmRef.current?.stop();
     pcmRef.current = null;
+    void realtimeRef.current?.close();
+    realtimeRef.current = null;
     streamActiveRef.current = false;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
@@ -552,6 +682,12 @@ export function useVoiceSession(
     async (text: string) => {
       const clean = text.trim();
       if (!clean || streamingRef.current) return;
+      // Realtime mode is voice-first — typed turns don't go through the /chat
+      // pipeline. Surface the user's text so the transcript stays complete.
+      if (REALTIME) {
+        setTranscript((x) => [...x, { role: 'user', text: clean }]);
+        return;
+      }
       await ensureAudio();
       await runChat(clean);
     },

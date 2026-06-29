@@ -229,6 +229,7 @@ class SpotifyMCPClient:
     def __init__(self, cfg: Settings) -> None:
         self._cfg = cfg
         self._bridge = _McpBridge(cfg.spotify_mcp_command, cfg.spotify_mcp_server_path)
+        self._web: Any = None  # lazy direct Web API client for the fast search path
 
     async def prewarm(self) -> None:
         """Start the MCP session at app startup (no-op if unconfigured)."""
@@ -267,8 +268,27 @@ class SpotifyMCPClient:
     # returns HTTP 400 "Invalid limit"), so we clamp it here defensively.
     _SEARCH_LIMIT_MAX = 10
 
+    def _web_client(self):
+        """Lazily build the direct Web API client (``None`` if Spotify isn't configured)."""
+        if self._web is None and self._cfg.spotify_mcp_server_path:
+            from backend.app.tools.spotify_web import SpotifyWebClient  # noqa: PLC0415
+
+            self._web = SpotifyWebClient(self._cfg)
+        return self._web
+
     async def search_tracks(self, query: str, limit: int = 10) -> list[dict]:
         capped = min(limit, self._SEARCH_LIMIT_MAX)
+        # Fast path: the direct Spotify Web API (~0.4 s warm) instead of the MCP
+        # stdio round-trip (~1.9 s). Falls back to MCP on any error or empty result,
+        # so search keeps working even without the direct token config.
+        web = self._web_client()
+        if web is not None:
+            try:
+                results = await web.search_tracks(query, limit=capped)
+                if results:
+                    return results
+            except Exception as exc:  # noqa: BLE001
+                log.warning("spotify_web_search_failed", error=str(exc))
         return parse_tracks(
             await self._call("searchSpotify", query=query, type="track", limit=capped)
         )
