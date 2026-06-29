@@ -1,10 +1,14 @@
-# Gia — a voice music companion
+# Gia: a voice music companion
 
-> A voice companion that knows your taste, sounds like a human, and notices your mood before you mention it — engineered to **start talking while it's still thinking**, streaming audio out as it's generated instead of making you wait for a finished paragraph.
+> A voice companion that knows your taste, sounds like a human, and notices your mood before you mention it, engineered to **start talking while it's still thinking**, streaming audio out as it's generated instead of making you wait for a finished paragraph.
 
 Gia isn't a "play me a song" bot. She's a stateful companion: she remembers what you've told her, synthesises it into a picture of *who you are*, picks one track with a reason instead of dumping ten, and gently notices when your listening drifts from your usual pattern.
 
-> Demo video: _[link]_
+> Demo video: 
+
+https://github.com/user-attachments/assets/558b58b3-d6c9-456f-a4eb-2135598b3d09
+
+
 
 **At a glance:** three voice architectures behind one flag — a decomposed pipeline (streaming STT → router cascade → specialists → streaming TTS) and two speech-to-speech paths on `gpt-realtime` — plus a reflective memory pipeline, graceful degradation on every external call, and per-turn observability with self-eval scores. Time-to-first-audio ranges from **~1.0–1.1 s** (realtime) to **~4–6 s** (pipeline, down from ~10 s). The latency work is a real, measured engineering story — including a feature I built, measured, and then **deleted** because the data said to.
 
