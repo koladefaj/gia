@@ -58,6 +58,8 @@ flowchart TB
     GPT -. function calls .-> MEM
     SPEC -. tools .-> SEARCH
     GPT -. function calls .-> SEARCH
+    SPEC -. tools .-> BRV
+    GPT -. function calls .-> BRV
     subgraph SVC["Shared tools & memory (both paths)"]
         direction LR
         MEM[Memory · parallel fan-out]
@@ -72,12 +74,13 @@ flowchart TB
     subgraph BG["Workers · Celery — reflection, off the hot path"]
         direction LR
         EXT[Memory extraction] --> CONS[Consolidation<br/>raw facts → insights]
-        ING[Recently-played ingest] --> MOOD[Mood inference<br/>LLM-labeled per time-bucket]
+        ING[Recently-played ingest<br/>inline · Spotify API] --> MOOD[Mood inference<br/>LLM-labeled per time-bucket]
     end
-    TTSA & MV & TTSC -. enqueue .-> EXT
+    SPEC & GPT -. enqueue via Redis .-> EXT
+    TTSA -. post-stream .-> ING
     CONS --> WV
     MOOD --> WV
-    MODE -. per-turn traces .-> LF[Langfuse]
+    SPEC & GPT -. per-turn traces .-> LF[Langfuse]
 ```
 
 | Layer | Technology |
